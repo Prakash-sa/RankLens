@@ -1,0 +1,11 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.coverage
+ranklens-results/
+demo-results/
+.DS_Store

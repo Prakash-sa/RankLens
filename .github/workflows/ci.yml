@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Open MPI
+        run: sudo apt-get update && sudo apt-get install -y openmpi-bin libopenmpi-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        env:
+          OMPI_MCA_rmaps_base_oversubscribe: "1"
+        run: ctest --test-dir build --output-on-failure
+

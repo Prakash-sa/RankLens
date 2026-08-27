@@ -1,0 +1,4 @@
+#pragma once
+
+#define RANKLENS_VERSION "@PROJECT_VERSION@"
+
