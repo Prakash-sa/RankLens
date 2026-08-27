@@ -82,6 +82,21 @@ ranklens analyze ranklens-results \
   --json ranklens-results/analysis.json
 ```
 
+## Web dashboard
+
+The browser dashboard in `web/` opens the analyzer's JSON output and renders the same evidence as
+an interactive, responsive operations view. Analysis files are parsed entirely in the browser and
+are not uploaded or persisted by RankLens.
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+Open the printed local URL, then choose the `analysis.json` produced by `ranklens analyze`. The
+dashboard requires Node.js 22.13 or newer. Run `npm run build` for a production build.
+
 Try the report pipeline without MPI. This data is explicitly marked synthetic and is not benchmark
 evidence:
 

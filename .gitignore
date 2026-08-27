@@ -5,6 +5,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.nodeenv/
+.shiki/
 .coverage
 ranklens-results/
 demo-results/
