@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -33,12 +34,12 @@ def _required_int(data: Mapping[str, object], key: str, path: Path) -> int:
 def load_summary(path: Path) -> RankSummary:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise TelemetryError(f"cannot read {path}: {exc}") from exc
 
     if not isinstance(data, dict):
         raise TelemetryError(f"{path}: summary root must be an object")
-    if data.get("schema_version") != 1:
+    if type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
         raise TelemetryError(f"{path}: unsupported schema_version {data.get('schema_version')!r}")
 
     raw_operations = data.get("operations")
@@ -59,6 +60,17 @@ def load_summary(path: Path) -> RankSummary:
     if not isinstance(hostname, str):
         raise TelemetryError(f"{path}: hostname must be a string")
 
+    rank = _required_int(data, "rank", path)
+    world_size = _required_int(data, "world_size", path)
+    if world_size == 0 or rank >= world_size:
+        raise TelemetryError(f"{path}: rank must be within a positive world_size")
+    for key in ("synthetic", "complete"):
+        if key in data and not isinstance(data[key], bool):
+            raise TelemetryError(f"{path}: {key} must be boolean")
+    context = data.get("context", {})
+    if not isinstance(context, dict) or not all(isinstance(v, str) for v in context.values()):
+        raise TelemetryError(f"{path}: context must contain string values")
+
     return RankSummary(
         rank=_required_int(data, "rank", path),
         world_size=_required_int(data, "world_size", path),
@@ -70,6 +82,9 @@ def load_summary(path: Path) -> RankSummary:
         bytes_sent=_required_int(data, "bytes_sent", path),
         bytes_received=_required_int(data, "bytes_received", path),
         operations=operations,
+        synthetic=data.get("synthetic", False),
+        complete=data.get("complete", True),
+        context=context,
     )
 
 
@@ -89,7 +104,8 @@ def load_summaries(directory: Path) -> List[RankSummary]:
 
 
 def _load_communication_edges(
-    directory: Path, total_bytes_sent: int, warnings: List[str]
+    directory: Path, total_bytes_sent: int, warnings: List[str], world_size: int,
+    timeline: List[dict], runtime_max_ns: int,
 ) -> List[CommunicationEdge]:
     edges: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0])
     for path in sorted(directory.glob("rank-*-events.jsonl")):
@@ -103,9 +119,21 @@ def _load_communication_edges(
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    warnings.append(f"ignored malformed {path.name}:{line_number}: {exc.msg}")
+                    if len(warnings) < 100:
+                        warnings.append(f"ignored malformed {path.name}:{line_number}: {exc.msg}")
                     continue
-                if event.get("operation") != "MPI_Send":
+                if not isinstance(event, dict):
+                    if len(warnings) < 100:
+                        warnings.append(f"ignored non-object event in {path.name}:{line_number}")
+                    continue
+                if event.get("error_code", 0) != 0:
+                    continue
+                timestamp, duration = event.get("timestamp_ns"), event.get("duration_ns")
+                if all(type(v) is int and v >= 0 for v in (timestamp, duration)):
+                    bucket = min(49, timestamp * 50 // max(runtime_max_ns, 1))
+                    timeline[bucket]["calls"] += 1
+                    timeline[bucket]["duration_ns"] += duration
+                if event.get("operation") not in {"MPI_Send", "MPI_Isend"}:
                     continue
                 source = event.get("rank")
                 destination = event.get("peer")
@@ -113,8 +141,9 @@ def _load_communication_edges(
                 if not all(
                     isinstance(value, int) and not isinstance(value, bool)
                     for value in (source, destination, payload_bytes)
-                ):
-                    warnings.append(f"ignored invalid send event in {path.name}:{line_number}")
+                ) or not (0 <= source < world_size and 0 <= destination < world_size and payload_bytes >= 0):
+                    if len(warnings) < 100:
+                        warnings.append(f"ignored invalid send event in {path.name}:{line_number}")
                     continue
                 edge = edges[(source, destination)]
                 edge[0] += payload_bytes
@@ -246,7 +275,7 @@ def _make_findings(result: AnalysisResult) -> List[Finding]:
                 severity="ok",
                 category="summary",
                 title="No configured rule crossed its threshold",
-                evidence="The captured operations do not show a dominant bottleneck under v0.1 rules.",
+                evidence="The captured operations do not show a dominant bottleneck under the current rules.",
                 recommendation=(
                     "Treat this as an absence of detected evidence, not proof of optimal performance; "
                     "compare against a controlled scaling baseline."
@@ -257,7 +286,7 @@ def _make_findings(result: AnalysisResult) -> List[Finding]:
 
 
 def analyze(directory: Path, straggler_threshold: float = 1.20) -> AnalysisResult:
-    if straggler_threshold <= 1.0:
+    if not math.isfinite(straggler_threshold) or straggler_threshold <= 1.0:
         raise ValueError("straggler_threshold must be greater than 1.0")
     directory = directory.expanduser().resolve()
     summaries = load_summaries(directory)
@@ -277,6 +306,31 @@ def analyze(directory: Path, straggler_threshold: float = 1.20) -> AnalysisResul
     aggregate_runtime = sum(runtimes)
     mpi_time = sum(summary.mpi_time_ns for summary in summaries)
     total_bytes_sent = sum(summary.bytes_sent for summary in summaries)
+    timeline = [{"timestamp_ns": maximum_runtime * i // 50, "calls": 0, "duration_ns": 0} for i in range(50)]
+    metadata = {}
+    manifest = directory / "run.json"
+    if manifest.exists():
+        try:
+            metadata = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                raise ValueError("root must be an object")
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise TelemetryError(f"cannot read run metadata: {exc}") from exc
+    complete = len(summaries) == world_size and all(s.complete for s in summaries)
+    if not complete:
+        warnings.append("capture is incomplete; runtimes and findings describe partial evidence")
+    if any(s.context.get("events_dropped", "0") != "0" for s in summaries):
+        warnings.append("event limit reached; communication edges and timeline are partial, operation totals remain complete")
+    if not list(directory.glob("rank-*-events.jsonl")):
+        warnings.append("no event streams; communication and timeline coverage unavailable")
+    if metadata.get("return_code", 0) != 0:
+        warnings.append("launcher did not complete successfully; review run metadata")
+        complete = False
+    run_ids = {s.context.get("run_id") for s in summaries if s.context.get("run_id")}
+    if len(run_ids) > 1 or (run_ids and metadata.get("run_id") and metadata["run_id"] not in run_ids):
+        raise TelemetryError("mixed run identities in capture")
+    if mpi_time > aggregate_runtime:
+        warnings.append("summed MPI call time exceeds wall time; concurrent threads may overlap")
 
     result = AnalysisResult(
         source=str(directory),
@@ -291,9 +345,16 @@ def analyze(directory: Path, straggler_threshold: float = 1.20) -> AnalysisResul
         straggler_threshold=straggler_threshold,
         straggler_ranks=stragglers,
         operations=_aggregate_operations(summaries),
-        communication_edges=_load_communication_edges(directory, total_bytes_sent, warnings),
+        communication_edges=_load_communication_edges(directory, total_bytes_sent, warnings, world_size, timeline, maximum_runtime),
         rank_runtimes=sorted((summary.rank, summary.runtime_ns) for summary in summaries),
         warnings=warnings,
+        synthetic=any(s.synthetic for s in summaries),
+        complete=complete,
+        metadata=metadata,
+        ranks=[{"rank": s.rank, "hostname": s.hostname, "runtime_ns": s.runtime_ns,
+                "mpi_time_ns": s.mpi_time_ns, "context": s.context, "complete": s.complete}
+               for s in sorted(summaries, key=lambda s: s.rank)],
+        timeline=timeline,
     )
     result.findings = _make_findings(result)
     return result

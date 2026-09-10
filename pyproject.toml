@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ranklens"
-version = "0.1.0"
+version = "1.0.0"
 description = "MPI workload observability and performance diagnosis"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,7 @@ license = {text = "Apache-2.0"}
 authors = [{name = "Prakash Saini"}]
 keywords = ["MPI", "HPC", "PMPI", "observability", "performance"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
@@ -29,4 +29,3 @@ package-dir = {"" = "python"}
 
 [tool.setuptools.packages.find]
 where = ["python"]
-

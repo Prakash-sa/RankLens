@@ -56,3 +56,85 @@ body::before { content:''; position:fixed; inset:0; pointer-events:none; opacity
 @media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } *,*::before,*::after { transition-duration:.01ms!important; } }
 @media (max-width:1080px) { .coverage-strip { grid-template-columns:1fr 1fr; }.coverage-strip>div { grid-row:span 2; } }
 @media (max-width:720px) { .coverage-strip { grid-template-columns:1fr; }.coverage-strip>div { grid-row:auto; } }
+
+/* Working surfaces use readable type and compact controls across breakpoints. */
+body { font-size: 16px; }
+.skip-link { position: absolute; left: 1rem; top: -8rem; padding: 1rem; background: var(--lime); color: #080d09; z-index: 30; }
+.skip-link:focus { top: 1rem; }
+.workspace-header { display: flex; justify-content: space-between; gap: 2rem; align-items: center; padding: 2.5rem 0; }
+.workspace-header h1 { font-size: clamp(2rem, 4vw, 3.2rem); letter-spacing: -.05em; margin: 0; line-height: 1.1; }
+.workspace-header p:not(.eyebrow) { color: #a3aea5; max-width: 45rem; margin: .75rem 0 0; }
+.workspace-header.dragging { outline: 2px dashed var(--lime); outline-offset: 4px; }
+.toolbar, .export-actions { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+.secondary-button, .pagination button { border: 1px solid #536457; background: #142017; padding: .75rem 1rem; cursor: pointer; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button:hover:not(:disabled) { filter: brightness(1.12); }
+label { display: flex; flex-direction: column; gap: .45rem; font-size: .875rem; color: #abb7ad; }
+select, input:not([type=checkbox]) { border: 1px solid #4a5c4e; color: var(--ink); background: #131d15; padding: .65rem .8rem; min-width: 0; max-width: 100%; border-radius: 4px; font-size: 1rem; }
+input[type=checkbox] { accent-color: var(--lime); width: 1.1rem; height: 1.1rem; }
+.rank-controls { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+.checkbox-label { flex-direction: row; align-items: center; margin-top: 1rem; }
+.notice { padding: .9rem 1rem; border-left: 3px solid var(--amber); background: #251f12; color: #efdaaa; font-size: .875rem; line-height: 1.55; }
+.file-error { font-size: 1rem; }
+.file-error button { float: right; text-decoration: underline; border: none; background: none; }
+.dataset-strip { grid-template-columns: minmax(180px,1fr) minmax(180px,1.4fr) auto; }
+.dataset-strip strong, .dataset-strip button, .topbar nav { font-size: .875rem; }
+.dataset-strip small, .dataset-source, .privacy-pill, .eyebrow { font-size: .75rem; }
+.privacy-pill { letter-spacing: normal; }
+.metric-grid article { min-height: 170px; padding: 1.4rem; }
+.metric-grid p { font-size: .875rem; letter-spacing: normal; text-transform: none; color: #aab7ad; }
+.metric-grid footer { font-size: .75rem; line-height: 1.5; color: #99a69c; }
+.metric-grid strong { font-size: clamp(1.8rem,3vw,2.6rem); margin-top: 1.3rem; }
+.content-grid { padding-top: 2.5rem; align-items: start; }
+.section-heading h2 { font-size: 1.65rem; }
+.finding-card { grid-template-columns: 2rem 1fr; padding: 1.4rem; }
+.finding-category { font-size: .75rem; line-height: 1.5; letter-spacing: .06em; }
+.finding-index { font-size: .75rem; color: #94a498; }
+.finding-card > div > p:not(.finding-category), .finding-card details p { font-size: 1rem; color: #a9b6ad; }
+.finding-card h3 { font-size: 1.15rem; line-height: 1.45; }
+.finding-card summary { font-size: .875rem; line-height: 1.5; }
+.rank-chart { margin-top: 1.5rem; gap: 1.3rem; }
+.rank-meta strong, .rank-meta span { font-size: .875rem; }
+.rank-host { display: block; color: #99a69c; margin-top: .5rem; overflow-wrap: anywhere; font-size: .75rem; }
+.pagination { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 1.5rem; font-size: .875rem; }
+.operations-panel th, .operations-panel td { font-size: .875rem; line-height: 1.5; }
+.operations-panel th { color: #9aab9e; }
+.edges-panel { margin-bottom: 1.5rem; }
+.edge-list article { padding: 1rem; }
+.edge-route strong { font-size: .875rem; }
+.edge-list article > div:nth-child(2), .edge-list small { font-size: .75rem; color: #9eaea3; line-height: 1.6; }
+.panel-note, .empty-state { font-size: .875rem; color: #a4b3a9; line-height: 1.6; }
+.timeline { height: 170px; display: flex; gap: 3px; align-items: end; padding-top: 1rem; border-bottom: 1px solid #435347; }
+.timeline > div { flex: 1; background: var(--lime); min-width: 1px; opacity: .85; }
+.timeline + .panel-note { margin-bottom: 2.5rem; }
+.comparison-metrics { display: grid; grid-template-columns: repeat(3,1fr); gap: 1.5rem; margin-top: 1.5rem; }
+.comparison-metrics article > * { display: block; overflow-wrap: anywhere; }
+.comparison-metrics span { font-size: .875rem; color: #a4b3a9; }
+.comparison-metrics strong { font-size: 2rem; margin: .6rem 0; }
+.comparison-metrics small { color: #99a99e; font-size: .875rem; }
+.coverage-strip { grid-template-columns: repeat(4,1fr); }
+.coverage-strip article { display: block; overflow-wrap: anywhere; }
+.coverage-strip article strong { font-size: 1rem; }
+.coverage-strip article small { font-size: .875rem; color: #a3b2a7; line-height: 1.65; }
+.getting-started { margin: 2rem 0 4rem; padding: 1.5rem; border: 1px solid var(--line); color: #a8b8ad; }
+.getting-started summary { cursor: pointer; color: var(--ink); }
+.getting-started pre { overflow: auto; background: #142016; padding: 1rem; font-size: .875rem; }
+.getting-started p { line-height: 1.65; }
+.warnings { margin: 1.2rem 0; padding: 1rem 1.5rem; }
+.warnings li { font-size: .875rem; }
+.site-footer { font-size: .75rem; }
+@media (max-width:1100px) { .workspace-header { flex-direction: column; align-items: flex-start; }.coverage-strip { grid-template-columns: 1fr 1fr; }.coverage-strip > div { grid-row: auto; } }
+@media (max-width:720px) {
+  .dataset-strip { grid-template-columns: 1fr; gap: .9rem; }
+  .dataset-source { display: block; white-space: normal; }
+  .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .metric-grid article { padding: 1rem; }
+  .metric-grid strong { font-size: 1.65rem; }
+  .section-heading { flex-direction: column; }
+  .section-heading label { width: 100%; }
+  .privacy-pill { font-size: .75rem; max-width: 10rem; text-align: center; }
+  .comparison-metrics, .coverage-strip { grid-template-columns: 1fr; }
+  .rank-meta { gap: .5rem; flex-wrap: wrap; }
+  .panel-heading { flex-wrap: wrap; }
+}
+@media print { .topbar nav, .toolbar, .export-actions, .getting-started, .pagination { display:none; } body { background: white; color: black; } }

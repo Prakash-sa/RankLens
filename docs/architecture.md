@@ -1,54 +1,65 @@
 # Architecture
 
-RankLens v0.1 has three deliberately separate layers.
+RankLens 1.0 separates capture, contract, analysis, and presentation so each layer can fail or
+evolve without changing application semantics.
 
 ## Capture layer
 
-`libranklens_mpi` exports normal MPI symbols and forwards each call to the corresponding PMPI
-symbol. Timing uses `std::chrono::steady_clock`, so clock adjustments cannot produce negative
-durations. Each rank writes its own files and never performs a RankLens-added collective.
+`libranklens_mpi` exports normal MPI symbols and forwards them to PMPI. Each rank writes its own
+files and RankLens never introduces a collective. Timing uses `std::chrono::steady_clock`; a mutex
+protects local recorder and pending-request state for MPI thread support.
 
-The interceptor does bounded work around a call: datatype-size lookup, timestamping, aggregate
-counter updates, and (when enabled) one JSON Lines append. A mutex protects local state when MPI is
-initialized with thread support. Payload bytes are logical application payload, not a claim about
-wire bytes or collective algorithm traffic.
+Blocking calls are recorded at completion. Nonblocking initiation records the request and logical
+payload, while `Wait`, `Test`, and `Waitall` close tracked requests and resolve receive status.
+Communicator-local ranks are translated to `MPI_COMM_WORLD` ranks when possible. Application MPI
+return codes are preserved.
 
-## Contract layer
+The collector snapshots `summary.json.tmp` and atomically publishes a partial summary about once
+per second. `MPI_Finalize` publishes the complete summary. Event output is optional and capped per
+rank. Payload bytes are logical application payload, not wire traffic.
 
-The capture/analyzer boundary is a versioned JSON contract. Summary files contain the minimum data
-needed for cross-rank diagnosis; event files enable directed communication edges. The analyzer
-rejects unsupported schema versions and inconsistent world sizes, and warns about partial captures.
+## Contract and run provenance
 
-This boundary makes future collectors possible without coupling them to the interceptor. A Slurm
-epilog, node agent, or streaming collector can move the same files without changing analysis rules.
+The rank summary and event formats use schema major version 1. Readers reject unknown major
+versions, inconsistent rank/world-size data, and invalid metrics. Optional fields can grow within
+the version.
+
+The launcher creates an atomic `run.json` containing a random run ID, timestamps, command, declared
+workload identity, tags, scheduler environment, and final return state. The analyzer rejects mixed
+run identities and marks missing ranks, failed launches, event caps, and unfinished summaries as
+partial evidence.
 
 ## Analysis layer
 
-The Python package is dependency-free and deterministic. It aggregates operation time across ranks,
-compares each runtime with the median, reconstructs `MPI_Send` edges, evaluates transparent rules,
-and renders the same result to text, JSON, or HTML.
+The dependency-free Python analyzer deterministically aggregates operation time, computes rank
+imbalance, reconstructs successful send edges, builds a bounded rank-local event histogram, and
+evaluates documented diagnostic rules. Every finding includes evidence and a recommended
+experiment—not a promised optimization.
 
-Rules produce:
+The same result model drives terminal, JSON, HTML, CSV, ZIP, comparison, and SQLite workflows.
+Comparisons expose an observed runtime delta for context, but report speedup only for complete,
+nonsynthetic captures with the same declared workload identity.
 
-1. the evidence that crossed a documented threshold;
-2. a category and severity; and
-3. a next experiment, not a guaranteed optimization.
+## Presentation layer
+
+The standalone HTML report embeds no remote assets. The web workspace strictly validates imported
+analysis JSON and keeps files in the browser. Its timeline intentionally labels rank-local time;
+cross-node clocks are not treated as synchronized.
 
 ## Failure behavior
 
-- Failure to create the telemetry directory disables recording for that rank and never changes the
-  wrapped MPI call's return value.
-- MPI errors are recorded in events and returned unchanged to the application.
-- Missing summaries produce an explicit partial-capture warning.
-- Malformed event lines are skipped with a warning; malformed summary files fail analysis because
-  aggregate conclusions would be unreliable.
-- RankLens flushes on `MPI_Finalize`. Abrupt process termination can leave event data without a
-  summary, which v0.2 will address with crash-tolerant checkpoints.
+- A telemetry directory or event-file error disables affected recording and never changes an MPI
+  call's return value.
+- MPI errors may appear in the event stream but are excluded from successful-operation aggregates.
+- Missing or unfinished summaries remain analyzable only as explicitly partial captures.
+- Malformed event lines are skipped with bounded warnings; malformed summary files fail analysis.
+- A launcher timeout or failure is persisted to `run.json`; telemetry already flushed is retained.
+- Output directories must be empty, preventing accidental cross-run aggregation.
 
 ## Performance discipline
 
-Instrumentation overhead must be measured on controlled workloads. Useful comparisons record the
-application and input checksum, code commit, MPI implementation, node type/count, rank placement,
-thread environment, scheduler job ID, and per-rank timing. Event tracing can be disabled to measure
-the summary-only path. No overhead target is claimed before reproducible benchmark data exists.
+Instrumentation overhead must be measured with controlled workloads. Record input identity, code
+commit, MPI implementation, node type/count, placement, scheduler ID, and thread environment.
+Disable event tracing to isolate summary-only cost. The bundled benchmark harness alternates trial
+order and reports observed wall-clock overhead without making a universal overhead claim.
 

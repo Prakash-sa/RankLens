@@ -1,4 +1,5 @@
 add_executable(ranklens_ping_pong ping_pong.cpp)
 target_compile_features(ranklens_ping_pong PRIVATE cxx_std_17)
 target_link_libraries(ranklens_ping_pong PRIVATE MPI::MPI_CXX)
-
+add_executable(ranklens_nonblocking nonblocking.cpp)
+target_link_libraries(ranklens_nonblocking PRIVATE MPI::MPI_CXX)

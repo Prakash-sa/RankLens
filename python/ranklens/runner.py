@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import json
+import uuid
+from datetime import datetime, timezone
 import platform
 import subprocess
 import sys
@@ -17,7 +20,10 @@ class RunnerError(ValueError):
 def discover_library(explicit: Optional[Path] = None) -> Path:
     candidates = []
     if explicit is not None:
-        candidates.append(explicit)
+        resolved = explicit.expanduser().resolve()
+        if not resolved.is_file():
+            raise RunnerError(f"explicit interceptor library does not exist: {resolved}")
+        return resolved
     configured = os.environ.get("RANKLENS_LIBRARY")
     if configured:
         candidates.append(Path(configured))
@@ -26,6 +32,7 @@ def discover_library(explicit: Optional[Path] = None) -> Path:
     package_root = Path(__file__).resolve().parents[2]
     candidates.extend(
         [
+            Path.cwd() / "build" / "src" / "interceptor" / f"libranklens_mpi{extension}",
             package_root / "build" / "src" / "interceptor" / f"libranklens_mpi{extension}",
             Path(sys.prefix) / "lib" / f"libranklens_mpi{extension}",
             Path("/usr/local/lib") / f"libranklens_mpi{extension}",
@@ -82,18 +89,48 @@ def _forward_macos_openmpi_environment(command: Sequence[str], environment: Mapp
     if not any(marker in version_text for marker in ("Open MPI", "OpenRTE", "PRRTE")):
         return adjusted
     exports = []
-    for name in ("DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE", "RANKLENS_OUTPUT_DIR"):
+    for name in sorted(environment):
+        if not (name.startswith("RANKLENS_") or name in {"DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE"}):
+            continue
         if name in environment:
             exports.extend(["-x", name])
     return [adjusted[0], *exports, *adjusted[1:]]
 
 
-def run(command: Sequence[str], library: Path, output: Path) -> int:
+def run(command: Sequence[str], library: Path, output: Path, *, workload: str = "",
+        tags: Optional[Mapping[str, str]] = None, timeout: Optional[float] = None) -> int:
     if not command:
         raise RunnerError("no MPI launcher or application command was provided after --")
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise RunnerError(f"capture directory must be empty to avoid mixing runs: {output}")
     environment = instrumented_environment(library, output)
+    run_id = uuid.uuid4().hex
+    environment["RANKLENS_RUN_ID"] = run_id
+    metadata = {"schema_version": 1, "run_id": run_id, "workload": workload,
+                "tags": dict(tags or {}), "command": list(command),
+                "started_at": datetime.now(timezone.utc).isoformat(), "state": "running",
+                "scheduler": {k: v for k, v in os.environ.items() if k in {
+                    "SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_NTASKS", "SLURM_JOB_NODELIST",
+                    "SLURM_CPUS_PER_TASK", "FLUX_JOB_ID", "PCLUSTER_CLUSTER_NAME"}}}
+    def save_metadata():
+        temporary = output / "run.json.tmp"
+        temporary.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(output / "run.json")
+    save_metadata()
     launch_command = _forward_macos_openmpi_environment(command, environment)
-    completed = subprocess.run(launch_command, env=environment, check=False)
-    return completed.returncode
+    try:
+        completed = subprocess.run(launch_command, env=environment, check=False, timeout=timeout)
+        code = completed.returncode
+    except subprocess.TimeoutExpired:
+        code = 124
+    except KeyboardInterrupt:
+        code = 130
+    except OSError as exc:
+        metadata["error"] = str(exc)
+        code = 127
+    metadata.update(return_code=code, state="completed" if code == 0 else "failed",
+                    finished_at=datetime.now(timezone.utc).isoformat())
+    save_metadata()
+    return code

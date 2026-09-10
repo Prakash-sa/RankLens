@@ -1,58 +1,69 @@
 # RankLens
 
-RankLens is an open-source observability and performance-diagnosis system for MPI workloads. It
-intercepts selected MPI calls through the standard PMPI interface, writes per-rank telemetry, and
-turns that evidence into terminal, JSON, and standalone HTML reports.
+RankLens is a local-first observability and performance-diagnosis toolkit for MPI workloads. Its
+PMPI interceptor records per-rank timing and communication evidence without source changes; its
+dependency-free Python analyzer turns a capture into explainable findings, portable reports, and
+controlled comparisons; and its responsive browser workspace explores an `analysis.json` without
+uploading it.
 
-The v0.1 release is deliberately narrow and usable: it instruments `MPI_Send`, `MPI_Recv`,
-`MPI_Allreduce`, `MPI_Bcast`, and `MPI_Barrier`; calculates per-rank runtime and MPI time; builds a
-point-to-point communication matrix; and flags stragglers, collective pressure, synchronization
-wait, communication hotspots, and possible strong-scaling saturation.
+RankLens 1.0 instruments blocking and nonblocking point-to-point operations, major collectives,
+request completion, process placement context, and bounded event streams. Recommendations remain
+testable hypotheses: RankLens does not invent speedups or claim scientific equivalence.
 
-RankLens recommendations are testable hypotheses. It does not invent expected speedups or claim
-that an application is optimal when no rule fires.
+## What ships
+
+- PMPI wrappers for `MPI_Send`, `MPI_Recv`, `MPI_Isend`, `MPI_Irecv`, `MPI_Wait`, `MPI_Test`,
+  `MPI_Waitall`, `MPI_Allreduce`, `MPI_Bcast`, and `MPI_Barrier`;
+- crash-tolerant periodic summaries, atomic final summaries, event caps, and explicit partial-run
+  status;
+- resolved wildcard receives and communicator-local peers mapped to world ranks;
+- CPU affinity, hostname, peak RSS, scheduler identifiers, run identity, workload identity, and
+  user-defined tags;
+- terminal, strict JSON, standalone HTML, CSV, and offline ZIP outputs;
+- provenance-gated run comparison, optional allocation-cost calculation, a local SQLite catalog,
+  and an alternating baseline/instrumented overhead harness;
+- an accessible web workspace with validation, rank filtering, event activity, communication
+  edges, provenance, exports, and baseline comparison;
+- unit tests plus real two-rank blocking and nonblocking MPI integration tests.
 
 ## Architecture
 
 ```text
 MPI application
+    │ PMPI interception (no added collectives)
+    ▼
+Per-rank summary JSON + optional bounded JSONL events
     │
     ▼
-PMPI interceptor (C++ shared library)
-    │  one summary + optional event stream per rank
-    ▼
-Versioned JSON telemetry
-    │
-    ▼
-Cross-rank analyzer (dependency-free Python)
-    ├── imbalance and stragglers
-    ├── operation and collective cost
-    ├── communication edges and hotspots
-    └── evidence-linked recommendations
-         ├── terminal
-         ├── JSON
-         └── standalone HTML
+Deterministic Python analyzer
+    ├── stragglers and runtime imbalance
+    ├── MPI operation and synchronization cost
+    ├── communication edges and traffic hotspots
+    ├── terminal / JSON / HTML / CSV / ZIP
+    └── controlled comparison / SQLite catalog
+                 │
+                 ▼
+          local browser workspace
 ```
 
-The telemetry files are rank-local: the instrumented process performs no extra MPI collectives,
-so observation cannot introduce a new collective deadlock. See [docs/architecture.md](docs/architecture.md)
-and [docs/telemetry-schema.md](docs/telemetry-schema.md).
+Telemetry is rank-local and RankLens introduces no MPI collective. See
+[architecture](docs/architecture.md) and the [telemetry contract](docs/telemetry-schema.md).
 
-## Quick start
+## Install
 
-Prerequisites: CMake 3.20+, a C++17 compiler, an MPI implementation with PMPI support, and Python
-3.9+.
+Prerequisites are CMake 3.20+, a C++17 compiler, an MPI implementation with PMPI support, and
+Python 3.9+.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
-If CMake on an Apple Silicon Mac finds Homebrew Open MPI but the Apple command-line compiler cannot
-find C++ standard headers, select Homebrew LLVM explicitly:
+On Apple Silicon, if Apple Clang cannot use the headers expected by Homebrew Open MPI, select
+Homebrew LLVM explicitly:
 
 ```bash
 cmake -S . -B build \
@@ -61,32 +72,54 @@ cmake -S . -B build \
   -DMPI_CXX_COMPILER=/opt/homebrew/bin/mpicxx
 ```
 
-Run the included workload under the interceptor:
+## Capture and analyze
+
+Use a new output directory for every run:
 
 ```bash
 ranklens run \
   --library build/src/interceptor/libranklens_mpi.dylib \
-  --output ranklens-results \
-  -- mpirun -n 2 build/examples/ranklens_ping_pong
+  --output captures/solver-a \
+  --workload cavity-re100-grid256-inputsha256 \
+  --tag commit=abc123 \
+  -- mpirun -n 4 ./solver input.json
 ```
 
-On Linux, the library suffix is `.so`. `ranklens run` configures `LD_PRELOAD` on Linux or
-`DYLD_INSERT_LIBRARIES` on macOS. For an existing application, replace the example command with
-your normal `mpirun` or `srun` command; no source-code changes are required.
+The library suffix is `.so` on Linux. `ranklens run` configures `LD_PRELOAD` on Linux and
+`DYLD_INSERT_LIBRARIES` on macOS, records launcher/scheduler provenance, and writes
+`analysis.json` plus `report.html` after the command exits. Replace `mpirun` with `srun` or
+`flux run` when appropriate. A multi-node output path must be visible to every rank, or rank-local
+files must be collected into one directory before analysis.
 
-Analyze an existing capture and create machine-readable output:
+Analyze previously collected telemetry and create every portable output:
 
 ```bash
-ranklens analyze ranklens-results \
-  --html ranklens-results/report.html \
-  --json ranklens-results/analysis.json
+ranklens analyze captures/solver-a \
+  --json captures/solver-a/analysis.json \
+  --html captures/solver-a/report.html \
+  --csv captures/solver-a/ranks.csv \
+  --bundle captures/solver-a.zip
 ```
 
-## Web dashboard
+## Compare, catalog, and measure overhead
 
-The browser dashboard in `web/` opens the analyzer's JSON output and renders the same evidence as
-an interactive, responsive operations view. Analysis files are parsed entirely in the browser and
-are not uploaded or persisted by RankLens.
+The same nonempty `--workload` value and complete nonsynthetic captures are required before
+RankLens reports a speedup. Workload identity is user-declared; validate scientific outputs in the
+application itself.
+
+```bash
+ranklens compare captures/baseline captures/candidate --hourly-rate 12.50
+ranklens catalog --database ranklens.sqlite3 --ingest captures/candidate
+ranklens catalog --database ranklens.sqlite3
+ranklens benchmark --library build/src/interceptor/libranklens_mpi.dylib \
+  --output overhead-study --repeats 5 -- mpirun -n 4 ./solver input.json
+ranklens doctor
+```
+
+`benchmark` alternates baseline and instrumented trials, reports launcher wall-clock overhead, and
+records stdout hashes. Matching hashes are useful evidence but do not prove numerical equivalence.
+
+## Web workspace
 
 ```bash
 cd web
@@ -94,27 +127,20 @@ npm ci
 npm run dev
 ```
 
-Open the printed local URL, then choose the `analysis.json` produced by `ranklens analyze`. The
-dashboard requires Node.js 22.13 or newer. Run `npm run build` for a production build.
-
-Try the report pipeline without MPI. This data is explicitly marked synthetic and is not benchmark
-evidence:
-
-```bash
-ranklens demo --output demo-results
-```
+Open the printed URL and choose an `analysis.json`. Parsing and exploration occur entirely in the
+browser. Node.js 22.13+ is required; `npm run lint` and `npm run build` validate a production build.
 
 ## Runtime controls
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `RANKLENS_OUTPUT_DIR` | `ranklens-results` | Destination shared or rank-local directory |
-| `RANKLENS_TRACE_EVENTS` | `1` | Set to `0` for summaries only and lower I/O volume |
-| `RANKLENS_LIBRARY` | unset | Default interceptor path used by `ranklens run` |
+| `RANKLENS_OUTPUT_DIR` | `ranklens-results` | Capture directory visible to each rank |
+| `RANKLENS_TRACE_EVENTS` | `1` | Set to `0` for summary-only, lower-I/O capture |
+| `RANKLENS_MAX_EVENTS` | `100000` | Maximum event records per rank; `0` disables events |
+| `RANKLENS_LIBRARY` | unset | Interceptor used by `ranklens run`, `doctor`, and `benchmark` |
 
-For a multi-node job, the configured output path must be visible to every rank (for example, a
-shared filesystem) or rank-local files must be collected after the job. Filenames include the rank,
-but two simultaneous jobs must use separate output directories.
+RankLens preserves a pre-existing preload value. The launcher wrapper forwards RankLens and DYLD
+variables through Open MPI on macOS.
 
 ## Test
 
@@ -122,20 +148,24 @@ but two simultaneous jobs must use separate output directories.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
+
+cd web
+npm ci
+npm run lint
+npm run build
 ```
 
-The suite includes pure-Python unit tests and a real two-rank MPI interposition test.
+## Boundaries
 
-## Current boundaries
+RankLens currently observes MPI application behavior and lightweight process context. It does not
+collect GPU counters, fabric counters, storage throughput, power, or cluster-wide utilization, and
+it does not replace a scheduler or infrastructure monitoring platform. `mpi_time_ns` is summed
+inclusive wall time across instrumented calls and can overlap across threads. Event timestamps are
+rank-local, so the UI histogram is not a synchronized distributed trace. See the
+[roadmap](docs/roadmap.md) for planned adapters and validation work.
 
-v0.1 observes blocking calls only. It does not yet instrument nonblocking completion, derive CPU or
-NUMA placement, collect hardware counters, integrate directly with Slurm accounting, or estimate a
-speedup. Those boundaries are intentional and tracked in [docs/roadmap.md](docs/roadmap.md).
-
-## Contributing
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing an interceptor or analysis rule. Every new
-recommendation needs a precise evidence condition and a controlled test. Security concerns should
-follow [SECURITY.md](SECURITY.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before adding wrappers or analysis rules. Every new
+recommendation needs a precise evidence condition and a controlled test. Report security issues as
+described in [SECURITY.md](SECURITY.md).
 
 Licensed under Apache-2.0.

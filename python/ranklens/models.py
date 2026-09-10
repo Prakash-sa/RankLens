@@ -25,6 +25,9 @@ class RankSummary:
     bytes_sent: int
     bytes_received: int
     operations: Dict[str, OperationStats]
+    synthetic: bool = False
+    complete: bool = True
+    context: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,12 @@ class AnalysisResult:
     rank_runtimes: List[Tuple[int, int]] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    schema_version: int = 1
+    synthetic: bool = False
+    complete: bool = True
+    metadata: dict = field(default_factory=dict)
+    ranks: List[dict] = field(default_factory=list)
+    timeline: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
-
