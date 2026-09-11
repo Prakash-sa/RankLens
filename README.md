@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-2ea44f)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab)](pyproject.toml)
 
-![RankLens reveals performance bottlenecks across an HPC cluster](docs/assets/ranklens-hero.png)
+![RankLens dashboard showing MPI runtime imbalance and bottleneck findings](docs/assets/ranklens-dashboard.jpg)
 
 RankLens turns an MPI run into a clear performance report. It highlights slow ranks, communication
 hotspots, time spent inside MPI, and incomplete captures so you can choose the next experiment with
