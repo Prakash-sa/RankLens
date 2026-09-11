@@ -158,11 +158,12 @@ int process_id() {
 #endif
 }
 
-constexpr std::array<const char*, 19> kOperationNames = {
+constexpr std::array<const char*, 23> kOperationNames = {
     "MPI_Send", "MPI_Recv", "MPI_Isend", "MPI_Irecv", "MPI_Wait", "MPI_Test",
     "MPI_Waitall", "MPI_Waitany", "MPI_Waitsome", "MPI_Testall", "MPI_Testany",
     "MPI_Testsome", "MPI_Allreduce", "MPI_Bcast", "MPI_Barrier",
-    "MPI_Cancel", "MPI_Request_free", "MPI_Isend_complete", "MPI_Irecv_complete"};
+    "MPI_Cancel", "MPI_Request_free", "MPI_Send_init", "MPI_Recv_init",
+    "MPI_Start", "MPI_Startall", "MPI_Isend_complete", "MPI_Irecv_complete"};
 
 std::size_t operation_index(const char* operation) {
   for (std::size_t index = 0; index < kOperationNames.size(); ++index) {
@@ -173,6 +174,14 @@ std::size_t operation_index(const char* operation) {
 
 bool is_completion(std::size_t index) {
   return index == kOperationNames.size() - 2 || index == kOperationNames.size() - 1;
+}
+
+bool is_sent_payload(std::size_t index) {
+  return index == 0 || index == 2;
+}
+
+bool is_received_payload(std::size_t index) {
+  return index == 1 || index == kOperationNames.size() - 1;
 }
 
 struct EventRecord {
@@ -256,8 +265,8 @@ class Recorder {
         ++api_calls_;
         if (error_code != MPI_SUCCESS) ++failed_calls_;
       }
-      if (index == 0 || index == 2) bytes_sent_ += safe_bytes;
-      if (index == 1 || index == kOperationNames.size() - 1) bytes_received_ += safe_bytes;
+      if (is_sent_payload(index)) bytes_sent_ += safe_bytes;
+      if (is_received_payload(index)) bytes_received_ += safe_bytes;
 
       if (trace_events_) {
         const auto event_sequence = event_sequence_++;
@@ -493,17 +502,21 @@ struct Pending {
   MPI_Group peers;
   int peer;
   int tag;
+  bool persistent;
 };
 std::mutex pending_mutex;
 std::map<MPI_Fint, Pending> pending;
+std::map<MPI_Fint, Pending> persistent;
 long long next_request_id = 0;
 
-long long remember(MPI_Request request, bool receive, MPI_Comm comm, int peer, int tag) noexcept {
+long long remember(MPI_Request request, bool receive, MPI_Comm comm, int peer, int tag,
+                   bool persistent_request = false) noexcept {
   if (request == MPI_REQUEST_NULL) return -1;
   MPI_Group group = MPI_GROUP_NULL;
   try {
     std::lock_guard<std::mutex> lock(pending_mutex);
-    if (pending.size() >= 65536) {
+    auto& table = persistent_request ? persistent : pending;
+    if (table.size() >= 65536) {
       if (recorder) recorder->request_tracking_overflow();
       return -1;
     }
@@ -512,11 +525,11 @@ long long remember(MPI_Request request, bool receive, MPI_Comm comm, int peer, i
     if (inter) PMPI_Comm_remote_group(comm, &group);
     else PMPI_Comm_group(comm, &group);
     auto key = PMPI_Request_c2f(request);
-    auto previous = pending.find(key);
-    if (previous != pending.end() && previous->second.peers != MPI_GROUP_NULL)
+    auto previous = table.find(key);
+    if (previous != table.end() && previous->second.peers != MPI_GROUP_NULL)
       PMPI_Group_free(&previous->second.peers);
     const auto id = ++next_request_id;
-    pending[key] = Pending{id, receive, group, peer, tag};
+    table[key] = Pending{id, receive, group, peer, tag, persistent_request};
     return id;
   } catch (...) {
     if (group != MPI_GROUP_NULL) PMPI_Group_free(&group);
@@ -529,10 +542,42 @@ void forget_request(MPI_Fint key) noexcept {
   try {
     std::lock_guard<std::mutex> lock(pending_mutex);
     auto found = pending.find(key);
-    if (found == pending.end()) return;
-    if (found->second.peers != MPI_GROUP_NULL) PMPI_Group_free(&found->second.peers);
-    pending.erase(found);
+    if (found != pending.end()) {
+      if (!found->second.persistent && found->second.peers != MPI_GROUP_NULL)
+        PMPI_Group_free(&found->second.peers);
+      pending.erase(found);
+    }
+    auto persistent_found = persistent.find(key);
+    if (persistent_found == persistent.end()) return;
+    if (persistent_found->second.peers != MPI_GROUP_NULL)
+      PMPI_Group_free(&persistent_found->second.peers);
+    persistent.erase(persistent_found);
   } catch (...) {}
+}
+
+long long request_id(MPI_Fint key) noexcept {
+  if (key == -1) return -1;
+  try {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    auto active = pending.find(key);
+    if (active != pending.end()) return active->second.id;
+    auto saved = persistent.find(key);
+    if (saved != persistent.end()) return saved->second.id;
+  } catch (...) {}
+  return -1;
+}
+
+long long start_persistent(MPI_Fint key) noexcept {
+  if (key == -1) return -1;
+  try {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    auto saved = persistent.find(key);
+    if (saved == persistent.end()) return -1;
+    pending[key] = Pending{saved->second.id, saved->second.receive, saved->second.peers,
+                           saved->second.peer, saved->second.tag, true};
+    return saved->second.id;
+  } catch (...) {}
+  return -1;
 }
 
 void complete_request(MPI_Fint key, MPI_Status* status) noexcept {
@@ -554,7 +599,7 @@ void complete_request(MPI_Fint key, MPI_Status* status) noexcept {
       PMPI_Group_free(&world);
       peer = translated;
     }
-    if (item.peers != MPI_GROUP_NULL) PMPI_Group_free(&item.peers);
+    if (!item.persistent && item.peers != MPI_GROUP_NULL) PMPI_Group_free(&item.peers);
     if (recorder) {
       const auto now = Clock::now();
       recorder->record(item.receive ? "MPI_Irecv_complete" : "MPI_Isend_complete", now, now,
@@ -623,9 +668,14 @@ int ranklens_MPI_Finalize() {
     ranklens::recorder->prepare_finalize();
   }
   for (auto& entry : ranklens::pending) {
-    if (entry.second.peers != MPI_GROUP_NULL) PMPI_Group_free(&entry.second.peers);
+    if (!entry.second.persistent && entry.second.peers != MPI_GROUP_NULL)
+      PMPI_Group_free(&entry.second.peers);
   }
   ranklens::pending.clear();
+  for (auto& entry : ranklens::persistent) {
+    if (entry.second.peers != MPI_GROUP_NULL) PMPI_Group_free(&entry.second.peers);
+  }
+  ranklens::persistent.clear();
   const int result = PMPI_Finalize();
   if (ranklens::recorder) {
     ranklens::recorder->finish_finalize(result);
@@ -715,6 +765,60 @@ int ranklens_MPI_Irecv(void* buffer, int count, MPI_Datatype datatype, int peer,
   ranklens::record("MPI_Irecv", start, end, 0, peer, tag, result, comm, id);
   return result;
 }
+
+int ranklens_MPI_Send_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag,
+                           MPI_Comm comm, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Send_init(buffer, count, datatype, peer, tag, comm, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, false, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Send_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
+int ranklens_MPI_Recv_init(void* buffer, int count, MPI_Datatype datatype, int peer, int tag,
+                           MPI_Comm comm, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Recv_init(buffer, count, datatype, peer, tag, comm, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, true, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Recv_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
+int ranklens_MPI_Start(MPI_Request* request) {
+  const auto key = ranklens::request_key(*request);
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Start(request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS ? ranklens::start_persistent(key) : ranklens::request_id(key);
+  ranklens::record("MPI_Start", start, end, 0, -1, -1, result, MPI_COMM_WORLD, id);
+  return result;
+}
+
+int ranklens_MPI_Startall(int count, MPI_Request requests[]) {
+  if (count < 0) return PMPI_Startall(count, requests);
+  std::vector<MPI_Fint> keys;
+  try {
+    keys.reserve(count);
+    for (int item = 0; item < count; ++item) keys.push_back(ranklens::request_key(requests[item]));
+  } catch (...) {
+    return PMPI_Startall(count, requests);
+  }
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Startall(count, requests);
+  const auto end = ranklens::Clock::now();
+  if (result == MPI_SUCCESS) {
+    for (const auto key : keys) ranklens::start_persistent(key);
+  }
+  ranklens::record("MPI_Startall", start, end, 0, -1, -1, result);
+  return result;
+}
+
 int ranklens_MPI_Wait(MPI_Request* request, MPI_Status* status) {
   const auto key = ranklens::request_key(*request);
   MPI_Status local{};
@@ -886,19 +990,21 @@ int ranklens_MPI_Testsome(int count, MPI_Request requests[], int* outcount, int 
 }
 
 int ranklens_MPI_Cancel(MPI_Request* request) {
+  const auto id = ranklens::request_id(ranklens::request_key(*request));
   const auto start = ranklens::Clock::now();
   const int result = PMPI_Cancel(request);
   const auto end = ranklens::Clock::now();
-  ranklens::record("MPI_Cancel", start, end, 0, -1, -1, result);
+  ranklens::record("MPI_Cancel", start, end, 0, -1, -1, result, MPI_COMM_WORLD, id);
   return result;
 }
 
 int ranklens_MPI_Request_free(MPI_Request* request) {
   const auto key = ranklens::request_key(*request);
+  const auto id = ranklens::request_id(key);
   const auto start = ranklens::Clock::now();
   const int result = PMPI_Request_free(request);
   const auto end = ranklens::Clock::now();
-  ranklens::record("MPI_Request_free", start, end, 0, -1, -1, result);
+  ranklens::record("MPI_Request_free", start, end, 0, -1, -1, result, MPI_COMM_WORLD, id);
   if (result == MPI_SUCCESS) ranklens::forget_request(key);
   return result;
 }
@@ -930,6 +1036,10 @@ RANKLENS_INTERPOSE(ranklens_MPI_Bcast, MPI_Bcast);
 RANKLENS_INTERPOSE(ranklens_MPI_Barrier, MPI_Barrier);
 RANKLENS_INTERPOSE(ranklens_MPI_Isend, MPI_Isend);
 RANKLENS_INTERPOSE(ranklens_MPI_Irecv, MPI_Irecv);
+RANKLENS_INTERPOSE(ranklens_MPI_Send_init, MPI_Send_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Recv_init, MPI_Recv_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Start, MPI_Start);
+RANKLENS_INTERPOSE(ranklens_MPI_Startall, MPI_Startall);
 RANKLENS_INTERPOSE(ranklens_MPI_Wait, MPI_Wait);
 RANKLENS_INTERPOSE(ranklens_MPI_Test, MPI_Test);
 RANKLENS_INTERPOSE(ranklens_MPI_Waitall, MPI_Waitall);
@@ -952,6 +1062,10 @@ int MPI_Init_thread(int* argc, char*** argv, int required, int* provided) {
 int MPI_Finalize() { return ranklens_MPI_Finalize(); }
 int MPI_Isend(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Isend(buffer, count, datatype, peer, tag, comm, request); }
 int MPI_Irecv(void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Irecv(buffer, count, datatype, peer, tag, comm, request); }
+int MPI_Send_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Send_init(buffer, count, datatype, peer, tag, comm, request); }
+int MPI_Recv_init(void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Recv_init(buffer, count, datatype, peer, tag, comm, request); }
+int MPI_Start(MPI_Request* request) { return ranklens_MPI_Start(request); }
+int MPI_Startall(int count, MPI_Request requests[]) { return ranklens_MPI_Startall(count, requests); }
 int MPI_Wait(MPI_Request* request, MPI_Status* status) { return ranklens_MPI_Wait(request, status); }
 int MPI_Test(MPI_Request* request, int* flag, MPI_Status* status) { return ranklens_MPI_Test(request, flag, status); }
 int MPI_Waitall(int count, MPI_Request requests[], MPI_Status statuses[]) { return ranklens_MPI_Waitall(count, requests, statuses); }

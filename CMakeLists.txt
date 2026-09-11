@@ -63,10 +63,14 @@ if(BUILD_TESTING AND RANKLENS_BUILD_TESTS)
     add_test(NAME ranklens_completion_families_integration COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_completion_families.py
       ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_completion_families>)
+    add_test(NAME ranklens_persistent_requests_integration COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_persistent_requests.py
+      ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_persistent_requests>)
     set_tests_properties(ranklens_mpi_integration ranklens_nonblocking_integration
-      ranklens_completion_families_integration
+      ranklens_completion_families_integration ranklens_persistent_requests_integration
       PROPERTIES TIMEOUT 60)
     set_tests_properties(ranklens_nonblocking_integration ranklens_completion_families_integration
+      ranklens_persistent_requests_integration
       PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python")
   endif()
 endif()
