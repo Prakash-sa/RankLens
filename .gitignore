@@ -11,3 +11,7 @@ __pycache__/
 ranklens-results/
 demo-results/
 .DS_Store
+
+# Local AI-agent planning and execution notes. Never publish this directory.
+.agents/private/
+.ranklens-agent/private/

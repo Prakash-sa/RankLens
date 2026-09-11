@@ -1,7 +1,7 @@
 # Architecture
 
-This page describes the current local toolkit. The proposed shared platform is specified in the
-[enterprise system design](enterprise-system-design.md), with explicit baseline gaps and delivery gates.
+This page describes the currently implemented local toolkit and its observable behavior. Internal
+delivery planning is intentionally kept outside the public repository.
 
 RankLens 1.0 separates capture, contract, analysis, and presentation so each layer can fail or
 evolve without changing application semantics.
@@ -16,7 +16,8 @@ protect recorder and pending-request state for MPI thread support; their measure
 part of the observer-overhead gate.
 
 Blocking calls are recorded at completion. Nonblocking initiation records the request and logical
-payload, while `Wait`, `Test`, and `Waitall` close tracked requests and resolve receive status.
+payload, while the supported `Wait` and `Test` completion families close tracked requests and
+resolve receive status.
 Communicator-local ranks are translated to `MPI_COMM_WORLD` ranks when possible. Application MPI
 return codes are preserved.
 

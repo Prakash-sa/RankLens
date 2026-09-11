@@ -2,8 +2,7 @@
 
 This Compose profile exercises the implemented admission foundation: PostgreSQL migrations,
 authenticated API, immutable local object adapter, and leased worker. It is a development/pilot
-profile, not the HA, mTLS, managed object storage, backup, RLS, or fleet-scale certification in the
-[enterprise delivery plan](../docs/enterprise-delivery-plan.md).
+profile, not an HA, mTLS, managed-object-storage, backup, RLS, or fleet-scale certification.
 
 Set two secrets in the invoking environment:
 
