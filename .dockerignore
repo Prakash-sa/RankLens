@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.nodeenv
+build
+dist
+web/node_modules
+web/dist
+__pycache__
+*.pyc
+*.sqlite3
+ranklens-results
+demo-results

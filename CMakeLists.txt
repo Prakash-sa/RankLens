@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
   RankLens
-  VERSION 1.0.0
+  VERSION 1.1.0
   DESCRIPTION "Cross-layer observability and performance diagnosis for MPI workloads"
   LANGUAGES CXX
 )
@@ -60,9 +60,13 @@ if(BUILD_TESTING AND RANKLENS_BUILD_TESTS)
     add_test(NAME ranklens_nonblocking_integration COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_nonblocking.py
       ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_nonblocking>)
+    add_test(NAME ranklens_completion_families_integration COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_completion_families.py
+      ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_completion_families>)
     set_tests_properties(ranklens_mpi_integration ranklens_nonblocking_integration
+      ranklens_completion_families_integration
       PROPERTIES TIMEOUT 60)
-    set_tests_properties(ranklens_nonblocking_integration
+    set_tests_properties(ranklens_nonblocking_integration ranklens_completion_families_integration
       PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python")
   endif()
 endif()

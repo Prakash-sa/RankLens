@@ -1,28 +1,37 @@
 # Architecture
 
+This page describes the current local toolkit. The proposed shared platform is specified in the
+[enterprise system design](enterprise-system-design.md), with explicit baseline gaps and delivery gates.
+
 RankLens 1.0 separates capture, contract, analysis, and presentation so each layer can fail or
 evolve without changing application semantics.
 
 ## Capture layer
 
-`libranklens_mpi` exports normal MPI symbols and forwards them to PMPI. Each rank writes its own
-files and RankLens never introduces a collective. Timing uses `std::chrono::steady_clock`; a mutex
-protects local recorder and pending-request state for MPI thread support.
+`libranklens_mpi` exports normal MPI symbols and forwards them to PMPI. Each rank owns its files
+and RankLens never introduces a collective. Timing uses `std::chrono::steady_clock`; bounded,
+preallocated event buffers and fixed operation slots keep serialization and filesystem writes off
+ordinary MPI call paths. A non-MPI writer thread drains detail and publishes snapshots. Mutexes
+protect recorder and pending-request state for MPI thread support; their measured contention remains
+part of the observer-overhead gate.
 
 Blocking calls are recorded at completion. Nonblocking initiation records the request and logical
 payload, while `Wait`, `Test`, and `Waitall` close tracked requests and resolve receive status.
 Communicator-local ranks are translated to `MPI_COMM_WORLD` ranks when possible. Application MPI
 return codes are preserved.
 
-The collector snapshots `summary.json.tmp` and atomically publishes a partial summary about once
-per second. `MPI_Finalize` publishes the complete summary. Event output is optional and capped per
-rank. Payload bytes are logical application payload, not wire traffic.
+The writer publishes `summary.json.tmp` about once per second and atomically renames it to a partial
+summary. It publishes `pre_finalize` before the underlying finalization and `finalized` with
+`complete: true` only after `PMPI_Finalize` returns successfully. Rename is not an fsync durability
+guarantee. Event output is optional and bounded by a live buffer and lifetime cap; drops and request
+tracking overflow are explicit. Payload bytes are logical application payload, not wire traffic.
 
 ## Contract and run provenance
 
-The rank summary and event formats use schema major version 1. Readers reject unknown major
-versions, inconsistent rank/world-size data, and invalid metrics. Optional fields can grow within
-the version.
+Current native rank summaries and events use schema major version 2. The analyzer also accepts
+legacy native version 1 while preserving its accounting meaning. Readers reject unknown major
+versions, inconsistent rank/world-size data, invalid lifecycle states, and mixed API/completion
+totals.
 
 The launcher creates an atomic `run.json` containing a random run ID, timestamps, command, declared
 workload identity, tags, scheduler environment, and final return state. The analyzer rejects mixed
@@ -50,7 +59,9 @@ cross-node clocks are not treated as synchronized.
 
 - A telemetry directory or event-file error disables affected recording and never changes an MPI
   call's return value.
-- MPI errors may appear in the event stream but are excluded from successful-operation aggregates.
+- Failed calls contribute API count and duration, zero payload, and a separate failure counter.
+  Request-completion lifecycle records remain separate from API-invocation totals in version 2;
+  version-1 imports preserve the older semantics.
 - Missing or unfinished summaries remain analyzable only as explicitly partial captures.
 - Malformed event lines are skipped with bounded warnings; malformed summary files fail analysis.
 - A launcher timeout or failure is persisted to `run.json`; telemetry already flushed is retained.
@@ -62,4 +73,3 @@ Instrumentation overhead must be measured with controlled workloads. Record inpu
 commit, MPI implementation, node type/count, placement, scheduler ID, and thread environment.
 Disable event tracing to isolate summary-only cost. The bundled benchmark harness alternates trial
 order and reports observed wall-clock overhead without making a universal overhead claim.
-

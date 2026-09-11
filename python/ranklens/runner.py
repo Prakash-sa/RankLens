@@ -107,8 +107,13 @@ def run(command: Sequence[str], library: Path, output: Path, *, workload: str = 
         raise RunnerError(f"capture directory must be empty to avoid mixing runs: {output}")
     environment = instrumented_environment(library, output)
     run_id = uuid.uuid4().hex
+    capture_epoch = uuid.uuid4().hex
     environment["RANKLENS_RUN_ID"] = run_id
+    environment["RANKLENS_CAPTURE_EPOCH"] = capture_epoch
+    environment.setdefault("RANKLENS_ATTEMPT_ID", run_id)
     metadata = {"schema_version": 1, "run_id": run_id, "workload": workload,
+                "capture_epoch": capture_epoch,
+                "attempt_id": environment["RANKLENS_ATTEMPT_ID"],
                 "tags": dict(tags or {}), "command": list(command),
                 "started_at": datetime.now(timezone.utc).isoformat(), "state": "running",
                 "scheduler": {k: v for k, v in os.environ.items() if k in {

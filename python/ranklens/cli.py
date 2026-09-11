@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from . import __version__
 from .analyzer import TelemetryError, analyze
 from .demo import write_demo
 from .report import render_text, write_html, write_json
@@ -23,7 +24,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="ranklens",
         description="Observe and diagnose MPI workload behavior with PMPI telemetry.",
     )
-    parser.add_argument("--version", action="version", version="RankLens 1.0.0")
+    parser.add_argument("--version", action="version", version=f"RankLens {__version__}")
     subcommands = parser.add_subparsers(dest="subcommand", required=True)
 
     analyze_parser = subcommands.add_parser("analyze", help="analyze a telemetry directory")

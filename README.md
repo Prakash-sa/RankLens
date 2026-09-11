@@ -10,12 +10,16 @@ RankLens 1.0 instruments blocking and nonblocking point-to-point operations, maj
 request completion, process placement context, and bounded event streams. Recommendations remain
 testable hypotheses: RankLens does not invent speedups or claim scientific equivalence.
 
+The current branch is the `1.1.0a1` enterprise foundation. Its implemented scope and remaining
+certification gates are tracked explicitly below; the 1.0 release remains the stable offline baseline.
+
 ## What ships
 
 - PMPI wrappers for `MPI_Send`, `MPI_Recv`, `MPI_Isend`, `MPI_Irecv`, `MPI_Wait`, `MPI_Test`,
-  `MPI_Waitall`, `MPI_Allreduce`, `MPI_Bcast`, and `MPI_Barrier`;
-- crash-tolerant periodic summaries, atomic final summaries, event caps, and explicit partial-run
-  status;
+  `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Testall`, `MPI_Testany`, `MPI_Testsome`,
+  `MPI_Cancel`, `MPI_Request_free`, `MPI_Allreduce`, `MPI_Bcast`, and `MPI_Barrier`;
+- a bounded asynchronous writer for native schema-v2 events and periodic summaries, event/request
+  coverage counters, post-finalize completion state, and explicit partial-run status;
 - resolved wildcard receives and communicator-local peers mapped to world ranks;
 - CPU affinity, hostname, peak RSS, scheduler identifiers, run identity, workload identity, and
   user-defined tags;
@@ -24,7 +28,7 @@ testable hypotheses: RankLens does not invent speedups or claim scientific equiv
   and an alternating baseline/instrumented overhead harness;
 - an accessible web workspace with validation, rank filtering, event activity, communication
   edges, provenance, exports, and baseline comparison;
-- unit tests plus real two-rank blocking and nonblocking MPI integration tests.
+- unit tests plus three real two-rank blocking and nonblocking MPI integration paths.
 
 ## Architecture
 
@@ -48,6 +52,25 @@ Deterministic Python analyzer
 
 Telemetry is rank-local and RankLens introduces no MPI collective. See
 [architecture](docs/architecture.md) and the [telemetry contract](docs/telemetry-schema.md).
+
+For the proposed enterprise platform, start with the
+[enterprise system design](docs/enterprise-system-design.md). It links the end-to-end data
+contracts, architecture decisions, phased delivery plan, release gates, and research sources.
+These documents describe future work; they do not expand the capabilities shipped in 1.0.
+The [implementation status](docs/enterprise-implementation-status.md) records which foundation
+items now have working code and which certification gates remain open.
+
+Install the opt-in enterprise control plane without changing the dependency-free offline analyzer:
+
+```bash
+python -m pip install -e '.[enterprise]'
+alembic -c alembic.ini upgrade head
+ranklens-enterprise-api --host 127.0.0.1 --port 8080
+ranklens-enterprise-worker
+```
+
+The API fails closed unless database, object-root, and scoped machine-token settings are supplied.
+See [the development deployment profile](deploy/README.md); it is not an HA certification.
 
 ## Install
 
@@ -137,6 +160,7 @@ browser. Node.js 22.13+ is required; `npm run lint` and `npm run build` validate
 | `RANKLENS_OUTPUT_DIR` | `ranklens-results` | Capture directory visible to each rank |
 | `RANKLENS_TRACE_EVENTS` | `1` | Set to `0` for summary-only, lower-I/O capture |
 | `RANKLENS_MAX_EVENTS` | `100000` | Maximum event records per rank; `0` disables events |
+| `RANKLENS_EVENT_BUFFER_RECORDS` | `1024` | Preallocated live event records per process before optional detail is dropped |
 | `RANKLENS_LIBRARY` | unset | Interceptor used by `ranklens run`, `doctor`, and `benchmark` |
 
 RankLens preserves a pre-existing preload value. The launcher wrapper forwards RankLens and DYLD

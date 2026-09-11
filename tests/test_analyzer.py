@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,7 +41,93 @@ class AnalyzerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "greater than 1.0"):
                 analyze(directory, straggler_threshold=1.0)
 
+    def test_accepts_version_two_with_separate_completion_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            summary = {
+                "schema_version": 2,
+                "complete": True,
+                "capture_state": "finalized",
+                "finalize_return_code": 0,
+                "context": {"events_dropped": "0"},
+                "rank": 0,
+                "world_size": 1,
+                "hostname": "node-a",
+                "pid": 42,
+                "runtime_ns": 100,
+                "mpi_time_ns": 20,
+                "mpi_calls": 1,
+                "request_completions": 1,
+                "failed_calls": 0,
+                "bytes_sent": 8,
+                "bytes_received": 0,
+                "operations": {
+                    "MPI_Isend": {
+                        "calls": 1,
+                        "duration_ns": 20,
+                        "payload_bytes": 8,
+                        "record_kind": "api_call",
+                    },
+                    "MPI_Isend_complete": {
+                        "calls": 1,
+                        "duration_ns": 0,
+                        "payload_bytes": 0,
+                        "record_kind": "request_completion",
+                    },
+                },
+            }
+            (directory / "rank-00000-summary.json").write_text(
+                json.dumps(summary), encoding="utf-8"
+            )
+
+            result = analyze(directory)
+
+            self.assertTrue(result.complete)
+            self.assertEqual(result.operations["MPI_Isend"].calls, 1)
+            self.assertEqual(result.operations["MPI_Isend_complete"].calls, 1)
+
+    def test_rejects_version_two_with_mixed_call_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            summary = {
+                "schema_version": 2,
+                "complete": True,
+                "capture_state": "finalized",
+                "finalize_return_code": 0,
+                "context": {},
+                "rank": 0,
+                "world_size": 1,
+                "hostname": "node-a",
+                "pid": 42,
+                "runtime_ns": 100,
+                "mpi_time_ns": 20,
+                "mpi_calls": 2,
+                "request_completions": 1,
+                "failed_calls": 0,
+                "bytes_sent": 8,
+                "bytes_received": 0,
+                "operations": {
+                    "MPI_Isend": {
+                        "calls": 1,
+                        "duration_ns": 20,
+                        "payload_bytes": 8,
+                        "record_kind": "api_call",
+                    },
+                    "MPI_Isend_complete": {
+                        "calls": 1,
+                        "duration_ns": 0,
+                        "payload_bytes": 0,
+                        "record_kind": "request_completion",
+                    },
+                },
+            }
+            (directory / "rank-00000-summary.json").write_text(
+                json.dumps(summary), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(TelemetryError, "mpi_calls does not match"):
+                analyze(directory)
+
 
 if __name__ == "__main__":
     unittest.main()
-

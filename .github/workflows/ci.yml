@@ -19,7 +19,7 @@ jobs:
       - name: Install Open MPI
         run: sudo apt-get update && sudo apt-get install -y openmpi-bin libopenmpi-dev
       - name: Install Python package
-        run: python -m pip install .
+        run: python -m pip install '.[enterprise,test]'
       - name: Verify CLI installation
         run: ranklens --version
       - name: Configure
@@ -30,6 +30,26 @@ jobs:
         env:
           OMPI_MCA_rmaps_base_oversubscribe: "1"
         run: ctest --test-dir build --output-on-failure
+      - name: Verify enterprise migrations
+        env:
+          RANKLENS_DATABASE_URL: sqlite:///migration-check.sqlite3
+        run: |
+          alembic -c alembic.ini upgrade head
+          alembic -c alembic.ini check
+
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache-dependency-path: agent/go.mod
+      - name: Test node agent
+        run: go test ./...
 
   web:
     runs-on: ubuntu-latest

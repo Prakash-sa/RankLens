@@ -39,22 +39,51 @@ def load_summary(path: Path) -> RankSummary:
 
     if not isinstance(data, dict):
         raise TelemetryError(f"{path}: summary root must be an object")
-    if type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
         raise TelemetryError(f"{path}: unsupported schema_version {data.get('schema_version')!r}")
+
+    if schema_version == 2:
+        if not isinstance(data.get("complete"), bool):
+            raise TelemetryError(f"{path}: version 2 complete must be boolean")
+        capture_state = data.get("capture_state")
+        if capture_state not in {"collecting", "pre_finalize", "finalized", "finalize_failed"}:
+            raise TelemetryError(f"{path}: invalid version 2 capture_state {capture_state!r}")
+        _required_int(data, "finalize_return_code", path)
+        _required_int(data, "request_completions", path)
+        _required_int(data, "failed_calls", path)
 
     raw_operations = data.get("operations")
     if not isinstance(raw_operations, dict):
         raise TelemetryError(f"{path}: operations must be an object")
 
     operations: Dict[str, OperationStats] = {}
+    api_operation_calls = 0
+    completion_calls = 0
     for name, raw_stats in raw_operations.items():
         if not isinstance(name, str) or not isinstance(raw_stats, dict):
             raise TelemetryError(f"{path}: invalid operation entry")
+        if schema_version == 2:
+            record_kind = raw_stats.get("record_kind")
+            if record_kind not in {"api_call", "request_completion"}:
+                raise TelemetryError(f"{path}: operation {name!r} has invalid record_kind")
+            if record_kind == "request_completion":
+                completion_calls += _required_int(raw_stats, "calls", path)
+            else:
+                api_operation_calls += _required_int(raw_stats, "calls", path)
         operations[name] = OperationStats(
             calls=_required_int(raw_stats, "calls", path),
             duration_ns=_required_int(raw_stats, "duration_ns", path),
             payload_bytes=_required_int(raw_stats, "payload_bytes", path),
         )
+
+    if schema_version == 2:
+        if _required_int(data, "mpi_calls", path) != api_operation_calls:
+            raise TelemetryError(f"{path}: mpi_calls does not match api_call operation records")
+        if _required_int(data, "request_completions", path) != completion_calls:
+            raise TelemetryError(
+                f"{path}: request_completions does not match request_completion records"
+            )
 
     hostname = data.get("hostname")
     if not isinstance(hostname, str):
@@ -110,6 +139,12 @@ def _load_communication_edges(
     edges: Dict[Tuple[int, int], List[int]] = defaultdict(lambda: [0, 0])
     for path in sorted(directory.glob("rank-*-events.jsonl")):
         try:
+            expected_rank = int(path.name.split("-", 2)[1])
+        except (IndexError, ValueError):
+            warnings.append(f"ignored event file with invalid rank name: {path.name}")
+            continue
+        last_sequence = -1
+        try:
             stream = path.open("r", encoding="utf-8")
         except OSError as exc:
             warnings.append(f"could not read {path.name}: {exc}")
@@ -126,6 +161,36 @@ def _load_communication_edges(
                     if len(warnings) < 100:
                         warnings.append(f"ignored non-object event in {path.name}:{line_number}")
                     continue
+                schema_version = event.get("schema_version")
+                if type(schema_version) is not int or schema_version not in {1, 2}:
+                    if len(warnings) < 100:
+                        warnings.append(
+                            f"ignored unsupported event schema in {path.name}:{line_number}"
+                        )
+                    continue
+                if event.get("rank") != expected_rank:
+                    if len(warnings) < 100:
+                        warnings.append(f"ignored rank-mismatched event in {path.name}:{line_number}")
+                    continue
+                if schema_version == 2:
+                    sequence = event.get("sequence")
+                    if type(sequence) is not int or sequence < 0 or sequence <= last_sequence:
+                        if len(warnings) < 100:
+                            warnings.append(
+                                f"ignored invalid event sequence in {path.name}:{line_number}"
+                            )
+                        continue
+                    last_sequence = sequence
+                    record_kind = event.get("record_kind")
+                    completion = str(event.get("operation", "")).endswith("_complete")
+                    expected_kind = "request_completion" if completion else "api_call"
+                    if record_kind != expected_kind:
+                        if len(warnings) < 100:
+                            warnings.append(
+                                f"ignored event with inconsistent record_kind in "
+                                f"{path.name}:{line_number}"
+                            )
+                        continue
                 if event.get("error_code", 0) != 0:
                     continue
                 timestamp, duration = event.get("timestamp_ns"), event.get("duration_ns")

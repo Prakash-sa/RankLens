@@ -2,7 +2,10 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -14,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -95,6 +99,13 @@ std::uint64_t event_limit() {
   catch (...) { return 100000; }
 }
 
+std::size_t event_buffer_limit() {
+  const std::string value = env_value("RANKLENS_EVENT_BUFFER_RECORDS");
+  if (value.empty()) return 1024;
+  try { return std::min<std::size_t>(std::stoull(value), 65536); }
+  catch (...) { return 1024; }
+}
+
 // Translate communicator-local peers without introducing MPI collectives.
 int world_peer(MPI_Comm communicator, int peer) {
   if (peer < 0 || communicator == MPI_COMM_WORLD) return peer;
@@ -147,6 +158,49 @@ int process_id() {
 #endif
 }
 
+constexpr std::array<const char*, 19> kOperationNames = {
+    "MPI_Send", "MPI_Recv", "MPI_Isend", "MPI_Irecv", "MPI_Wait", "MPI_Test",
+    "MPI_Waitall", "MPI_Waitany", "MPI_Waitsome", "MPI_Testall", "MPI_Testany",
+    "MPI_Testsome", "MPI_Allreduce", "MPI_Bcast", "MPI_Barrier",
+    "MPI_Cancel", "MPI_Request_free", "MPI_Isend_complete", "MPI_Irecv_complete"};
+
+std::size_t operation_index(const char* operation) {
+  for (std::size_t index = 0; index < kOperationNames.size(); ++index) {
+    if (std::strcmp(operation, kOperationNames[index]) == 0) return index;
+  }
+  return kOperationNames.size();
+}
+
+bool is_completion(std::size_t index) {
+  return index == kOperationNames.size() - 2 || index == kOperationNames.size() - 1;
+}
+
+struct EventRecord {
+  const char* operation = "unknown";
+  std::uint64_t sequence = 0;
+  std::uint64_t timestamp_ns = 0;
+  std::uint64_t duration_ns = 0;
+  std::uint64_t payload_bytes = 0;
+  int peer = -1;
+  int tag = -1;
+  int error_code = MPI_SUCCESS;
+  long long communicator = -1;
+  long long request_id = -1;
+};
+
+struct RecorderSnapshot {
+  std::array<OperationStats, kOperationNames.size() + 1> operations{};
+  std::uint64_t mpi_time_ns = 0;
+  std::uint64_t api_calls = 0;
+  std::uint64_t request_completions = 0;
+  std::uint64_t failed_calls = 0;
+  std::uint64_t bytes_sent = 0;
+  std::uint64_t bytes_received = 0;
+  std::uint64_t events_dropped = 0;
+  std::uint64_t events_written = 0;
+  std::uint64_t request_tracking_overflows = 0;
+};
+
 class Recorder {
  public:
   Recorder(int rank, int world_size)
@@ -155,6 +209,8 @@ class Recorder {
         host_(hostname()),
         pid_(process_id()),
         started_at_(Clock::now()),
+        max_events_(event_limit()),
+        event_buffer_capacity_(event_buffer_limit()),
         trace_events_(env_enabled("RANKLENS_TRACE_EVENTS", true)) {
     const char* configured_output = std::getenv("RANKLENS_OUTPUT_DIR");
     output_directory_ = configured_output == nullptr ? "ranklens-results" : configured_output;
@@ -168,88 +224,168 @@ class Recorder {
 
     if (trace_events_) {
       event_stream_.open(rank_path("events.jsonl"), std::ios::out | std::ios::trunc);
-      if (!event_stream_) {
-        trace_events_ = false;
-      }
+      if (!event_stream_) trace_events_ = false;
     }
-    snapshot(false);
+    active_events_.reserve(event_buffer_capacity_);
+    staging_events_.reserve(event_buffer_capacity_);
+    writer_thread_ = std::thread([this] { writer_loop(); });
   }
+
+  ~Recorder() { stop_writer(); }
 
   void record(const char* operation, Clock::time_point start, Clock::time_point end,
               long long bytes, int peer, int tag, int error_code, long long communicator = 0,
-              long long request_id = -1) {
-    if (disabled_) {
-      return;
-    }
+              long long request_id = -1) noexcept {
+    if (disabled_) return;
 
+    const auto index = operation_index(operation);
     const std::uint64_t duration = elapsed_ns(start, end);
     const std::uint64_t timestamp = elapsed_ns(started_at_, start);
     const std::uint64_t safe_bytes = bytes > 0 ? static_cast<std::uint64_t>(bytes) : 0;
+    bool wake_writer = false;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      auto& stats = operations_[index];
+      ++stats.calls;
+      stats.duration_ns += duration;
+      stats.payload_bytes += safe_bytes;
+      mpi_time_ns_ += duration;
+      if (is_completion(index)) {
+        ++request_completions_;
+      } else {
+        ++api_calls_;
+        if (error_code != MPI_SUCCESS) ++failed_calls_;
+      }
+      if (index == 0 || index == 2) bytes_sent_ += safe_bytes;
+      if (index == 1 || index == kOperationNames.size() - 1) bytes_received_ += safe_bytes;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    OperationStats& stats = operations_[operation];
-    ++stats.calls;
-    stats.duration_ns += duration;
-    stats.payload_bytes += safe_bytes;
-    mpi_time_ns_ += duration;
-
-    const std::string op(operation);
-    if (op == "MPI_Send" || op == "MPI_Isend") {
-      bytes_sent_ += safe_bytes;
-    } else if (op == "MPI_Recv" || op == "MPI_Irecv_complete") {
-      bytes_received_ += safe_bytes;
+      if (trace_events_) {
+        const auto event_sequence = event_sequence_++;
+        if (events_accepted_ >= max_events_ || active_events_.size() >= event_buffer_capacity_) {
+          ++events_dropped_;
+        } else {
+          active_events_.push_back(EventRecord{operation, event_sequence, timestamp, duration, safe_bytes, peer,
+                                                tag, error_code, communicator, request_id});
+          ++events_accepted_;
+          wake_writer = active_events_.size() >= std::max<std::size_t>(1, event_buffer_capacity_ / 2);
+        }
+      }
     }
-
-    if (trace_events_ && event_stream_ && events_written_ < max_events_) {
-      ++events_written_;
-      event_stream_ << "{\"schema_version\":1,\"timestamp_ns\":" << timestamp
-                    << ",\"rank\":" << rank_ << ",\"operation\":\""
-                    << json_escape(operation) << "\",\"duration_ns\":" << duration
-                    << ",\"payload_bytes\":" << safe_bytes << ",\"peer\":" << peer
-                    << ",\"tag\":" << tag << ",\"error_code\":" << error_code
-                    << ",\"communicator\":" << communicator << ",\"request_id\":" << request_id << "}\n";
-    } else if (trace_events_) {
-      ++events_dropped_;
-    }
-    if (elapsed_ns(last_snapshot_, end) >= 1000000000) {
-      snapshot(false);
-      last_snapshot_ = end;
-    }
+    if (wake_writer) writer_wakeup_.notify_one();
   }
 
-  void finalize() {
-    if (disabled_) {
-      return;
-    }
+  void prepare_finalize() noexcept { stop_writer(); }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshot(true);
-    if (event_stream_) {
-      event_stream_.flush();
-      event_stream_.close();
-    }
+  void request_tracking_overflow() noexcept {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    ++request_tracking_overflows_;
+  }
 
+  void finish_finalize(int finalize_return_code) noexcept {
+    if (disabled_) return;
+    try {
+      drain_events();
+      write_snapshot(finalize_return_code == MPI_SUCCESS,
+                     finalize_return_code == MPI_SUCCESS ? "finalized" : "finalize_failed",
+                     finalize_return_code);
+      if (event_stream_) {
+        event_stream_.flush();
+        event_stream_.close();
+      }
+    } catch (...) {
+    }
   }
 
  private:
-  // Atomic checkpoints keep the previous valid summary if a job dies during a write.
-  void snapshot(bool complete) {
+  void stop_writer() noexcept {
+    if (!writer_thread_.joinable()) return;
+    stop_requested_.store(true, std::memory_order_release);
+    writer_wakeup_.notify_one();
+    try { writer_thread_.join(); } catch (...) {}
+  }
+
+  void writer_loop() noexcept {
+    try {
+      auto next_snapshot = Clock::now();
+      while (!stop_requested_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> wait_lock(writer_mutex_);
+        writer_wakeup_.wait_for(wait_lock, std::chrono::milliseconds(100), [this] {
+          return stop_requested_.load(std::memory_order_acquire);
+        });
+        wait_lock.unlock();
+        drain_events();
+        if (Clock::now() >= next_snapshot) {
+          write_snapshot(false, "collecting", MPI_ERR_PENDING);
+          next_snapshot = Clock::now() + std::chrono::seconds(1);
+        }
+      }
+      drain_events();
+      write_snapshot(false, "pre_finalize", MPI_ERR_PENDING);
+    } catch (...) {
+      writer_failed_.store(true, std::memory_order_release);
+    }
+  }
+
+  void drain_events() {
+    if (!trace_events_ || !event_stream_) return;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      active_events_.swap(staging_events_);
+    }
+    for (const auto& event : staging_events_) {
+      event_stream_ << "{\"schema_version\":2,\"sequence\":" << event.sequence
+                    << ",\"timestamp_ns\":" << event.timestamp_ns
+                    << ",\"rank\":" << rank_ << ",\"operation\":\""
+                    << json_escape(event.operation) << "\",\"record_kind\":\""
+                    << (is_completion(operation_index(event.operation)) ? "request_completion" : "api_call")
+                    << "\",\"duration_ns\":" << event.duration_ns
+                    << ",\"payload_bytes\":" << event.payload_bytes << ",\"peer\":" << event.peer
+                    << ",\"tag\":" << event.tag << ",\"error_code\":" << event.error_code
+                    << ",\"communicator\":" << event.communicator
+                    << ",\"request_id\":" << event.request_id << "}\n";
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      events_written_ += staging_events_.size();
+    }
+    staging_events_.clear();
+  }
+
+  RecorderSnapshot capture_snapshot() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return RecorderSnapshot{operations_, mpi_time_ns_, api_calls_, request_completions_,
+                            failed_calls_, bytes_sent_, bytes_received_, events_dropped_,
+                            events_written_, request_tracking_overflows_};
+  }
+
+  // The writer thread owns filesystem I/O. Atomic rename avoids publishing partial JSON;
+  // it is not an fsync durability guarantee.
+  void write_snapshot(bool complete, const char* capture_state, int finalize_return_code) {
+    const auto state = capture_snapshot();
     const std::uint64_t runtime_ns = elapsed_ns(started_at_, Clock::now());
     if (event_stream_) event_stream_.flush();
     std::ofstream summary(rank_path("summary.json.tmp"), std::ios::out | std::ios::trunc);
-    if (!summary) {
-      return;
-    }
+    if (!summary) return;
 
     summary << "{\n"
-            << "  \"schema_version\": 1,\n"
+            << "  \"schema_version\": 2,\n"
             << "  \"complete\": " << (complete ? "true" : "false") << ",\n"
+            << "  \"capture_state\": \"" << capture_state << "\",\n"
+            << "  \"finalize_return_code\": " << finalize_return_code << ",\n"
             << "  \"context\": {\"run_id\": \"" << json_escape(env_value("RANKLENS_RUN_ID"))
+            << "\", \"capture_epoch\": \"" << json_escape(env_value("RANKLENS_CAPTURE_EPOCH"))
+            << "\", \"attempt_id\": \"" << json_escape(env_value("RANKLENS_ATTEMPT_ID"))
             << "\", \"slurm_job_id\": \"" << json_escape(env_value("SLURM_JOB_ID"))
             << "\", \"slurm_step_id\": \"" << json_escape(env_value("SLURM_STEP_ID"))
             << "\", \"flux_job_id\": \"" << json_escape(env_value("FLUX_JOB_ID"))
             << "\", \"traceparent\": \"" << json_escape(env_value("TRACEPARENT"))
-            << "\", \"events_dropped\": \"" << events_dropped_
+            << "\", \"events_dropped\": \"" << state.events_dropped
+            << "\", \"events_written\": \"" << state.events_written
+            << "\", \"event_buffer_records\": \"" << event_buffer_capacity_
+            << "\", \"request_tracking_overflows\": \""
+            << state.request_tracking_overflows
+            << "\", \"writer_failed\": \""
+            << (writer_failed_.load(std::memory_order_acquire) ? "true" : "false")
             << "\", \"tracing_enabled\": \"" << (trace_events_ ? "true" : "false") << "\"";
 #if !defined(_WIN32)
     struct rusage usage {};
@@ -282,18 +418,25 @@ class Recorder {
             << "  \"hostname\": \"" << json_escape(host_) << "\",\n"
             << "  \"pid\": " << pid_ << ",\n"
             << "  \"runtime_ns\": " << runtime_ns << ",\n"
-            << "  \"mpi_time_ns\": " << mpi_time_ns_ << ",\n"
-            << "  \"mpi_calls\": " << total_calls() << ",\n"
-            << "  \"bytes_sent\": " << bytes_sent_ << ",\n"
-            << "  \"bytes_received\": " << bytes_received_ << ",\n"
+            << "  \"mpi_time_ns\": " << state.mpi_time_ns << ",\n"
+            << "  \"mpi_calls\": " << state.api_calls << ",\n"
+            << "  \"request_completions\": " << state.request_completions << ",\n"
+            << "  \"failed_calls\": " << state.failed_calls << ",\n"
+            << "  \"bytes_sent\": " << state.bytes_sent << ",\n"
+            << "  \"bytes_received\": " << state.bytes_received << ",\n"
             << "  \"operations\": {\n";
 
-    std::size_t index = 0;
-    for (const auto& [name, stats] : operations_) {
-      summary << "    \"" << json_escape(name) << "\": {\"calls\": " << stats.calls
+    std::size_t remaining = 0;
+    for (const auto& stats : state.operations) if (stats.calls > 0) ++remaining;
+    for (std::size_t index = 0; index < state.operations.size(); ++index) {
+      const auto& stats = state.operations[index];
+      if (stats.calls == 0) continue;
+      const char* name = index < kOperationNames.size() ? kOperationNames[index] : "Other";
+      summary << "    \"" << name << "\": {\"calls\": " << stats.calls
               << ", \"duration_ns\": " << stats.duration_ns
-              << ", \"payload_bytes\": " << stats.payload_bytes << "}";
-      summary << (++index == operations_.size() ? "\n" : ",\n");
+              << ", \"payload_bytes\": " << stats.payload_bytes
+              << ", \"record_kind\": \"" << (is_completion(index) ? "request_completion" : "api_call")
+              << "\"}" << (--remaining == 0 ? "\n" : ",\n");
     }
     summary << "  }\n}\n";
     summary.close();
@@ -303,20 +446,10 @@ class Recorder {
     }
   }
 
- private:
   std::filesystem::path rank_path(const char* suffix) const {
     std::ostringstream filename;
     filename << "rank-" << std::setw(5) << std::setfill('0') << rank_ << '-' << suffix;
     return output_directory_ / filename.str();
-  }
-
-  std::uint64_t total_calls() const {
-    std::uint64_t result = 0;
-    for (const auto& [name, stats] : operations_) {
-      (void)name;
-      result += stats.calls;
-    }
-    return result;
   }
 
   int rank_ = 0;
@@ -324,19 +457,32 @@ class Recorder {
   std::string host_;
   int pid_ = 0;
   Clock::time_point started_at_;
-  Clock::time_point last_snapshot_ = Clock::now();
-  std::uint64_t max_events_ = event_limit();
-  std::uint64_t events_written_ = 0;
-  std::uint64_t events_dropped_ = 0;
+  std::uint64_t max_events_ = 0;
+  std::size_t event_buffer_capacity_ = 0;
   bool trace_events_ = true;
   bool disabled_ = false;
   std::filesystem::path output_directory_;
   std::ofstream event_stream_;
-  std::mutex mutex_;
-  std::map<std::string, OperationStats> operations_;
+  std::mutex state_mutex_;
+  std::array<OperationStats, kOperationNames.size() + 1> operations_{};
+  std::vector<EventRecord> active_events_;
+  std::vector<EventRecord> staging_events_;
   std::uint64_t mpi_time_ns_ = 0;
+  std::uint64_t api_calls_ = 0;
+  std::uint64_t request_completions_ = 0;
+  std::uint64_t failed_calls_ = 0;
   std::uint64_t bytes_sent_ = 0;
   std::uint64_t bytes_received_ = 0;
+  std::uint64_t events_accepted_ = 0;
+  std::uint64_t event_sequence_ = 0;
+  std::uint64_t events_written_ = 0;
+  std::uint64_t events_dropped_ = 0;
+  std::uint64_t request_tracking_overflows_ = 0;
+  std::mutex writer_mutex_;
+  std::condition_variable writer_wakeup_;
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> writer_failed_{false};
+  std::thread writer_thread_;
 };
 
 std::unique_ptr<Recorder> recorder;
@@ -357,7 +503,10 @@ long long remember(MPI_Request request, bool receive, MPI_Comm comm, int peer, i
   MPI_Group group = MPI_GROUP_NULL;
   try {
     std::lock_guard<std::mutex> lock(pending_mutex);
-    if (pending.size() >= 65536) return -1;
+    if (pending.size() >= 65536) {
+      if (recorder) recorder->request_tracking_overflow();
+      return -1;
+    }
     int inter = 0;
     PMPI_Comm_test_inter(comm, &inter);
     if (inter) PMPI_Comm_remote_group(comm, &group);
@@ -373,6 +522,17 @@ long long remember(MPI_Request request, bool receive, MPI_Comm comm, int peer, i
     if (group != MPI_GROUP_NULL) PMPI_Group_free(&group);
     return -1;
   }
+}
+
+void forget_request(MPI_Fint key) noexcept {
+  if (key == -1) return;
+  try {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    auto found = pending.find(key);
+    if (found == pending.end()) return;
+    if (found->second.peers != MPI_GROUP_NULL) PMPI_Group_free(&found->second.peers);
+    pending.erase(found);
+  } catch (...) {}
 }
 
 void complete_request(MPI_Fint key, MPI_Status* status) noexcept {
@@ -459,15 +619,19 @@ int ranklens_MPI_Init_thread(int* argc, char*** argv, int required, int* provide
 }
 
 int ranklens_MPI_Finalize() {
+  if (ranklens::recorder) {
+    ranklens::recorder->prepare_finalize();
+  }
   for (auto& entry : ranklens::pending) {
     if (entry.second.peers != MPI_GROUP_NULL) PMPI_Group_free(&entry.second.peers);
   }
   ranklens::pending.clear();
+  const int result = PMPI_Finalize();
   if (ranklens::recorder) {
-    try { ranklens::recorder->finalize(); } catch (...) {}
+    ranklens::recorder->finish_finalize(result);
     ranklens::recorder.reset();
   }
-  return PMPI_Finalize();
+  return result;
 }
 
 int ranklens_MPI_Send(const void* buffer, int count, MPI_Datatype datatype, int destination, int tag,
@@ -475,7 +639,9 @@ int ranklens_MPI_Send(const void* buffer, int count, MPI_Datatype datatype, int 
   const auto start = ranklens::Clock::now();
   const int result = PMPI_Send(buffer, count, datatype, destination, tag, communicator);
   const auto end = ranklens::Clock::now();
-  ranklens::record("MPI_Send", start, end, destination == MPI_PROC_NULL ? 0 : ranklens::payload_size(count, datatype), destination,
+  const auto bytes = result == MPI_SUCCESS && destination != MPI_PROC_NULL
+                         ? ranklens::payload_size(count, datatype) : 0;
+  ranklens::record("MPI_Send", start, end, bytes, destination,
                    tag, result, communicator);
   return result;
 }
@@ -501,7 +667,8 @@ int ranklens_MPI_Recv(void* buffer, int count, MPI_Datatype datatype, int source
     actual_source = observed_status->MPI_SOURCE;
     actual_tag = observed_status->MPI_TAG;
   }
-  ranklens::record("MPI_Recv", start, end, ranklens::payload_size(actual_count, datatype),
+  const auto bytes = result == MPI_SUCCESS ? ranklens::payload_size(actual_count, datatype) : 0;
+  ranklens::record("MPI_Recv", start, end, bytes,
                    actual_source, actual_tag, result, communicator);
   return result;
 }
@@ -512,7 +679,8 @@ int ranklens_MPI_Allreduce(const void* send_buffer, void* receive_buffer, int co
   const int result =
       PMPI_Allreduce(send_buffer, receive_buffer, count, datatype, operation, communicator);
   const auto end = ranklens::Clock::now();
-  ranklens::record("MPI_Allreduce", start, end, ranklens::payload_size(count, datatype), -1, -1,
+  const auto bytes = result == MPI_SUCCESS ? ranklens::payload_size(count, datatype) : 0;
+  ranklens::record("MPI_Allreduce", start, end, bytes, -1, -1,
                    result, communicator);
   return result;
 }
@@ -522,7 +690,8 @@ int ranklens_MPI_Bcast(void* buffer, int count, MPI_Datatype datatype, int root,
   const auto start = ranklens::Clock::now();
   const int result = PMPI_Bcast(buffer, count, datatype, root, communicator);
   const auto end = ranklens::Clock::now();
-  ranklens::record("MPI_Bcast", start, end, ranklens::payload_size(count, datatype), root, -1,
+  const auto bytes = result == MPI_SUCCESS ? ranklens::payload_size(count, datatype) : 0;
+  ranklens::record("MPI_Bcast", start, end, bytes, root, -1,
                    result, communicator);
   return result;
 }
@@ -532,7 +701,9 @@ int ranklens_MPI_Isend(const void* buffer, int count, MPI_Datatype datatype, int
   const int result = PMPI_Isend(buffer, count, datatype, peer, tag, comm, request);
   const auto end = ranklens::Clock::now();
   const auto id = result == MPI_SUCCESS ? ranklens::remember(*request, false, comm, peer, tag) : -1;
-  ranklens::record("MPI_Isend", start, end, peer == MPI_PROC_NULL ? 0 : ranklens::payload_size(count, datatype), peer, tag, result, comm, id);
+  const auto bytes = result == MPI_SUCCESS && peer != MPI_PROC_NULL
+                         ? ranklens::payload_size(count, datatype) : 0;
+  ranklens::record("MPI_Isend", start, end, bytes, peer, tag, result, comm, id);
   return result;
 }
 
@@ -589,6 +760,149 @@ int ranklens_MPI_Waitall(int count, MPI_Request requests[], MPI_Status statuses[
   return result;
 }
 
+int ranklens_MPI_Waitany(int count, MPI_Request requests[], int* index, MPI_Status* status) {
+  if (count < 0) return PMPI_Waitany(count, requests, index, status);
+  std::vector<MPI_Fint> keys;
+  try {
+    keys.reserve(count);
+    for (int item = 0; item < count; ++item) keys.push_back(ranklens::request_key(requests[item]));
+  } catch (...) {
+    return PMPI_Waitany(count, requests, index, status);
+  }
+  MPI_Status local{};
+  auto observed = status == MPI_STATUS_IGNORE ? &local : status;
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Waitany(count, requests, index, observed);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Waitany", start, end, 0, -1, -1, result);
+  if (result == MPI_SUCCESS && *index != MPI_UNDEFINED && 0 <= *index && *index < count)
+    ranklens::complete_request(keys[*index], observed);
+  return result;
+}
+
+int ranklens_MPI_Testall(int count, MPI_Request requests[], int* flag, MPI_Status statuses[]) {
+  if (count < 0) return PMPI_Testall(count, requests, flag, statuses);
+  std::vector<MPI_Fint> keys;
+  std::vector<MPI_Status> local;
+  try {
+    keys.reserve(count);
+    for (int item = 0; item < count; ++item) keys.push_back(ranklens::request_key(requests[item]));
+    if (statuses == MPI_STATUSES_IGNORE) local.resize(count);
+  } catch (...) {
+    return PMPI_Testall(count, requests, flag, statuses);
+  }
+  auto observed = statuses == MPI_STATUSES_IGNORE ? local.data() : statuses;
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Testall(count, requests, flag, observed);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Testall", start, end, 0, -1, -1, result);
+  if ((result == MPI_SUCCESS || result == MPI_ERR_IN_STATUS) && *flag) {
+    for (int item = 0; item < count; ++item) {
+      if (keys[item] != -1 &&
+          (result == MPI_SUCCESS || observed[item].MPI_ERROR == MPI_SUCCESS))
+        ranklens::complete_request(keys[item], &observed[item]);
+    }
+  }
+  return result;
+}
+
+int ranklens_MPI_Testany(int count, MPI_Request requests[], int* index, int* flag,
+                         MPI_Status* status) {
+  if (count < 0) return PMPI_Testany(count, requests, index, flag, status);
+  std::vector<MPI_Fint> keys;
+  try {
+    keys.reserve(count);
+    for (int item = 0; item < count; ++item) keys.push_back(ranklens::request_key(requests[item]));
+  } catch (...) {
+    return PMPI_Testany(count, requests, index, flag, status);
+  }
+  MPI_Status local{};
+  auto observed = status == MPI_STATUS_IGNORE ? &local : status;
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Testany(count, requests, index, flag, observed);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Testany", start, end, 0, -1, -1, result);
+  if (result == MPI_SUCCESS && *flag && *index != MPI_UNDEFINED && 0 <= *index && *index < count)
+    ranklens::complete_request(keys[*index], observed);
+  return result;
+}
+
+int ranklens_MPI_Waitsome(int count, MPI_Request requests[], int* outcount, int indices[],
+                          MPI_Status statuses[]) {
+  if (count < 0) return PMPI_Waitsome(count, requests, outcount, indices, statuses);
+  std::vector<MPI_Fint> keys;
+  std::vector<MPI_Status> local;
+  try {
+    keys.reserve(count);
+    for (int item = 0; item < count; ++item) keys.push_back(ranklens::request_key(requests[item]));
+    if (statuses == MPI_STATUSES_IGNORE) local.resize(count);
+  } catch (...) {
+    return PMPI_Waitsome(count, requests, outcount, indices, statuses);
+  }
+  auto observed = statuses == MPI_STATUSES_IGNORE ? local.data() : statuses;
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Waitsome(count, requests, outcount, indices, observed);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Waitsome", start, end, 0, -1, -1, result);
+  if ((result == MPI_SUCCESS || result == MPI_ERR_IN_STATUS) &&
+      *outcount != MPI_UNDEFINED && *outcount > 0) {
+    for (int completed = 0; completed < *outcount; ++completed) {
+      const int item = indices[completed];
+      if (0 <= item && item < count && keys[item] != -1 &&
+          (result == MPI_SUCCESS || observed[completed].MPI_ERROR == MPI_SUCCESS))
+        ranklens::complete_request(keys[item], &observed[completed]);
+    }
+  }
+  return result;
+}
+
+int ranklens_MPI_Testsome(int count, MPI_Request requests[], int* outcount, int indices[],
+                          MPI_Status statuses[]) {
+  if (count < 0) return PMPI_Testsome(count, requests, outcount, indices, statuses);
+  std::vector<MPI_Fint> keys;
+  std::vector<MPI_Status> local;
+  try {
+    keys.reserve(count);
+    for (int item = 0; item < count; ++item) keys.push_back(ranklens::request_key(requests[item]));
+    if (statuses == MPI_STATUSES_IGNORE) local.resize(count);
+  } catch (...) {
+    return PMPI_Testsome(count, requests, outcount, indices, statuses);
+  }
+  auto observed = statuses == MPI_STATUSES_IGNORE ? local.data() : statuses;
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Testsome(count, requests, outcount, indices, observed);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Testsome", start, end, 0, -1, -1, result);
+  if ((result == MPI_SUCCESS || result == MPI_ERR_IN_STATUS) &&
+      *outcount != MPI_UNDEFINED && *outcount > 0) {
+    for (int completed = 0; completed < *outcount; ++completed) {
+      const int item = indices[completed];
+      if (0 <= item && item < count && keys[item] != -1 &&
+          (result == MPI_SUCCESS || observed[completed].MPI_ERROR == MPI_SUCCESS))
+        ranklens::complete_request(keys[item], &observed[completed]);
+    }
+  }
+  return result;
+}
+
+int ranklens_MPI_Cancel(MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Cancel(request);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Cancel", start, end, 0, -1, -1, result);
+  return result;
+}
+
+int ranklens_MPI_Request_free(MPI_Request* request) {
+  const auto key = ranklens::request_key(*request);
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Request_free(request);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Request_free", start, end, 0, -1, -1, result);
+  if (result == MPI_SUCCESS) ranklens::forget_request(key);
+  return result;
+}
+
 int ranklens_MPI_Barrier(MPI_Comm communicator) {
   const auto start = ranklens::Clock::now();
   const int result = PMPI_Barrier(communicator);
@@ -619,6 +933,13 @@ RANKLENS_INTERPOSE(ranklens_MPI_Irecv, MPI_Irecv);
 RANKLENS_INTERPOSE(ranklens_MPI_Wait, MPI_Wait);
 RANKLENS_INTERPOSE(ranklens_MPI_Test, MPI_Test);
 RANKLENS_INTERPOSE(ranklens_MPI_Waitall, MPI_Waitall);
+RANKLENS_INTERPOSE(ranklens_MPI_Waitany, MPI_Waitany);
+RANKLENS_INTERPOSE(ranklens_MPI_Waitsome, MPI_Waitsome);
+RANKLENS_INTERPOSE(ranklens_MPI_Testall, MPI_Testall);
+RANKLENS_INTERPOSE(ranklens_MPI_Testany, MPI_Testany);
+RANKLENS_INTERPOSE(ranklens_MPI_Testsome, MPI_Testsome);
+RANKLENS_INTERPOSE(ranklens_MPI_Cancel, MPI_Cancel);
+RANKLENS_INTERPOSE(ranklens_MPI_Request_free, MPI_Request_free);
 
 #else
 
@@ -634,6 +955,13 @@ int MPI_Irecv(void* buffer, int count, MPI_Datatype datatype, int peer, int tag,
 int MPI_Wait(MPI_Request* request, MPI_Status* status) { return ranklens_MPI_Wait(request, status); }
 int MPI_Test(MPI_Request* request, int* flag, MPI_Status* status) { return ranklens_MPI_Test(request, flag, status); }
 int MPI_Waitall(int count, MPI_Request requests[], MPI_Status statuses[]) { return ranklens_MPI_Waitall(count, requests, statuses); }
+int MPI_Waitany(int count, MPI_Request requests[], int* index, MPI_Status* status) { return ranklens_MPI_Waitany(count, requests, index, status); }
+int MPI_Waitsome(int count, MPI_Request requests[], int* outcount, int indices[], MPI_Status statuses[]) { return ranklens_MPI_Waitsome(count, requests, outcount, indices, statuses); }
+int MPI_Testall(int count, MPI_Request requests[], int* flag, MPI_Status statuses[]) { return ranklens_MPI_Testall(count, requests, flag, statuses); }
+int MPI_Testany(int count, MPI_Request requests[], int* index, int* flag, MPI_Status* status) { return ranklens_MPI_Testany(count, requests, index, flag, status); }
+int MPI_Testsome(int count, MPI_Request requests[], int* outcount, int indices[], MPI_Status statuses[]) { return ranklens_MPI_Testsome(count, requests, outcount, indices, statuses); }
+int MPI_Cancel(MPI_Request* request) { return ranklens_MPI_Cancel(request); }
+int MPI_Request_free(MPI_Request* request) { return ranklens_MPI_Request_free(request); }
 
 int MPI_Send(const void* buffer, int count, MPI_Datatype datatype, int destination, int tag,
              MPI_Comm communicator) {
