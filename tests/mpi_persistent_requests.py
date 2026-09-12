@@ -15,20 +15,32 @@ with tempfile.TemporaryDirectory() as temporary:
     assert run([launcher, "-n", "2", executable], Path(library), output) == 0
     result = analyze(output)
     assert result.complete
-    required = {"MPI_Send_init", "MPI_Recv_init", "MPI_Start", "MPI_Startall"}
+    required = {
+        "MPI_Send_init",
+        "MPI_Recv_init",
+        "MPI_Bsend_init",
+        "MPI_Ssend_init",
+        "MPI_Rsend_init",
+        "MPI_Start",
+        "MPI_Startall",
+    }
     assert required.issubset(result.operations)
     assert result.operations["MPI_Send_init"].calls == 2
-    assert result.operations["MPI_Recv_init"].calls == 4
-    assert result.operations["MPI_Startall"].calls == 6
-    assert result.operations["MPI_Start"].calls == 2
-    assert result.operations["MPI_Irecv_complete"].calls == 8
+    assert result.operations["MPI_Bsend_init"].calls == 2
+    assert result.operations["MPI_Ssend_init"].calls == 2
+    assert result.operations["MPI_Rsend_init"].calls == 2
+    assert result.operations["MPI_Recv_init"].calls == 10
+    assert result.operations["MPI_Startall"].calls == 10
+    assert result.operations["MPI_Start"].calls == 6
+    assert result.operations["MPI_Irecv_complete"].calls == 14
 
     for stream in output.glob("*-events.jsonl"):
         events = [json.loads(line) for line in stream.read_text().splitlines()]
         templates = {
             event["request_id"]
             for event in events
-            if event["operation"] in {"MPI_Send_init", "MPI_Recv_init"}
+            if event["operation"]
+            in {"MPI_Send_init", "MPI_Recv_init", "MPI_Bsend_init", "MPI_Ssend_init", "MPI_Rsend_init"}
         }
         completed = {
             event["request_id"]

@@ -158,12 +158,13 @@ int process_id() {
 #endif
 }
 
-constexpr std::array<const char*, 23> kOperationNames = {
+constexpr std::array<const char*, 26> kOperationNames = {
     "MPI_Send", "MPI_Recv", "MPI_Isend", "MPI_Irecv", "MPI_Wait", "MPI_Test",
     "MPI_Waitall", "MPI_Waitany", "MPI_Waitsome", "MPI_Testall", "MPI_Testany",
     "MPI_Testsome", "MPI_Allreduce", "MPI_Bcast", "MPI_Barrier",
     "MPI_Cancel", "MPI_Request_free", "MPI_Send_init", "MPI_Recv_init",
-    "MPI_Start", "MPI_Startall", "MPI_Isend_complete", "MPI_Irecv_complete"};
+    "MPI_Bsend_init", "MPI_Ssend_init", "MPI_Rsend_init", "MPI_Start",
+    "MPI_Startall", "MPI_Isend_complete", "MPI_Irecv_complete"};
 
 std::size_t operation_index(const char* operation) {
   for (std::size_t index = 0; index < kOperationNames.size(); ++index) {
@@ -790,6 +791,42 @@ int ranklens_MPI_Recv_init(void* buffer, int count, MPI_Datatype datatype, int p
   return result;
 }
 
+int ranklens_MPI_Bsend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag,
+                            MPI_Comm comm, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Bsend_init(buffer, count, datatype, peer, tag, comm, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, false, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Bsend_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
+int ranklens_MPI_Ssend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag,
+                            MPI_Comm comm, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Ssend_init(buffer, count, datatype, peer, tag, comm, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, false, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Ssend_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
+int ranklens_MPI_Rsend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag,
+                            MPI_Comm comm, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Rsend_init(buffer, count, datatype, peer, tag, comm, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, false, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Rsend_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
 int ranklens_MPI_Start(MPI_Request* request) {
   const auto key = ranklens::request_key(*request);
   const auto start = ranklens::Clock::now();
@@ -1038,6 +1075,9 @@ RANKLENS_INTERPOSE(ranklens_MPI_Isend, MPI_Isend);
 RANKLENS_INTERPOSE(ranklens_MPI_Irecv, MPI_Irecv);
 RANKLENS_INTERPOSE(ranklens_MPI_Send_init, MPI_Send_init);
 RANKLENS_INTERPOSE(ranklens_MPI_Recv_init, MPI_Recv_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Bsend_init, MPI_Bsend_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Ssend_init, MPI_Ssend_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Rsend_init, MPI_Rsend_init);
 RANKLENS_INTERPOSE(ranklens_MPI_Start, MPI_Start);
 RANKLENS_INTERPOSE(ranklens_MPI_Startall, MPI_Startall);
 RANKLENS_INTERPOSE(ranklens_MPI_Wait, MPI_Wait);
@@ -1064,6 +1104,9 @@ int MPI_Isend(const void* buffer, int count, MPI_Datatype datatype, int peer, in
 int MPI_Irecv(void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Irecv(buffer, count, datatype, peer, tag, comm, request); }
 int MPI_Send_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Send_init(buffer, count, datatype, peer, tag, comm, request); }
 int MPI_Recv_init(void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Recv_init(buffer, count, datatype, peer, tag, comm, request); }
+int MPI_Bsend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Bsend_init(buffer, count, datatype, peer, tag, comm, request); }
+int MPI_Ssend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Ssend_init(buffer, count, datatype, peer, tag, comm, request); }
+int MPI_Rsend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Rsend_init(buffer, count, datatype, peer, tag, comm, request); }
 int MPI_Start(MPI_Request* request) { return ranklens_MPI_Start(request); }
 int MPI_Startall(int count, MPI_Request requests[]) { return ranklens_MPI_Startall(count, requests); }
 int MPI_Wait(MPI_Request* request, MPI_Status* status) { return ranklens_MPI_Wait(request, status); }
