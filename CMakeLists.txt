@@ -69,12 +69,16 @@ if(BUILD_TESTING AND RANKLENS_BUILD_TESTS)
     add_test(NAME ranklens_thread_multiple_integration COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_thread_multiple.py
       ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_thread_multiple>)
+    add_test(NAME ranklens_controlled_errors_integration COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_controlled_errors.py
+      ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_controlled_errors>)
     set_tests_properties(ranklens_mpi_integration ranklens_nonblocking_integration
       ranklens_completion_families_integration ranklens_persistent_requests_integration
-      ranklens_thread_multiple_integration
+      ranklens_thread_multiple_integration ranklens_controlled_errors_integration
       PROPERTIES TIMEOUT 60)
     set_tests_properties(ranklens_nonblocking_integration ranklens_completion_families_integration
       ranklens_persistent_requests_integration ranklens_thread_multiple_integration
+      ranklens_controlled_errors_integration
       PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python")
   endif()
 endif()
