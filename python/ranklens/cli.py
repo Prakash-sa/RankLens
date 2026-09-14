@@ -68,6 +68,22 @@ def _parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("--output", type=Path, required=True)
     bench_parser.add_argument("--repeats", type=int, default=3)
     bench_parser.add_argument("--timeout", type=float, default=300)
+    bench_parser.add_argument(
+        "--mode",
+        choices=("summary", "detail"),
+        default="summary",
+        help="capture mode for instrumented trials; summary disables event tracing",
+    )
+    bench_parser.add_argument(
+        "--max-median-overhead-percent",
+        type=float,
+        help="fail if paired median overhead is above this percentage",
+    )
+    bench_parser.add_argument(
+        "--max-p95-overhead-percent",
+        type=float,
+        help="fail if paired p95 overhead is above this percentage",
+    )
     bench_parser.add_argument("command", nargs=argparse.REMAINDER)
     subcommands.add_parser("doctor", help="check local launcher and interceptor availability")
     return parser
@@ -152,8 +168,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if arguments.subcommand == "benchmark":
             command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
-            print(json.dumps(benchmark(command, discover_library(arguments.library), arguments.output,
-                                       arguments.repeats, arguments.timeout), indent=2))
+            print(json.dumps(
+                benchmark(
+                    command,
+                    discover_library(arguments.library),
+                    arguments.output,
+                    arguments.repeats,
+                    arguments.timeout,
+                    mode=arguments.mode,
+                    max_median_overhead_percent=arguments.max_median_overhead_percent,
+                    max_p95_overhead_percent=arguments.max_p95_overhead_percent,
+                ),
+                indent=2,
+            ))
             return 0
         if arguments.subcommand == "doctor":
             checks = {name: shutil.which(name) for name in ("mpirun", "srun", "flux", "cmake")}

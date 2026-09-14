@@ -6,16 +6,32 @@ import csv
 import hashlib
 import json
 import math
+import os
 import sqlite3
 import statistics
 import subprocess
 import time
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 from .analyzer import analyze
 from .report import render_html
 from .runner import instrumented_environment, _forward_macos_openmpi_environment
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[int(rank)]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
 
 
 def export_csv(result, destination: Path) -> None:
@@ -84,10 +100,30 @@ def catalog(database: Path, directory=None) -> list:
                 for row in connection.execute("SELECT id, source, report FROM captures ORDER BY rowid DESC")]
 
 
-def benchmark(command, library: Path, output: Path, repeats=3, timeout=300) -> dict:
-    """Alternate baseline/instrumented trials; record stdout equality without claiming numerical equivalence."""
-    if not command or repeats < 2 or repeats > 100 or not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("provide a command, 2–100 repeats, and a positive finite timeout")
+def benchmark(
+    command,
+    library: Path,
+    output: Path,
+    repeats=3,
+    timeout=300,
+    *,
+    mode: str = "summary",
+    max_median_overhead_percent: Optional[float] = None,
+    max_p95_overhead_percent: Optional[float] = None,
+) -> dict:
+    """Alternate baseline/instrumented trials and optionally enforce overhead budgets."""
+    if (
+        not command
+        or repeats < 2
+        or repeats > 100
+        or not math.isfinite(timeout)
+        or timeout <= 0
+        or mode not in {"summary", "detail"}
+    ):
+        raise ValueError("provide a command, 2–100 repeats, positive finite timeout, and valid mode")
+    for budget in (max_median_overhead_percent, max_p95_overhead_percent):
+        if budget is not None and (not math.isfinite(budget) or budget < 0):
+            raise ValueError("overhead budgets must be finite non-negative percentages")
     output.mkdir(parents=True, exist_ok=False)
     trials = []
     for trial in range(repeats):
@@ -95,6 +131,8 @@ def benchmark(command, library: Path, output: Path, repeats=3, timeout=300) -> d
             directory = output / f"trial-{trial}-{'instrumented' if instrumented else 'baseline'}"
             directory.mkdir()
             env = instrumented_environment(library, directory) if instrumented else None
+            if env is not None:
+                env["RANKLENS_TRACE_EVENTS"] = "1" if mode == "detail" else "0"
             launch = _forward_macos_openmpi_environment(command, env) if env else command
             started = time.perf_counter_ns()
             completed = subprocess.run(launch, env=env, capture_output=True, timeout=timeout, check=False)
@@ -107,13 +145,54 @@ def benchmark(command, library: Path, output: Path, repeats=3, timeout=300) -> d
                 captured = analyze(directory)
                 if not captured.complete:
                     raise ValueError(f"benchmark capture incomplete: {directory}")
-            trials.append({"trial": trial, "instrumented": instrumented, "elapsed_ns": elapsed,
-                           "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest()})
+            trials.append({
+                "trial": trial,
+                "instrumented": instrumented,
+                "elapsed_ns": elapsed,
+                "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+                "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
+            })
     baseline = statistics.median(t["elapsed_ns"] for t in trials if not t["instrumented"])
     measured = statistics.median(t["elapsed_ns"] for t in trials if t["instrumented"])
-    result = {"command": list(command), "trials": trials, "baseline_median_ns": baseline,
-              "instrumented_median_ns": measured, "overhead_percent": (measured / baseline - 1) * 100,
-              "stdout_equal": len({t["stdout_sha256"] for t in trials}) == 1,
-              "scope": "wall-clock launcher time; stdout equality does not prove scientific equivalence"}
+    paired_overheads = []
+    for trial in range(repeats):
+        baseline_elapsed = next(t["elapsed_ns"] for t in trials if t["trial"] == trial and not t["instrumented"])
+        measured_elapsed = next(t["elapsed_ns"] for t in trials if t["trial"] == trial and t["instrumented"])
+        paired_overheads.append((measured_elapsed / baseline_elapsed - 1) * 100)
+    median_overhead = statistics.median(paired_overheads)
+    p95_overhead = _percentile(paired_overheads, 0.95)
+    budget = {
+        "max_median_overhead_percent": max_median_overhead_percent,
+        "max_p95_overhead_percent": max_p95_overhead_percent,
+        "passed": (
+            (max_median_overhead_percent is None or median_overhead <= max_median_overhead_percent)
+            and (max_p95_overhead_percent is None or p95_overhead <= max_p95_overhead_percent)
+        ),
+    }
+    result = {
+        "command": list(command),
+        "mode": mode,
+        "repeats": repeats,
+        "trials": trials,
+        "baseline_median_ns": baseline,
+        "instrumented_median_ns": measured,
+        "overhead_percent": (measured / baseline - 1) * 100,
+        "paired_overhead_percent": paired_overheads,
+        "paired_median_overhead_percent": median_overhead,
+        "paired_p95_overhead_percent": p95_overhead,
+        "budget": budget,
+        "stdout_equal": len({t["stdout_sha256"] for t in trials}) == 1,
+        "stderr_equal": len({t["stderr_sha256"] for t in trials}) == 1,
+        "scope": (
+            "wall-clock launcher time; stdout/stderr equality does not prove scientific "
+            "equivalence; summary mode disables event tracing"
+        ),
+        "environment": {
+            "ranklens_trace_events": "1" if mode == "detail" else "0",
+            "python_hash_seed": os.environ.get("PYTHONHASHSEED", ""),
+        },
+    }
     (output / "benchmark.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    if not budget["passed"]:
+        raise ValueError(f"benchmark overhead budget failed; inspect {output / 'benchmark.json'}")
     return result

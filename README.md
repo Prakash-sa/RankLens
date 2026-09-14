@@ -106,12 +106,15 @@ the [security policy](SECURITY.md) before enabling network ingestion.
 ranklens doctor
 ranklens analyze captures/solver-a --html report.html --json analysis.json --csv ranks.csv
 ranklens benchmark --library build/src/interceptor/libranklens_mpi.so \
-  --output overhead-study --repeats 5 -- mpirun -n 4 ./solver input.json
+  --output overhead-study --repeats 5 --mode summary \
+  --max-median-overhead-percent 2 --max-p95-overhead-percent 5 \
+  -- mpirun -n 4 ./solver input.json
 ```
 
-`ranklens benchmark` alternates baseline and instrumented trials and records output hashes. Matching
-hashes are useful evidence, but scientific validity must still be checked with the application’s
-own tolerances and validators.
+`ranklens benchmark` alternates baseline and instrumented trials, records output hashes, and can
+fail when observed median or p95 overhead exceeds the budget you set. Matching hashes are useful
+evidence, but scientific validity must still be checked with the application’s own tolerances and
+validators.
 
 ## Contributing and support
 

@@ -72,5 +72,7 @@ cross-node clocks are not treated as synchronized.
 
 Instrumentation overhead must be measured with controlled workloads. Record input identity, code
 commit, MPI implementation, node type/count, placement, scheduler ID, and thread environment.
-Disable event tracing to isolate summary-only cost. The bundled benchmark harness alternates trial
-order and reports observed wall-clock overhead without making a universal overhead claim.
+Use summary mode to disable event tracing and isolate summary-only cost; use detail mode when event
+records are part of the test. The bundled benchmark harness alternates trial order, reports paired
+median and p95 wall-clock overhead, and can enforce caller-supplied budgets without making a
+universal overhead claim.
