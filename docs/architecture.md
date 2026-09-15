@@ -56,6 +56,14 @@ The standalone HTML report embeds no remote assets. The web workspace strictly v
 analysis JSON and keeps files in the browser. Its timeline intentionally labels rank-local time;
 cross-node clocks are not treated as synchronized.
 
+## Node agent
+
+The Go node agent incrementally reads completed capture records, assigns per-stream sequence
+numbers, seals bounded local spool segments, and can replay them to an authenticated ingest API.
+It refuses to seal new segments when the pending-spool quota is exhausted. Operators can also set
+minimum filesystem free space and maximum Go runtime memory thresholds so collection fails open
+before the agent consumes resources outside an approved node budget.
+
 ## Failure behavior
 
 - A telemetry directory or event-file error disables affected recording and never changes an MPI

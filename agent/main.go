@@ -15,8 +15,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -28,17 +30,19 @@ const (
 )
 
 type config struct {
-	CaptureDir         string
-	SpoolDir           string
-	APIURL             string
-	TokenFile          string
-	ClusterID          string
-	AttemptID          string
-	ProducerID         string
-	DeletionGeneration uint64
-	MaxSpoolBytes      int64
-	Interval           time.Duration
-	Once               bool
+	CaptureDir          string
+	SpoolDir            string
+	APIURL              string
+	TokenFile           string
+	ClusterID           string
+	AttemptID           string
+	ProducerID          string
+	DeletionGeneration  uint64
+	MaxSpoolBytes       int64
+	MinSpoolFreeBytes   int64
+	MaxAgentMemoryBytes int64
+	Interval            time.Duration
+	Once                bool
 }
 
 type fileCursor struct {
@@ -172,6 +176,12 @@ func newAgent(configuration config) (*agent, error) {
 	if configuration.MaxSpoolBytes <= 0 {
 		return nil, errors.New("max spool bytes must be positive")
 	}
+	if configuration.MinSpoolFreeBytes < 0 {
+		return nil, errors.New("minimum spool free bytes cannot be negative")
+	}
+	if configuration.MaxAgentMemoryBytes < 0 {
+		return nil, errors.New("max agent memory bytes cannot be negative")
+	}
 	state, err := loadOrCreateState(configuration.SpoolDir)
 	if err != nil {
 		return nil, err
@@ -183,12 +193,55 @@ func newAgent(configuration config) (*agent, error) {
 	}, nil
 }
 
+func agentMemoryBytes() int64 {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	if stats.Sys > uint64(^uint(0)>>1) {
+		return int64(^uint(0) >> 1)
+	}
+	return int64(stats.Sys)
+}
+
+func filesystemAvailableBytes(path string) (int64, error) {
+	var stats syscall.Statfs_t
+	if err := syscall.Statfs(path, &stats); err != nil {
+		return 0, err
+	}
+	free := uint64(stats.Bavail) * uint64(stats.Bsize)
+	if free > uint64(^uint(0)>>1) {
+		return int64(^uint(0) >> 1), nil
+	}
+	return int64(free), nil
+}
+
+func (a *agent) enforceNodeBudgets() error {
+	if a.config.MaxAgentMemoryBytes > 0 {
+		used := agentMemoryBytes()
+		if used > a.config.MaxAgentMemoryBytes {
+			return fmt.Errorf("agent memory budget exceeded: used=%d limit=%d", used, a.config.MaxAgentMemoryBytes)
+		}
+	}
+	if a.config.MinSpoolFreeBytes > 0 {
+		free, err := filesystemAvailableBytes(a.config.SpoolDir)
+		if err != nil {
+			return fmt.Errorf("measure spool filesystem free space: %w", err)
+		}
+		if free < a.config.MinSpoolFreeBytes {
+			return fmt.Errorf("spool filesystem free budget violated: free=%d required=%d", free, a.config.MinSpoolFreeBytes)
+		}
+	}
+	return nil
+}
+
 func (a *agent) spoolPayload(streamID string, payload []byte, records int) error {
 	if records <= 0 || len(payload) == 0 {
 		return nil
 	}
 	if len(payload) > maxSegmentBytes {
 		return errors.New("sealed segment exceeds 8 MiB admission budget")
+	}
+	if err := a.enforceNodeBudgets(); err != nil {
+		return err
 	}
 	digest := sha256.Sum256(payload)
 	first := a.state.NextSequence[streamID]
@@ -502,6 +555,8 @@ func main() {
 	flag.StringVar(&configuration.ProducerID, "producer-id", "", "registered node-agent identity")
 	flag.Uint64Var(&configuration.DeletionGeneration, "deletion-generation", 0, "current attempt deletion generation")
 	flag.Int64Var(&configuration.MaxSpoolBytes, "max-spool-bytes", defaultSpoolMax, "maximum pending spool bytes")
+	flag.Int64Var(&configuration.MinSpoolFreeBytes, "min-spool-free-bytes", 0, "minimum filesystem free bytes required before sealing a segment")
+	flag.Int64Var(&configuration.MaxAgentMemoryBytes, "max-agent-memory-bytes", 0, "maximum Go runtime memory bytes allowed before sealing a segment; 0 disables the check")
 	flag.DurationVar(&configuration.Interval, "interval", time.Second, "collection and replay interval")
 	flag.BoolVar(&configuration.Once, "once", false, "collect and replay once, then exit")
 	flag.Parse()

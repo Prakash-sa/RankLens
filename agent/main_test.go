@@ -152,3 +152,38 @@ func TestSpoolAndSummaryBudgets(t *testing.T) {
 		t.Fatal("expected oversized summary to be rejected")
 	}
 }
+
+func TestNodeAdmissionBudgets(t *testing.T) {
+	root := t.TempDir()
+	spool := filepath.Join(root, "spool")
+	instance, err := newAgent(config{
+		CaptureDir:    root,
+		SpoolDir:      spool,
+		ClusterID:     "cluster-a",
+		AttemptID:     "attempt-1",
+		ProducerID:    "agent-1",
+		MaxSpoolBytes: defaultSpoolMax,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	instance.config.MaxAgentMemoryBytes = 1
+	if err := instance.spoolPayload("events", []byte("{\"value\":1}\n"), 1); err == nil || !strings.Contains(err.Error(), "agent memory budget") {
+		t.Fatalf("expected memory budget rejection, got %v", err)
+	}
+	pending, _ := filepath.Glob(filepath.Join(spool, "pending", "*.segment.json"))
+	if len(pending) != 0 {
+		t.Fatalf("memory budget rejection should not seal a segment, found %d", len(pending))
+	}
+
+	instance.config.MaxAgentMemoryBytes = 0
+	instance.config.MinSpoolFreeBytes = int64(^uint64(0) >> 1)
+	if err := instance.spoolPayload("events", []byte("{\"value\":1}\n"), 1); err == nil || !strings.Contains(err.Error(), "spool filesystem free budget") {
+		t.Fatalf("expected free-space budget rejection, got %v", err)
+	}
+	pending, _ = filepath.Glob(filepath.Join(spool, "pending", "*.segment.json"))
+	if len(pending) != 0 {
+		t.Fatalf("free-space budget rejection should not seal a segment, found %d", len(pending))
+	}
+}
