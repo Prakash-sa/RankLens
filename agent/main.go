@@ -57,21 +57,30 @@ type agentState struct {
 }
 
 type segmentUpload struct {
-	EnvelopeMajor      int    `json:"envelope_major"`
-	ClusterID          string `json:"cluster_id"`
-	AttemptID          string `json:"attempt_id"`
-	ProducerID         string `json:"producer_id"`
-	TransportEpoch     string `json:"transport_epoch"`
-	StreamID           string `json:"stream_id"`
-	FirstSequence      uint64 `json:"first_sequence"`
-	LastSequence       uint64 `json:"last_sequence"`
-	RecordCount        int    `json:"record_count"`
-	DeletionGeneration uint64 `json:"deletion_generation"`
-	Compression        string `json:"compression"`
-	ContentType        string `json:"content_type"`
-	ExpandedSizeBytes  int    `json:"expanded_size_bytes"`
-	PayloadSHA256      string `json:"payload_sha256"`
-	PayloadBase64      string `json:"payload_base64"`
+	EnvelopeMajor      int                `json:"envelope_major"`
+	ClusterID          string             `json:"cluster_id"`
+	AttemptID          string             `json:"attempt_id"`
+	ProducerID         string             `json:"producer_id"`
+	TransportEpoch     string             `json:"transport_epoch"`
+	StreamID           string             `json:"stream_id"`
+	FirstSequence      uint64             `json:"first_sequence"`
+	LastSequence       uint64             `json:"last_sequence"`
+	RecordCount        int                `json:"record_count"`
+	DeletionGeneration uint64             `json:"deletion_generation"`
+	Compression        string             `json:"compression"`
+	ContentType        string             `json:"content_type"`
+	ExpandedSizeBytes  int                `json:"expanded_size_bytes"`
+	PayloadSHA256      string             `json:"payload_sha256"`
+	PayloadBase64      string             `json:"payload_base64"`
+	NodeBudget         nodeBudgetSnapshot `json:"node_budget"`
+}
+
+type nodeBudgetSnapshot struct {
+	AgentMemoryBytes    int64 `json:"agent_memory_bytes"`
+	MaxAgentMemoryBytes int64 `json:"max_agent_memory_bytes"`
+	SpoolFreeBytes      int64 `json:"spool_free_bytes"`
+	MinSpoolFreeBytes   int64 `json:"min_spool_free_bytes"`
+	MaxSpoolBytes       int64 `json:"max_spool_bytes"`
 }
 
 type durableReceipt struct {
@@ -214,23 +223,37 @@ func filesystemAvailableBytes(path string) (int64, error) {
 	return int64(free), nil
 }
 
-func (a *agent) enforceNodeBudgets() error {
+func (a *agent) measureNodeBudgets() (nodeBudgetSnapshot, error) {
+	snapshot := nodeBudgetSnapshot{
+		AgentMemoryBytes:    agentMemoryBytes(),
+		MaxAgentMemoryBytes: a.config.MaxAgentMemoryBytes,
+		MinSpoolFreeBytes:   a.config.MinSpoolFreeBytes,
+		MaxSpoolBytes:       a.config.MaxSpoolBytes,
+	}
+	free, err := filesystemAvailableBytes(a.config.SpoolDir)
+	if err != nil {
+		return snapshot, fmt.Errorf("measure spool filesystem free space: %w", err)
+	}
+	snapshot.SpoolFreeBytes = free
+	return snapshot, nil
+}
+
+func (a *agent) enforceNodeBudgets() (nodeBudgetSnapshot, error) {
+	snapshot, err := a.measureNodeBudgets()
+	if err != nil {
+		return snapshot, err
+	}
 	if a.config.MaxAgentMemoryBytes > 0 {
-		used := agentMemoryBytes()
-		if used > a.config.MaxAgentMemoryBytes {
-			return fmt.Errorf("agent memory budget exceeded: used=%d limit=%d", used, a.config.MaxAgentMemoryBytes)
+		if snapshot.AgentMemoryBytes > a.config.MaxAgentMemoryBytes {
+			return snapshot, fmt.Errorf("agent memory budget exceeded: used=%d limit=%d", snapshot.AgentMemoryBytes, a.config.MaxAgentMemoryBytes)
 		}
 	}
 	if a.config.MinSpoolFreeBytes > 0 {
-		free, err := filesystemAvailableBytes(a.config.SpoolDir)
-		if err != nil {
-			return fmt.Errorf("measure spool filesystem free space: %w", err)
-		}
-		if free < a.config.MinSpoolFreeBytes {
-			return fmt.Errorf("spool filesystem free budget violated: free=%d required=%d", free, a.config.MinSpoolFreeBytes)
+		if snapshot.SpoolFreeBytes < a.config.MinSpoolFreeBytes {
+			return snapshot, fmt.Errorf("spool filesystem free budget violated: free=%d required=%d", snapshot.SpoolFreeBytes, a.config.MinSpoolFreeBytes)
 		}
 	}
-	return nil
+	return snapshot, nil
 }
 
 func (a *agent) spoolPayload(streamID string, payload []byte, records int) error {
@@ -240,7 +263,8 @@ func (a *agent) spoolPayload(streamID string, payload []byte, records int) error
 	if len(payload) > maxSegmentBytes {
 		return errors.New("sealed segment exceeds 8 MiB admission budget")
 	}
-	if err := a.enforceNodeBudgets(); err != nil {
+	nodeBudget, err := a.enforceNodeBudgets()
+	if err != nil {
 		return err
 	}
 	digest := sha256.Sum256(payload)
@@ -262,6 +286,7 @@ func (a *agent) spoolPayload(streamID string, payload []byte, records int) error
 		ExpandedSizeBytes:  len(payload),
 		PayloadSHA256:      hex.EncodeToString(digest[:]),
 		PayloadBase64:      base64.StdEncoding.EncodeToString(payload),
+		NodeBudget:         nodeBudget,
 	}
 	encoded, err := json.Marshal(upload)
 	if err != nil {

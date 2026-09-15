@@ -49,6 +49,10 @@ func TestCollectSpoolAndDurableDrain(t *testing.T) {
 			http.Error(response, "invalid segment", http.StatusBadRequest)
 			return
 		}
+		if segment.NodeBudget.AgentMemoryBytes <= 0 || segment.NodeBudget.SpoolFreeBytes <= 0 || segment.NodeBudget.MaxSpoolBytes <= 0 {
+			http.Error(response, "missing node budget evidence", http.StatusBadRequest)
+			return
+		}
 		index := requests.Add(1)
 		response.Header().Set("Content-Type", "application/json")
 		response.WriteHeader(http.StatusCreated)
