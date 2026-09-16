@@ -53,6 +53,9 @@ class SchedulerReconcilerTests(unittest.TestCase):
         initialize_schema(self.engine)
         self.sessions = build_session_factory(self.engine)
 
+    def tearDown(self) -> None:
+        self.engine.dispose()
+
     def observations(self) -> list[SchedulerObservation]:
         with self.sessions() as session:
             return list(
