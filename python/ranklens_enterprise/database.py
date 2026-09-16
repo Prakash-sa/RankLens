@@ -118,6 +118,49 @@ class NormalizedSegment(Base):
     normalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SchedulerObservation(Base):
+    __tablename__ = "scheduler_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "cluster_id", "source_identity", "observed_at",
+            name="uq_scheduler_observation_seen",
+        ),
+        Index(
+            "ix_scheduler_observation_attempt",
+            "tenant_id", "cluster_id", "source_identity", "observed_at",
+        ),
+        Index(
+            "ix_scheduler_observation_job",
+            "tenant_id", "cluster_id", "job_id", "observed_at",
+        ),
+    )
+
+    observation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    adapter: Mapped[str] = mapped_column(String(64), nullable=False)
+    adapter_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_identity: Mapped[str] = mapped_column(String(256), nullable=False)
+    job_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    array_job_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    array_task_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    step_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    restart_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    state_reason: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    allocated_nodes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    allocated_cpus: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    account: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    partition: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    user_ref: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    raw_json: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 def build_engine(database_url: str):
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
     return create_engine(database_url, pool_pre_ping=True, future=True, connect_args=connect_args)
