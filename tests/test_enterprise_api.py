@@ -4,12 +4,19 @@ import base64
 import hashlib
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from ranklens_enterprise.api import create_app
-from ranklens_enterprise.database import assert_schema_ready, build_engine, initialize_schema
+from ranklens_enterprise.database import (
+    SchedulerObservation,
+    assert_schema_ready,
+    build_engine,
+    build_session_factory,
+    initialize_schema,
+)
 from ranklens_enterprise.settings import MachinePrincipal, Settings
 
 
@@ -17,9 +24,10 @@ class EnterpriseApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.database_url = f"sqlite:///{root / 'catalog.sqlite3'}"
         self.token = "test-token-with-at-least-24-characters"
         settings = Settings(
-            database_url=f"sqlite:///{root / 'catalog.sqlite3'}",
+            database_url=self.database_url,
             object_root=root / "objects",
             machine_tokens={
                 self.token: MachinePrincipal("tenant-a", frozenset({"cluster-a"}))
@@ -107,6 +115,58 @@ class EnterpriseApiTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "alembic_version"):
             assert_schema_ready(engine)
         engine.dispose()
+
+    def test_scheduler_observations_are_cluster_scoped(self) -> None:
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        observed = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+        with sessions() as session:
+            session.add(
+                SchedulerObservation(
+                    observation_id="observation-1",
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    adapter="slurm",
+                    adapter_version="slurm-sacct-json-v1",
+                    source_identity="slurm:cluster-a:derived:abc",
+                    job_id="44",
+                    array_job_id=None,
+                    array_task_id=None,
+                    step_id=None,
+                    restart_count=0,
+                    state="running",
+                    state_reason=None,
+                    submitted_at=observed,
+                    started_at=observed,
+                    ended_at=None,
+                    allocated_nodes=2,
+                    allocated_cpus=64,
+                    account="science",
+                    partition="compute",
+                    user_ref="opaque-user-ref",
+                    observed_at=observed,
+                    raw_json='{"job_id":"44"}',
+                    first_seen_at=observed,
+                )
+            )
+            session.commit()
+        engine.dispose()
+
+        headers = {"authorization": f"Bearer {self.token}"}
+        allowed = self.client.get(
+            "/v1/scheduler/observations?cluster_id=cluster-a&job_id=44",
+            headers=headers,
+        )
+        denied = self.client.get(
+            "/v1/scheduler/observations?cluster_id=cluster-b",
+            headers=headers,
+        )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.json()[0]["job_id"], "44")
+        self.assertEqual(allowed.json()[0]["state"], "running")
+        self.assertEqual(allowed.json()[0]["allocated_cpus"], 64)
+        self.assertEqual(denied.status_code, 404)
 
 
 if __name__ == "__main__":

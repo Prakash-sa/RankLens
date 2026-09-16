@@ -5,16 +5,18 @@ from __future__ import annotations
 import argparse
 import uuid
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from sqlalchemy import text
 
 from ranklens import __version__
 
 from .auth import MachineAuthenticator
-from .contracts import DurableReceipt, HealthStatus, ReceiptView, SegmentUpload
-from .database import assert_schema_ready, build_engine, build_session_factory, initialize_schema
+from .contracts import DurableReceipt, HealthStatus, ReceiptView, SchedulerObservationView, SegmentUpload
+from .database import SchedulerObservation, assert_schema_ready, build_engine, build_session_factory, initialize_schema
 from .ingestion import AdmissionError, IngestionService
 from .settings import MachinePrincipal, Settings
 from .storage import LocalObjectStore
@@ -119,6 +121,53 @@ def create_app(settings: Settings) -> FastAPI:
         if result is None or result.cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "receipt_not_found"})
         return result
+
+    @app.get("/v1/scheduler/observations", response_model=List[SchedulerObservationView])
+    def scheduler_observations(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        job_id: Optional[str] = Query(default=None, min_length=1, max_length=128),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> List[SchedulerObservationView]:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = select(SchedulerObservation).where(
+            SchedulerObservation.tenant_id == principal.tenant_id,
+            SchedulerObservation.cluster_id == cluster_id,
+        )
+        if job_id is not None:
+            statement = statement.where(SchedulerObservation.job_id == job_id)
+        statement = statement.order_by(SchedulerObservation.observed_at.desc()).limit(limit)
+        with sessions() as session:
+            rows = session.execute(statement).scalars().all()
+            return [
+                SchedulerObservationView(
+                    observation_id=row.observation_id,
+                    tenant_id=row.tenant_id,
+                    cluster_id=row.cluster_id,
+                    adapter=row.adapter,
+                    adapter_version=row.adapter_version,
+                    source_identity=row.source_identity,
+                    job_id=row.job_id,
+                    array_job_id=row.array_job_id,
+                    array_task_id=row.array_task_id,
+                    step_id=row.step_id,
+                    restart_count=row.restart_count,
+                    state=row.state,
+                    state_reason=row.state_reason,
+                    submitted_at=row.submitted_at,
+                    started_at=row.started_at,
+                    ended_at=row.ended_at,
+                    allocated_nodes=row.allocated_nodes,
+                    allocated_cpus=row.allocated_cpus,
+                    account=row.account,
+                    partition=row.partition,
+                    user_ref=row.user_ref,
+                    observed_at=row.observed_at,
+                    first_seen_at=row.first_seen_at,
+                )
+                for row in rows
+            ]
 
     return app
 

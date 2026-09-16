@@ -69,6 +69,34 @@ class ReceiptView(DurableReceipt):
     last_sequence: int
 
 
+class SchedulerObservationView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: str
+    tenant_id: str
+    cluster_id: str
+    adapter: str
+    adapter_version: str
+    source_identity: str
+    job_id: str
+    array_job_id: Optional[str] = None
+    array_task_id: Optional[str] = None
+    step_id: Optional[str] = None
+    restart_count: int
+    state: str
+    state_reason: Optional[str] = None
+    submitted_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    allocated_nodes: Optional[int] = None
+    allocated_cpus: Optional[int] = None
+    account: Optional[str] = None
+    partition: Optional[str] = None
+    user_ref: Optional[str] = None
+    observed_at: datetime
+    first_seen_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"] = "ok"
     service: Literal["ranklens-enterprise-api"] = "ranklens-enterprise-api"
