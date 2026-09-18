@@ -3,12 +3,23 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from typing import Sequence
+from typing import Optional, Sequence
 
 from sqlalchemy import select
 
-from ranklens_enterprise.database import SchedulerObservation, build_engine, build_session_factory, initialize_schema
-from ranklens_enterprise.scheduler import ExecutionState, SchedulerAttempt, SchedulerReconciler
+from ranklens_enterprise.database import (
+    SchedulerObservation,
+    SchedulerPollCursor,
+    build_engine,
+    build_session_factory,
+    initialize_schema,
+)
+from ranklens_enterprise.scheduler import (
+    ExecutionState,
+    SchedulerAttempt,
+    SchedulerPoller,
+    SchedulerReconciler,
+)
 
 
 class StaticSchedulerAdapter:
@@ -16,8 +27,14 @@ class StaticSchedulerAdapter:
         self.attempts = list(attempts)
         self.requested_job_ids: Sequence[str] = ()
 
-    def fetch_attempts(self, job_ids: Sequence[str] = ()) -> Sequence[SchedulerAttempt]:
+    def fetch_attempts(
+        self,
+        job_ids: Sequence[str] = (),
+        *,
+        since: Optional[datetime] = None,
+    ) -> Sequence[SchedulerAttempt]:
         self.requested_job_ids = tuple(job_ids)
+        self.since = since
         return list(self.attempts)
 
 
@@ -97,6 +114,129 @@ class SchedulerReconcilerTests(unittest.TestCase):
         rows = self.observations()
         self.assertEqual([row.state for row in rows], ["running", "succeeded"])
         self.assertIsNotNone(rows[1].ended_at)
+
+
+class FailingSchedulerAdapter(StaticSchedulerAdapter):
+    def fetch_attempts(
+        self,
+        job_ids: Sequence[str] = (),
+        *,
+        since: Optional[datetime] = None,
+    ) -> Sequence[SchedulerAttempt]:
+        raise RuntimeError("accounting unavailable")
+
+
+class MutableClock:
+    def __init__(self, value: datetime):
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: int) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
+class SchedulerPollerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = build_engine("sqlite:///:memory:")
+        initialize_schema(self.engine)
+        self.sessions = build_session_factory(self.engine)
+        self.clock = MutableClock(datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc))
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+
+    def poller(self, adapter: StaticSchedulerAdapter, *, owner: str = "poller-a") -> SchedulerPoller:
+        return SchedulerPoller(
+            self.sessions,
+            lambda _cluster_id: adapter,
+            owner=owner,
+            poll_interval_seconds=30,
+            lease_seconds=60,
+            accounting_lookback_seconds=300,
+            max_backoff_seconds=300,
+            jitter_ratio=0,
+            clock=self.clock,
+        )
+
+    def cursor(self) -> SchedulerPollCursor:
+        with self.sessions() as session:
+            value = session.get(SchedulerPollCursor, ("tenant-a", "cluster-a"))
+            assert value is not None
+            session.expunge(value)
+            return value
+
+    def test_success_advances_cursor_and_overlaps_next_query(self) -> None:
+        adapter = StaticSchedulerAdapter([attempt_at(self.clock())])
+        poller = self.poller(adapter)
+        poller.register("tenant-a", "cluster-a")
+
+        first = poller.claim()
+        assert first is not None
+        first_result = poller.execute(first)
+
+        self.assertTrue(first_result.published)
+        self.assertIsNone(adapter.since)
+        saved = self.cursor()
+        self.assertEqual(saved.cursor_at.replace(tzinfo=timezone.utc), self.clock())
+        self.assertEqual(saved.consecutive_failures, 0)
+        self.assertIsNone(poller.claim())
+
+        self.clock.advance(30)
+        adapter.attempts = []
+        second = poller.claim()
+        assert second is not None
+        second_result = poller.execute(second)
+
+        self.assertTrue(second_result.published)
+        self.assertEqual(adapter.since, datetime(2026, 9, 18, 11, 55, tzinfo=timezone.utc))
+
+    def test_failure_releases_lease_and_applies_exponential_backoff(self) -> None:
+        adapter = FailingSchedulerAdapter([])
+        poller = self.poller(adapter)
+        poller.register("tenant-a", "cluster-a")
+
+        first = poller.claim()
+        assert first is not None
+        result = poller.execute(first)
+
+        self.assertFalse(result.published)
+        self.assertIn("accounting unavailable", result.error or "")
+        saved = self.cursor()
+        self.assertEqual(saved.consecutive_failures, 1)
+        self.assertIsNone(saved.lease_owner)
+        self.assertEqual(
+            saved.next_poll_at.replace(tzinfo=timezone.utc),
+            self.clock() + timedelta(seconds=30),
+        )
+
+        self.clock.advance(30)
+        second = poller.claim()
+        assert second is not None
+        poller.execute(second)
+        saved = self.cursor()
+        self.assertEqual(saved.consecutive_failures, 2)
+        self.assertEqual(
+            saved.next_poll_at.replace(tzinfo=timezone.utc),
+            self.clock() + timedelta(seconds=60),
+        )
+
+    def test_expired_lease_is_reclaimed_and_stale_owner_is_fenced(self) -> None:
+        adapter = StaticSchedulerAdapter([])
+        first_poller = self.poller(adapter, owner="poller-a")
+        second_poller = self.poller(adapter, owner="poller-b")
+        first_poller.register("tenant-a", "cluster-a")
+
+        stale = first_poller.claim()
+        assert stale is not None
+        self.clock.advance(61)
+        replacement = second_poller.claim()
+        assert replacement is not None
+
+        self.assertGreater(replacement.generation, stale.generation)
+        self.assertFalse(first_poller.execute(stale).published)
+        self.assertTrue(second_poller.execute(replacement).published)
 
 
 if __name__ == "__main__":

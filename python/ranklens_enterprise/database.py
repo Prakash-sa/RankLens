@@ -161,6 +161,27 @@ class SchedulerObservation(Base):
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SchedulerPollCursor(Base):
+    """Durable ownership and progress for one tenant/cluster poll stream."""
+
+    __tablename__ = "scheduler_poll_cursors"
+    __table_args__ = (Index("ix_scheduler_poll_due", "next_poll_at", "tenant_id", "cluster_id"),)
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    adapter: Mapped[str] = mapped_column(String(64), nullable=False)
+    cursor_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 def build_engine(database_url: str):
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
     return create_engine(database_url, pool_pre_ping=True, future=True, connect_args=connect_args)
