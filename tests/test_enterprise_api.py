@@ -161,12 +161,24 @@ class EnterpriseApiTests(unittest.TestCase):
             "/v1/scheduler/observations?cluster_id=cluster-b",
             headers=headers,
         )
+        allocation = self.client.get(
+            "/v1/scheduler/allocation",
+            params={
+                "cluster_id": "cluster-a",
+                "source_identity": "slurm:cluster-a:derived:abc",
+            },
+            headers=headers,
+        )
 
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(allowed.json()[0]["job_id"], "44")
         self.assertEqual(allowed.json()[0]["state"], "running")
         self.assertEqual(allowed.json()[0]["allocated_cpus"], 64)
         self.assertEqual(denied.status_code, 404)
+        self.assertEqual(allocation.status_code, 200)
+        self.assertEqual(allocation.json()["coverage_status"], "observed")
+        self.assertEqual(allocation.json()["intervals"][0]["allocated_nodes"], 2)
+        self.assertIn("attempt_not_terminal", allocation.json()["coverage_reasons"])
 
 
 if __name__ == "__main__":

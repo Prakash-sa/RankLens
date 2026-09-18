@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -95,6 +95,28 @@ class SchedulerObservationView(BaseModel):
     user_ref: Optional[str] = None
     observed_at: datetime
     first_seen_at: datetime
+
+
+class AllocationIntervalView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    allocated_nodes: Optional[int] = None
+    allocated_cpus: Optional[int] = None
+    partition: Optional[str] = None
+
+
+class AllocationTimelineView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_identity: str
+    job_id: str
+    latest_state: str
+    latest_observed_at: datetime
+    coverage_status: Literal["observed", "unknown"]
+    coverage_reasons: List[str]
+    intervals: List[AllocationIntervalView]
 
 
 class HealthStatus(BaseModel):

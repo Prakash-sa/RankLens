@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
@@ -19,6 +20,7 @@ from ranklens_enterprise.scheduler import (
     SchedulerAttempt,
     SchedulerPoller,
     SchedulerReconciler,
+    derive_allocation_timeline,
 )
 
 
@@ -114,6 +116,35 @@ class SchedulerReconcilerTests(unittest.TestCase):
         rows = self.observations()
         self.assertEqual([row.state for row in rows], ["running", "succeeded"])
         self.assertIsNotNone(rows[1].ended_at)
+
+    def test_derives_resource_change_intervals_with_explicit_poll_coverage(self) -> None:
+        first_seen = datetime(2026, 9, 16, 13, 0, tzinfo=timezone.utc)
+        resized_at = first_seen + timedelta(minutes=2)
+        ended_at = first_seen + timedelta(minutes=5)
+        first = attempt_at(first_seen)
+        resized = replace(first, observed_at=resized_at, allocated_nodes=4, allocated_cpus=128)
+        terminal = replace(
+            resized,
+            observed_at=ended_at,
+            state=ExecutionState.SUCCEEDED,
+            ended_at=ended_at,
+        )
+        SchedulerReconciler(
+            self.sessions,
+            StaticSchedulerAdapter([first, resized, terminal]),
+            tenant_id="tenant-a",
+        ).poll_once()
+
+        timeline = derive_allocation_timeline(self.observations())
+
+        self.assertEqual(timeline.coverage_status, "observed")
+        self.assertEqual(timeline.latest_state, "succeeded")
+        self.assertEqual(len(timeline.intervals), 2)
+        self.assertEqual(timeline.intervals[0].allocated_nodes, 2)
+        self.assertEqual(timeline.intervals[0].ended_at, resized_at)
+        self.assertEqual(timeline.intervals[1].allocated_nodes, 4)
+        self.assertEqual(timeline.intervals[1].ended_at, ended_at)
+        self.assertEqual(timeline.coverage_reasons, ("poll_sampled",))
 
 
 class FailingSchedulerAdapter(StaticSchedulerAdapter):

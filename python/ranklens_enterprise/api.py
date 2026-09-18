@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -15,9 +16,17 @@ from sqlalchemy import text
 from ranklens import __version__
 
 from .auth import MachineAuthenticator
-from .contracts import DurableReceipt, HealthStatus, ReceiptView, SchedulerObservationView, SegmentUpload
+from .contracts import (
+    AllocationTimelineView,
+    DurableReceipt,
+    HealthStatus,
+    ReceiptView,
+    SchedulerObservationView,
+    SegmentUpload,
+)
 from .database import SchedulerObservation, assert_schema_ready, build_engine, build_session_factory, initialize_schema
 from .ingestion import AdmissionError, IngestionService
+from .scheduler import derive_allocation_timeline
 from .settings import MachinePrincipal, Settings
 from .storage import LocalObjectStore
 
@@ -168,6 +177,43 @@ def create_app(settings: Settings) -> FastAPI:
                 )
                 for row in rows
             ]
+
+    @app.get("/v1/scheduler/allocation", response_model=AllocationTimelineView)
+    def scheduler_allocation(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        source_identity: str = Query(min_length=1, max_length=256),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> AllocationTimelineView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = (
+            select(SchedulerObservation)
+            .where(
+                SchedulerObservation.tenant_id == principal.tenant_id,
+                SchedulerObservation.cluster_id == cluster_id,
+                SchedulerObservation.source_identity == source_identity,
+            )
+            .order_by(SchedulerObservation.observed_at.desc())
+            .limit(501)
+        )
+        with sessions() as session:
+            rows = session.execute(statement).scalars().all()
+            if not rows:
+                raise HTTPException(status_code=404, detail={"code": "scheduler_attempt_not_found"})
+            limited = len(rows) > 500
+            timeline = derive_allocation_timeline(list(reversed(rows[:500])))
+            coverage_reasons = list(timeline.coverage_reasons)
+            if limited:
+                coverage_reasons.append("observation_window_limited")
+            return AllocationTimelineView(
+                source_identity=timeline.source_identity,
+                job_id=timeline.job_id,
+                latest_state=timeline.latest_state,
+                latest_observed_at=timeline.latest_observed_at,
+                coverage_status=timeline.coverage_status,
+                coverage_reasons=sorted(coverage_reasons),
+                intervals=[asdict(interval) for interval in timeline.intervals],
+            )
 
     return app
 

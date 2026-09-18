@@ -194,8 +194,141 @@ class SchedulerPollResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class AllocationInterval:
+    started_at: datetime
+    ended_at: Optional[datetime]
+    allocated_nodes: Optional[int]
+    allocated_cpus: Optional[int]
+    partition: Optional[str]
+
+
+@dataclass(frozen=True)
+class AllocationTimeline:
+    source_identity: str
+    job_id: str
+    latest_state: str
+    latest_observed_at: datetime
+    coverage_status: str
+    coverage_reasons: Sequence[str]
+    intervals: Sequence[AllocationInterval]
+
+
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc)
+
+
+def derive_allocation_timeline(
+    observations: Sequence[SchedulerObservation],
+) -> AllocationTimeline:
+    """Derive poll-sampled allocation intervals without claiming unseen changes."""
+
+    if not observations:
+        raise ValueError("at least one scheduler observation is required")
+    ordered = sorted(observations, key=lambda row: _aware(row.observed_at))
+    identity = ordered[0].source_identity
+    if any(row.source_identity != identity for row in ordered):
+        raise ValueError("observations must belong to one scheduler source identity")
+
+    terminal_states = {
+        ExecutionState.SUCCEEDED.value,
+        ExecutionState.FAILED.value,
+        ExecutionState.CANCELLED.value,
+        ExecutionState.PREEMPTED.value,
+        ExecutionState.TIMED_OUT.value,
+    }
+    active_states = {ExecutionState.RUNNING.value, ExecutionState.COMPLETING.value}
+    intervals = []
+    current: Optional[AllocationInterval] = None
+    reasons = set()
+
+    for row in ordered:
+        observed_at = _aware(row.observed_at)
+        started_at = _aware(row.started_at) if row.started_at is not None else None
+        ended_at = _aware(row.ended_at) if row.ended_at is not None else None
+        resources = (row.allocated_nodes, row.allocated_cpus, row.partition)
+        has_resources = row.allocated_nodes is not None or row.allocated_cpus is not None
+        is_terminal = row.state in terminal_states
+        can_open = row.state in active_states or (is_terminal and started_at is not None)
+
+        if current is None and can_open and has_resources:
+            current = AllocationInterval(
+                started_at=started_at or observed_at,
+                ended_at=None,
+                allocated_nodes=row.allocated_nodes,
+                allocated_cpus=row.allocated_cpus,
+                partition=row.partition,
+            )
+        elif current is not None and row.state in active_states:
+            current_resources = (
+                current.allocated_nodes,
+                current.allocated_cpus,
+                current.partition,
+            )
+            if has_resources and resources != current_resources:
+                if observed_at >= current.started_at:
+                    intervals.append(
+                        AllocationInterval(
+                            started_at=current.started_at,
+                            ended_at=observed_at,
+                            allocated_nodes=current.allocated_nodes,
+                            allocated_cpus=current.allocated_cpus,
+                            partition=current.partition,
+                        )
+                    )
+                    current = AllocationInterval(
+                        started_at=observed_at,
+                        ended_at=None,
+                        allocated_nodes=row.allocated_nodes,
+                        allocated_cpus=row.allocated_cpus,
+                        partition=row.partition,
+                    )
+                else:
+                    reasons.add("non_monotonic_observation")
+
+        if can_open and not has_resources:
+            reasons.add("missing_allocation_size")
+        if is_terminal and current is not None:
+            boundary = ended_at or observed_at
+            if boundary >= current.started_at:
+                intervals.append(
+                    AllocationInterval(
+                        started_at=current.started_at,
+                        ended_at=boundary,
+                        allocated_nodes=current.allocated_nodes,
+                        allocated_cpus=current.allocated_cpus,
+                        partition=current.partition,
+                    )
+                )
+            else:
+                reasons.add("invalid_terminal_interval")
+            current = None
+
+    latest = ordered[-1]
+    if current is not None:
+        intervals.append(current)
+    if not intervals:
+        reasons.add("no_observed_allocation")
+    if not any(row.started_at is not None for row in ordered):
+        reasons.add("missing_scheduler_start")
+    if latest.state in terminal_states and latest.ended_at is None:
+        reasons.add("missing_scheduler_end")
+    if latest.state not in terminal_states:
+        reasons.add("attempt_not_terminal")
+    # Scheduler polling can miss allocation changes between observations. Even
+    # a closed interval is therefore evidence-bounded, never inferred complete.
+    if intervals:
+        reasons.add("poll_sampled")
+
+    return AllocationTimeline(
+        source_identity=identity,
+        job_id=latest.job_id,
+        latest_state=latest.state,
+        latest_observed_at=_aware(latest.observed_at),
+        coverage_status="observed" if intervals else "unknown",
+        coverage_reasons=tuple(sorted(reasons)),
+        intervals=tuple(intervals),
+    )
 
 
 class SchedulerPoller:
