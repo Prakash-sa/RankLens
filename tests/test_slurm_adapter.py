@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from subprocess import CompletedProcess
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from ranklens_enterprise.scheduler import ExecutionState
-from ranklens_enterprise.slurm import SlurmAdapterError, parse_sacct_json
+from ranklens_enterprise.slurm import SlurmAccountingAdapter, SlurmAdapterError, parse_sacct_json
 
 
 class SlurmAdapterTests(unittest.TestCase):
@@ -72,6 +74,33 @@ class SlurmAdapterTests(unittest.TestCase):
     def test_rejects_unstructured_sacct_output(self) -> None:
         with self.assertRaisesRegex(SlurmAdapterError, "jobs list"):
             parse_sacct_json({}, cluster_id="cluster-a")
+
+    @patch("ranklens_enterprise.slurm.subprocess.run")
+    def test_bounded_query_passes_utc_start_time_without_a_shell(self, run) -> None:
+        run.return_value = CompletedProcess([], 0, '{"jobs": []}', "")
+        adapter = SlurmAccountingAdapter("cluster-a", sacct="/opt/slurm/bin/sacct")
+
+        result = adapter.fetch_attempts(
+            ("41", "44"),
+            since=datetime(2026, 9, 18, 8, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result, [])
+        run.assert_called_once_with(
+            [
+                "/opt/slurm/bin/sacct",
+                "--json",
+                "--duplicates",
+                "--jobs",
+                "41,44",
+                "--starttime",
+                "2026-09-18T08:30:00",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
 
 
 if __name__ == "__main__":

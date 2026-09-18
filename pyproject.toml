@@ -24,6 +24,7 @@ dependencies = []
 [project.scripts]
 ranklens = "ranklens.cli:main"
 ranklens-enterprise-api = "ranklens_enterprise.api:main"
+ranklens-enterprise-scheduler = "ranklens_enterprise.scheduler_service:main"
 ranklens-enterprise-worker = "ranklens_enterprise.worker:main"
 
 [project.optional-dependencies]

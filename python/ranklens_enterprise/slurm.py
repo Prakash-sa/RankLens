@@ -171,12 +171,22 @@ class SlurmAccountingAdapter:
         self.sacct = sacct
         self.timeout_seconds = timeout_seconds
 
-    def fetch_attempts(self, job_ids: Sequence[str] = ()) -> Sequence[SchedulerAttempt]:
+    def fetch_attempts(
+        self,
+        job_ids: Sequence[str] = (),
+        *,
+        since: Optional[datetime] = None,
+    ) -> Sequence[SchedulerAttempt]:
         command = [self.sacct, "--json", "--duplicates"]
         if job_ids:
             if len(job_ids) > 1000 or not all(item and "," not in item for item in job_ids):
                 raise ValueError("job_ids must contain at most 1000 nonempty identifiers")
             command.extend(("--jobs", ",".join(job_ids)))
+        if since is not None:
+            if not isinstance(since, datetime):
+                raise TypeError("since must be a datetime")
+            normalized = since.replace(tzinfo=since.tzinfo or timezone.utc).astimezone(timezone.utc)
+            command.extend(("--starttime", normalized.strftime("%Y-%m-%dT%H:%M:%S")))
         try:
             completed = subprocess.run(
                 command,
