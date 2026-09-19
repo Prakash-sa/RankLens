@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy import text
@@ -21,10 +21,20 @@ from .contracts import (
     DurableReceipt,
     HealthStatus,
     ReceiptView,
+    ReportRevisionView,
     SchedulerObservationView,
     SegmentUpload,
 )
-from .database import SchedulerObservation, assert_schema_ready, build_engine, build_session_factory, initialize_schema
+from .database import (
+    AttemptGeneration,
+    ReportHead,
+    ReportRevision,
+    SchedulerObservation,
+    assert_schema_ready,
+    build_engine,
+    build_session_factory,
+    initialize_schema,
+)
 from .ingestion import AdmissionError, IngestionService
 from .scheduler import derive_allocation_timeline
 from .settings import MachinePrincipal, Settings
@@ -213,6 +223,57 @@ def create_app(settings: Settings) -> FastAPI:
                 coverage_status=timeline.coverage_status,
                 coverage_reasons=sorted(coverage_reasons),
                 intervals=[asdict(interval) for interval in timeline.intervals],
+            )
+
+    @app.get("/v1/reports/{attempt_id}", response_model=ReportRevisionView)
+    def report_revision(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> ReportRevisionView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        identity = (principal.tenant_id, cluster_id, attempt_id)
+        with sessions() as session:
+            generation = session.get(AttemptGeneration, identity)
+            head = session.get(ReportHead, identity)
+            if (
+                generation is None
+                or generation.deleted_at is not None
+                or head is None
+                or head.deletion_generation != generation.generation
+            ):
+                raise HTTPException(status_code=404, detail={"code": "report_not_found"})
+            statement = select(ReportRevision).where(
+                ReportRevision.tenant_id == principal.tenant_id,
+                ReportRevision.cluster_id == cluster_id,
+                ReportRevision.attempt_id == attempt_id,
+                ReportRevision.deletion_generation == generation.generation,
+            )
+            if revision_number is None:
+                statement = statement.where(ReportRevision.revision_id == head.revision_id)
+            else:
+                statement = statement.where(ReportRevision.revision_number == revision_number)
+            revision = session.scalar(statement)
+            if revision is None:
+                raise HTTPException(status_code=404, detail={"code": "report_not_found"})
+            return ReportRevisionView(
+                revision_id=revision.revision_id,
+                tenant_id=revision.tenant_id,
+                cluster_id=revision.cluster_id,
+                attempt_id=revision.attempt_id,
+                deletion_generation=revision.deletion_generation,
+                revision_number=revision.revision_number,
+                input_fingerprint=revision.input_fingerprint,
+                segment_count=revision.segment_count,
+                record_count=revision.record_count,
+                report_sha256=revision.report_sha256,
+                builder_version=revision.builder_version,
+                created_at=revision.created_at,
+                current=revision.revision_id == head.revision_id,
             )
 
     return app

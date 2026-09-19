@@ -11,6 +11,9 @@ from fastapi.testclient import TestClient
 
 from ranklens_enterprise.api import create_app
 from ranklens_enterprise.database import (
+    AttemptGeneration,
+    ReportHead,
+    ReportRevision,
     SchedulerObservation,
     assert_schema_ready,
     build_engine,
@@ -179,6 +182,88 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(allocation.json()["coverage_status"], "observed")
         self.assertEqual(allocation.json()["intervals"][0]["allocated_nodes"], 2)
         self.assertIn("attempt_not_terminal", allocation.json()["coverage_reasons"])
+
+    def test_report_metadata_is_current_generation_and_cluster_scoped(self) -> None:
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        now = datetime(2026, 9, 19, 12, 0, tzinfo=timezone.utc)
+        with sessions.begin() as session:
+            session.add(
+                AttemptGeneration(
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-report",
+                    generation=0,
+                    deleted_at=None,
+                )
+            )
+            session.add(
+                ReportRevision(
+                    revision_id="revision-1",
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-report",
+                    deletion_generation=0,
+                    revision_number=1,
+                    input_fingerprint="1" * 64,
+                    segment_count=2,
+                    record_count=8,
+                    report_object_key="internal/object.json",
+                    report_sha256="2" * 64,
+                    builder_version="attempt-manifest-v1",
+                    created_at=now,
+                )
+            )
+            session.add(
+                ReportHead(
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-report",
+                    deletion_generation=0,
+                    revision_number=1,
+                    revision_id="revision-1",
+                    input_fingerprint="1" * 64,
+                    updated_at=now,
+                )
+            )
+        engine.dispose()
+        headers = {"authorization": f"Bearer {self.token}"}
+
+        allowed = self.client.get(
+            "/v1/reports/attempt-report",
+            params={"cluster_id": "cluster-a"},
+            headers=headers,
+        )
+        denied = self.client.get(
+            "/v1/reports/attempt-report",
+            params={"cluster_id": "cluster-b"},
+            headers=headers,
+        )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.json()["revision_number"], 1)
+        self.assertEqual(allowed.json()["record_count"], 8)
+        self.assertTrue(allowed.json()["current"])
+        self.assertFalse(allowed.json()["download_available"])
+        self.assertNotIn("report_object_key", allowed.json())
+        self.assertEqual(denied.status_code, 404)
+
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions.begin() as session:
+            generation = session.get(
+                AttemptGeneration, ("tenant-a", "cluster-a", "attempt-report")
+            )
+            assert generation is not None
+            generation.generation = 1
+            generation.deleted_at = now
+        engine.dispose()
+        deleted = self.client.get(
+            "/v1/reports/attempt-report",
+            params={"cluster_id": "cluster-a"},
+            headers=headers,
+        )
+        self.assertEqual(deleted.status_code, 404)
 
 
 if __name__ == "__main__":

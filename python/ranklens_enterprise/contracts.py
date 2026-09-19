@@ -119,6 +119,25 @@ class AllocationTimelineView(BaseModel):
     intervals: List[AllocationIntervalView]
 
 
+class ReportRevisionView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision_id: str
+    tenant_id: str
+    cluster_id: str
+    attempt_id: str
+    deletion_generation: int
+    revision_number: int
+    input_fingerprint: str
+    segment_count: int
+    record_count: int
+    report_sha256: str
+    builder_version: str
+    created_at: datetime
+    current: bool
+    download_available: Literal[False] = False
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"] = "ok"
     service: Literal["ranklens-enterprise-api"] = "ranklens-enterprise-api"
