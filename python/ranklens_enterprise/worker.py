@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import time
@@ -17,7 +18,10 @@ from .database import (
     AttemptGeneration,
     NormalizedSegment,
     OutboxRecord,
+    ReportHead,
+    ReportRevision,
     SegmentManifest,
+    lock_stream,
     utc_now,
 )
 from .storage import ImmutableObjectStore, ObjectIntegrityError
@@ -54,6 +58,7 @@ class OutboxWorker:
             query = (
                 select(OutboxRecord)
                 .where(
+                    OutboxRecord.event_type == "segment.admitted",
                     (OutboxRecord.state == "pending")
                     | (
                         (OutboxRecord.state == "processing")
@@ -153,6 +158,30 @@ class OutboxWorker:
                             normalized_at=utc_now(),
                         )
                     )
+                    session.add(
+                        OutboxRecord(
+                            outbox_id=str(uuid.uuid4()),
+                            tenant_id=publication["tenant_id"],
+                            event_type="attempt.report.requested",
+                            aggregate_id=publication["attempt_id"],
+                            payload_json=json.dumps(
+                                {
+                                    "cluster_id": publication["cluster_id"],
+                                    "attempt_id": publication["attempt_id"],
+                                    "deletion_generation": publication["deletion_generation"],
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            state="pending",
+                            attempts=0,
+                            lease_owner=None,
+                            lease_generation=0,
+                            lease_expires_at=None,
+                            last_error=None,
+                            created_at=utc_now(),
+                        )
+                    )
                 elif existing.payload_sha256 != publication["payload_sha256"]:
                     raise ValueError("normalized receipt digest conflict")
                 outbox.state = "completed"
@@ -186,6 +215,318 @@ class OutboxWorker:
         return True
 
 
+@dataclass(frozen=True)
+class ReportInput:
+    receipt_id: str
+    payload_sha256: str
+    record_count: int
+    normalizer_version: str
+
+
+class ReportRevisionWorker:
+    """Publishes deterministic attempt manifests and atomically advances their head."""
+
+    BUILDER_VERSION = "attempt-manifest-v1"
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        objects: ImmutableObjectStore,
+        *,
+        owner: Optional[str] = None,
+        lease_seconds: int = 60,
+    ):
+        self._sessions = sessions
+        self._objects = objects
+        self._owner = owner or f"report-worker-{uuid.uuid4()}"
+        self._lease_seconds = lease_seconds
+
+    def claim(self) -> Optional[WorkLease]:
+        now = utc_now()
+        with self._sessions.begin() as session:
+            query = (
+                select(OutboxRecord)
+                .where(
+                    OutboxRecord.event_type == "attempt.report.requested",
+                    (OutboxRecord.state == "pending")
+                    | (
+                        (OutboxRecord.state == "processing")
+                        & (OutboxRecord.lease_expires_at < now)
+                    ),
+                )
+                .order_by(OutboxRecord.created_at, OutboxRecord.outbox_id)
+                .limit(1)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            record = session.scalar(query)
+            if record is None:
+                return None
+            record.state = "processing"
+            record.lease_owner = self._owner
+            record.lease_generation += 1
+            record.lease_expires_at = now + timedelta(seconds=self._lease_seconds)
+            record.attempts += 1
+            record.last_error = None
+            return WorkLease(record.outbox_id, record.lease_generation, self._owner)
+
+    @staticmethod
+    def _request(record: OutboxRecord) -> tuple[str, str, str, int]:
+        payload = json.loads(record.payload_json)
+        if not isinstance(payload, dict) or set(payload) != {
+            "cluster_id", "attempt_id", "deletion_generation"
+        }:
+            raise ValueError("report request payload is invalid")
+        cluster_id = payload["cluster_id"]
+        attempt_id = payload["attempt_id"]
+        generation = payload["deletion_generation"]
+        if not isinstance(cluster_id, str) or not cluster_id:
+            raise ValueError("report request cluster_id is invalid")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("report request attempt_id is invalid")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("report request deletion_generation is invalid")
+        return record.tenant_id, cluster_id, attempt_id, generation
+
+    @staticmethod
+    def _inputs(
+        session: Session,
+        tenant_id: str,
+        cluster_id: str,
+        attempt_id: str,
+        generation: int,
+    ) -> list[ReportInput]:
+        statement = (
+            select(NormalizedSegment, SegmentManifest)
+            .join(SegmentManifest, SegmentManifest.receipt_id == NormalizedSegment.receipt_id)
+            .where(
+                SegmentManifest.tenant_id == tenant_id,
+                SegmentManifest.cluster_id == cluster_id,
+                SegmentManifest.attempt_id == attempt_id,
+                SegmentManifest.deletion_generation == generation,
+            )
+            .order_by(SegmentManifest.receipt_id)
+        )
+        return [
+            ReportInput(
+                receipt_id=manifest.receipt_id,
+                payload_sha256=manifest.payload_sha256,
+                record_count=normalized.record_count,
+                normalizer_version=normalized.normalizer_version,
+            )
+            for normalized, manifest in session.execute(statement).all()
+        ]
+
+    @staticmethod
+    def _input_fingerprint(inputs: list[ReportInput]) -> str:
+        encoded = json.dumps(
+            [
+                {
+                    "normalizer_version": item.normalizer_version,
+                    "payload_sha256": item.payload_sha256,
+                    "receipt_id": item.receipt_id,
+                    "record_count": item.record_count,
+                }
+                for item in inputs
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _report_payload(
+        cls,
+        tenant_id: str,
+        cluster_id: str,
+        attempt_id: str,
+        generation: int,
+        fingerprint: str,
+        inputs: list[ReportInput],
+    ) -> bytes:
+        value = {
+            "attempt_id": attempt_id,
+            "builder_version": cls.BUILDER_VERSION,
+            "cluster_id": cluster_id,
+            "deletion_generation": generation,
+            "input_fingerprint": fingerprint,
+            "record_count": sum(item.record_count for item in inputs),
+            "schema_major": 1,
+            "segment_count": len(inputs),
+            "segments": [
+                {
+                    "normalizer_version": item.normalizer_version,
+                    "payload_sha256": item.payload_sha256,
+                    "receipt_id": item.receipt_id,
+                    "record_count": item.record_count,
+                }
+                for item in inputs
+            ],
+            "tenant_id": tenant_id,
+            "type": "ranklens-attempt-manifest",
+        }
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+    @staticmethod
+    def _object_key(tenant_id: str, cluster_id: str, attempt_id: str, digest: str) -> str:
+        scope = "/".join(
+            hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            for value in (tenant_id, cluster_id, attempt_id)
+        )
+        return f"reports/v1/{scope}/{digest}.json"
+
+    def execute(self, lease: WorkLease) -> bool:
+        try:
+            with self._sessions() as session:
+                record = session.get(OutboxRecord, lease.outbox_id)
+                if (
+                    record is None
+                    or record.state != "processing"
+                    or record.lease_owner != lease.owner
+                    or record.lease_generation != lease.generation
+                ):
+                    return False
+                tenant_id, cluster_id, attempt_id, generation = self._request(record)
+                inputs = self._inputs(session, tenant_id, cluster_id, attempt_id, generation)
+                if not inputs:
+                    raise ValueError("report request has no normalized inputs")
+
+            fingerprint = self._input_fingerprint(inputs)
+            payload = self._report_payload(
+                tenant_id, cluster_id, attempt_id, generation, fingerprint, inputs
+            )
+            report_digest = hashlib.sha256(payload).hexdigest()
+            object_key = self._object_key(tenant_id, cluster_id, attempt_id, report_digest)
+            self._objects.put_verified(object_key, payload, report_digest)
+
+            with self._sessions.begin() as session:
+                record = session.get(OutboxRecord, lease.outbox_id)
+                if (
+                    record is None
+                    or record.state != "processing"
+                    or record.lease_owner != lease.owner
+                    or record.lease_generation != lease.generation
+                ):
+                    return False
+                lock_stream(session, f"report:{tenant_id}:{cluster_id}:{attempt_id}")
+                generation_state = session.get(
+                    AttemptGeneration, (tenant_id, cluster_id, attempt_id)
+                )
+                if (
+                    generation_state is None
+                    or generation_state.deleted_at is not None
+                    or generation_state.generation != generation
+                ):
+                    record.state = "suppressed"
+                    record.lease_owner = None
+                    record.lease_expires_at = None
+                    record.last_error = "attempt deletion generation changed"
+                    return False
+                current_inputs = self._inputs(
+                    session, tenant_id, cluster_id, attempt_id, generation
+                )
+                if self._input_fingerprint(current_inputs) != fingerprint:
+                    record.state = "pending"
+                    record.lease_owner = None
+                    record.lease_expires_at = None
+                    record.last_error = "normalized inputs changed during report build"
+                    return False
+
+                head_key = (tenant_id, cluster_id, attempt_id)
+                head = session.get(ReportHead, head_key)
+                if (
+                    head is not None
+                    and head.deletion_generation == generation
+                    and head.input_fingerprint == fingerprint
+                ):
+                    record.state = "completed"
+                    record.lease_owner = None
+                    record.lease_expires_at = None
+                    record.last_error = None
+                    return True
+
+                existing = session.scalar(
+                    select(ReportRevision).where(
+                        ReportRevision.tenant_id == tenant_id,
+                        ReportRevision.cluster_id == cluster_id,
+                        ReportRevision.attempt_id == attempt_id,
+                        ReportRevision.deletion_generation == generation,
+                        ReportRevision.input_fingerprint == fingerprint,
+                    )
+                )
+                now = utc_now()
+                if existing is None:
+                    revision_number = (
+                        head.revision_number + 1
+                        if head is not None and head.deletion_generation == generation
+                        else 1
+                    )
+                    existing = ReportRevision(
+                        revision_id=str(uuid.uuid4()),
+                        tenant_id=tenant_id,
+                        cluster_id=cluster_id,
+                        attempt_id=attempt_id,
+                        deletion_generation=generation,
+                        revision_number=revision_number,
+                        input_fingerprint=fingerprint,
+                        segment_count=len(inputs),
+                        record_count=sum(item.record_count for item in inputs),
+                        report_object_key=object_key,
+                        report_sha256=report_digest,
+                        builder_version=self.BUILDER_VERSION,
+                        created_at=now,
+                    )
+                    session.add(existing)
+                    session.flush()
+                if head is None:
+                    head = ReportHead(
+                        tenant_id=tenant_id,
+                        cluster_id=cluster_id,
+                        attempt_id=attempt_id,
+                        deletion_generation=generation,
+                        revision_number=existing.revision_number,
+                        revision_id=existing.revision_id,
+                        input_fingerprint=fingerprint,
+                        updated_at=now,
+                    )
+                    session.add(head)
+                else:
+                    head.deletion_generation = generation
+                    head.revision_number = existing.revision_number
+                    head.revision_id = existing.revision_id
+                    head.input_fingerprint = fingerprint
+                    head.updated_at = now
+                record.state = "completed"
+                record.lease_owner = None
+                record.lease_expires_at = None
+                record.last_error = None
+                return True
+        except (ObjectIntegrityError, json.JSONDecodeError, ValueError) as exc:
+            self.fail(lease, str(exc))
+            return False
+
+    def fail(self, lease: WorkLease, message: str) -> None:
+        with self._sessions.begin() as session:
+            record = session.get(OutboxRecord, lease.outbox_id)
+            if (
+                record is None
+                or record.lease_owner != lease.owner
+                or record.lease_generation != lease.generation
+            ):
+                return
+            record.state = "failed" if record.attempts >= 5 else "pending"
+            record.lease_owner = None
+            record.lease_expires_at = None
+            record.last_error = message[:512]
+
+    def run_once(self) -> bool:
+        lease = self.claim()
+        if lease is None:
+            return False
+        self.execute(lease)
+        return True
+
+
 def main() -> int:
     from .database import assert_schema_ready, build_engine, build_session_factory, initialize_schema
     from .settings import Settings
@@ -197,7 +538,10 @@ def main() -> int:
         initialize_schema(engine)
     else:
         assert_schema_ready(engine)
-    worker = OutboxWorker(build_session_factory(engine), LocalObjectStore(settings.object_root))
+    sessions = build_session_factory(engine)
+    objects = LocalObjectStore(settings.object_root)
+    worker = OutboxWorker(sessions, objects)
+    report_worker = ReportRevisionWorker(sessions, objects)
     stopping = False
 
     def stop(*_: object) -> None:
@@ -208,7 +552,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     try:
         while not stopping:
-            if not worker.run_once():
+            worked = worker.run_once()
+            worked = report_worker.run_once() or worked
+            if not worked:
                 time.sleep(0.5)
     finally:
         engine.dispose()

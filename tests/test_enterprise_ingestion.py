@@ -12,6 +12,8 @@ from ranklens_enterprise.contracts import SegmentUpload
 from ranklens_enterprise.database import (
     NormalizedSegment,
     OutboxRecord,
+    ReportHead,
+    ReportRevision,
     SegmentManifest,
     build_engine,
     build_session_factory,
@@ -20,7 +22,7 @@ from ranklens_enterprise.database import (
 from ranklens_enterprise.ingestion import AdmissionConflict, AdmissionError, IngestionService
 from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
-from ranklens_enterprise.worker import OutboxWorker
+from ranklens_enterprise.worker import OutboxWorker, ReportRevisionWorker
 
 
 class EnterpriseIngestionTests(unittest.TestCase):
@@ -181,6 +183,65 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(session.scalar(select(func.count()).select_from(NormalizedSegment)), 0)
             outbox = session.scalar(select(OutboxRecord))
             self.assertEqual(outbox.state, "suppressed")
+
+    def test_late_normalized_evidence_publishes_a_new_immutable_report_revision(self) -> None:
+        first_receipt = self.service.admit(self.principal, self.segment())
+        normalizer = OutboxWorker(self.sessions, self.objects, owner="normalizer-a")
+        reports = ReportRevisionWorker(self.sessions, self.objects, owner="reporter-a")
+
+        self.assertTrue(normalizer.run_once())
+        first_report_lease = reports.claim()
+        assert first_report_lease is not None
+        self.assertTrue(reports.execute(first_report_lease))
+
+        second_segment = self.segment(
+            b'{"record":"two"}\n', first=1, last=1, record_count=1
+        )
+        second_receipt = self.service.admit(self.principal, second_segment)
+        self.assertTrue(normalizer.run_once())
+        second_report_lease = reports.claim()
+        assert second_report_lease is not None
+        self.assertTrue(reports.execute(second_report_lease))
+
+        with self.sessions() as session:
+            revisions = list(
+                session.scalars(select(ReportRevision).order_by(ReportRevision.revision_number))
+            )
+            head = session.get(ReportHead, ("tenant-a", "cluster-a", "attempt-1"))
+        self.assertEqual([item.revision_number for item in revisions], [1, 2])
+        self.assertEqual([item.segment_count for item in revisions], [1, 2])
+        self.assertEqual([item.record_count for item in revisions], [1, 2])
+        self.assertIsNotNone(head)
+        assert head is not None
+        self.assertEqual(head.revision_id, revisions[1].revision_id)
+        self.assertTrue(
+            self.objects.exists_verified(
+                revisions[0].report_object_key, revisions[0].report_sha256
+            )
+        )
+        report = self.objects.read_verified(
+            revisions[1].report_object_key, revisions[1].report_sha256
+        )
+        self.assertIn(first_receipt.receipt_id.encode("ascii"), report)
+        self.assertIn(second_receipt.receipt_id.encode("ascii"), report)
+
+    def test_attempt_deletion_suppresses_report_head_publication(self) -> None:
+        self.service.admit(self.principal, self.segment())
+        normalizer = OutboxWorker(self.sessions, self.objects, owner="normalizer-a")
+        reports = ReportRevisionWorker(self.sessions, self.objects, owner="reporter-a")
+        self.assertTrue(normalizer.run_once())
+        lease = reports.claim()
+        assert lease is not None
+
+        self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+
+        self.assertFalse(reports.execute(lease))
+        with self.sessions() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(ReportRevision)), 0)
+            self.assertEqual(session.scalar(select(func.count()).select_from(ReportHead)), 0)
+            report_outbox = session.get(OutboxRecord, lease.outbox_id)
+            assert report_outbox is not None
+            self.assertEqual(report_outbox.state, "suppressed")
 
 
 if __name__ == "__main__":
