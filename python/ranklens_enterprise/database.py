@@ -118,6 +118,51 @@ class NormalizedSegment(Base):
     normalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ReportRevision(Base):
+    __tablename__ = "report_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "cluster_id", "attempt_id", "deletion_generation", "revision_number",
+            name="uq_report_revision_number",
+        ),
+        UniqueConstraint(
+            "tenant_id", "cluster_id", "attempt_id", "deletion_generation", "input_fingerprint",
+            name="uq_report_revision_input",
+        ),
+        Index(
+            "ix_report_revision_attempt",
+            "tenant_id", "cluster_id", "attempt_id", "deletion_generation", "revision_number",
+        ),
+    )
+
+    revision_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    deletion_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    segment_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    record_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    report_object_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    report_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    builder_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ReportHead(Base):
+    __tablename__ = "report_heads"
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    deletion_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    revision_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SchedulerObservation(Base):
     __tablename__ = "scheduler_observations"
     __table_args__ = (
