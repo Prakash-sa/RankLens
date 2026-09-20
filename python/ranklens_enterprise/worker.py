@@ -24,6 +24,7 @@ from .database import (
     lock_stream,
     utc_now,
 )
+from .parquet import ParquetSegment, build_normalized_parquet
 from .storage import ImmutableObjectStore, ObjectIntegrityError
 
 
@@ -219,6 +220,7 @@ class OutboxWorker:
 class ReportInput:
     receipt_id: str
     payload_sha256: str
+    object_key: str
     record_count: int
     normalizer_version: str
 
@@ -235,11 +237,17 @@ class ReportRevisionWorker:
         *,
         owner: Optional[str] = None,
         lease_seconds: int = 60,
+        max_segments: int = 10_000,
+        max_records: int = 10_000_000,
+        max_input_bytes: int = 64 * 1024 * 1024,
     ):
         self._sessions = sessions
         self._objects = objects
         self._owner = owner or f"report-worker-{uuid.uuid4()}"
         self._lease_seconds = lease_seconds
+        self._max_segments = max_segments
+        self._max_records = max_records
+        self._max_input_bytes = max_input_bytes
 
     def claim(self) -> Optional[WorkLease]:
         now = utc_now()
@@ -305,12 +313,19 @@ class ReportRevisionWorker:
                 SegmentManifest.attempt_id == attempt_id,
                 SegmentManifest.deletion_generation == generation,
             )
-            .order_by(SegmentManifest.receipt_id)
+            .order_by(
+                SegmentManifest.producer_id,
+                SegmentManifest.transport_epoch,
+                SegmentManifest.stream_id,
+                SegmentManifest.first_sequence,
+                SegmentManifest.receipt_id,
+            )
         )
         return [
             ReportInput(
                 receipt_id=manifest.receipt_id,
                 payload_sha256=manifest.payload_sha256,
+                object_key=manifest.object_key,
                 record_count=normalized.record_count,
                 normalizer_version=normalized.normalizer_version,
             )
@@ -343,6 +358,9 @@ class ReportRevisionWorker:
         generation: int,
         fingerprint: str,
         inputs: list[ReportInput],
+        parquet_sha256: str,
+        parquet_schema_version: str,
+        parquet_row_count: int,
     ) -> bytes:
         value = {
             "attempt_id": attempt_id,
@@ -350,6 +368,11 @@ class ReportRevisionWorker:
             "cluster_id": cluster_id,
             "deletion_generation": generation,
             "input_fingerprint": fingerprint,
+            "parquet": {
+                "row_count": parquet_row_count,
+                "schema_version": parquet_schema_version,
+                "sha256": parquet_sha256,
+            },
             "record_count": sum(item.record_count for item in inputs),
             "schema_major": 1,
             "segment_count": len(inputs),
@@ -368,12 +391,18 @@ class ReportRevisionWorker:
         return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
     @staticmethod
-    def _object_key(tenant_id: str, cluster_id: str, attempt_id: str, digest: str) -> str:
+    def _object_key(
+        tenant_id: str,
+        cluster_id: str,
+        attempt_id: str,
+        digest: str,
+        suffix: str,
+    ) -> str:
         scope = "/".join(
             hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
             for value in (tenant_id, cluster_id, attempt_id)
         )
-        return f"reports/v1/{scope}/{digest}.json"
+        return f"reports/v1/{scope}/{digest}.{suffix}"
 
     def execute(self, lease: WorkLease) -> bool:
         try:
@@ -392,11 +421,52 @@ class ReportRevisionWorker:
                     raise ValueError("report request has no normalized inputs")
 
             fingerprint = self._input_fingerprint(inputs)
+            parquet_segments = []
+            total_input_bytes = 0
+            for item in inputs:
+                segment_payload = self._objects.read_verified(
+                    item.object_key, item.payload_sha256
+                )
+                total_input_bytes += len(segment_payload)
+                if total_input_bytes > self._max_input_bytes:
+                    raise ValueError("Parquet input byte limit exceeded")
+                parquet_segments.append(
+                    ParquetSegment(
+                        receipt_id=item.receipt_id,
+                        payload_sha256=item.payload_sha256,
+                        expected_records=item.record_count,
+                        payload=segment_payload,
+                    )
+                )
+            parquet = build_normalized_parquet(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                attempt_id=attempt_id,
+                segments=parquet_segments,
+                max_segments=self._max_segments,
+                max_records=self._max_records,
+                max_input_bytes=self._max_input_bytes,
+            )
+            parquet_digest = hashlib.sha256(parquet.payload).hexdigest()
+            parquet_key = self._object_key(
+                tenant_id, cluster_id, attempt_id, parquet_digest, "parquet"
+            )
+            self._objects.put_verified(parquet_key, parquet.payload, parquet_digest)
             payload = self._report_payload(
-                tenant_id, cluster_id, attempt_id, generation, fingerprint, inputs
+                tenant_id,
+                cluster_id,
+                attempt_id,
+                generation,
+                fingerprint,
+                inputs,
+                parquet_digest,
+                parquet.schema_version,
+                parquet.row_count,
             )
             report_digest = hashlib.sha256(payload).hexdigest()
-            object_key = self._object_key(tenant_id, cluster_id, attempt_id, report_digest)
+            object_key = self._object_key(
+                tenant_id, cluster_id, attempt_id, report_digest, "json"
+            )
             self._objects.put_verified(object_key, payload, report_digest)
 
             with self._sessions.begin() as session:
@@ -473,6 +543,10 @@ class ReportRevisionWorker:
                         record_count=sum(item.record_count for item in inputs),
                         report_object_key=object_key,
                         report_sha256=report_digest,
+                        parquet_object_key=parquet_key,
+                        parquet_sha256=parquet_digest,
+                        parquet_schema_version=parquet.schema_version,
+                        parquet_row_count=parquet.row_count,
                         builder_version=self.BUILDER_VERSION,
                         created_at=now,
                     )

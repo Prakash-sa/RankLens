@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
 
+import pyarrow.parquet as pq
 from sqlalchemy import func, select
 
 from ranklens_enterprise.contracts import SegmentUpload
@@ -219,11 +221,25 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 revisions[0].report_object_key, revisions[0].report_sha256
             )
         )
+        self.assertEqual(revisions[1].parquet_schema_version, "normalized-record-v1")
+        self.assertEqual(revisions[1].parquet_row_count, 2)
+        assert revisions[1].parquet_object_key is not None
+        assert revisions[1].parquet_sha256 is not None
+        parquet_payload = self.objects.read_verified(
+            revisions[1].parquet_object_key, revisions[1].parquet_sha256
+        )
+        parquet_table = pq.read_table(io.BytesIO(parquet_payload))
+        self.assertEqual(parquet_table.num_rows, 2)
+        self.assertEqual(
+            parquet_table.column("record_json").to_pylist(),
+            ['{"record":"one"}', '{"record":"two"}'],
+        )
         report = self.objects.read_verified(
             revisions[1].report_object_key, revisions[1].report_sha256
         )
         self.assertIn(first_receipt.receipt_id.encode("ascii"), report)
         self.assertIn(second_receipt.receipt_id.encode("ascii"), report)
+        self.assertIn(revisions[1].parquet_sha256.encode("ascii"), report)
 
     def test_attempt_deletion_suppresses_report_head_publication(self) -> None:
         self.service.admit(self.principal, self.segment())
