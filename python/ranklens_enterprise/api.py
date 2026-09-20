@@ -271,6 +271,14 @@ def create_app(settings: Settings) -> FastAPI:
                 segment_count=revision.segment_count,
                 record_count=revision.record_count,
                 report_sha256=revision.report_sha256,
+                parquet_sha256=revision.parquet_sha256,
+                parquet_schema_version=revision.parquet_schema_version,
+                parquet_row_count=revision.parquet_row_count,
+                parquet_available=bool(
+                    revision.parquet_object_key
+                    and revision.parquet_sha256
+                    and revision.parquet_schema_version
+                ),
                 builder_version=revision.builder_version,
                 created_at=revision.created_at,
                 current=revision.revision_id == head.revision_id,

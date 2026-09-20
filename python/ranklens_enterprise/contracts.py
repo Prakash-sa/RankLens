@@ -132,6 +132,10 @@ class ReportRevisionView(BaseModel):
     segment_count: int
     record_count: int
     report_sha256: str
+    parquet_sha256: Optional[str] = None
+    parquet_schema_version: Optional[str] = None
+    parquet_row_count: Optional[int] = None
+    parquet_available: bool
     builder_version: str
     created_at: datetime
     current: bool

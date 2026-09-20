@@ -210,6 +210,10 @@ class EnterpriseApiTests(unittest.TestCase):
                     record_count=8,
                     report_object_key="internal/object.json",
                     report_sha256="2" * 64,
+                    parquet_object_key="internal/records.parquet",
+                    parquet_sha256="3" * 64,
+                    parquet_schema_version="normalized-record-v1",
+                    parquet_row_count=8,
                     builder_version="attempt-manifest-v1",
                     created_at=now,
                 )
@@ -245,7 +249,11 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(allowed.json()["record_count"], 8)
         self.assertTrue(allowed.json()["current"])
         self.assertFalse(allowed.json()["download_available"])
+        self.assertTrue(allowed.json()["parquet_available"])
+        self.assertEqual(allowed.json()["parquet_schema_version"], "normalized-record-v1")
+        self.assertEqual(allowed.json()["parquet_row_count"], 8)
         self.assertNotIn("report_object_key", allowed.json())
+        self.assertNotIn("parquet_object_key", allowed.json())
         self.assertEqual(denied.status_code, 404)
 
         engine = build_engine(self.database_url)
