@@ -31,6 +31,7 @@ ranklens-enterprise-worker = "ranklens_enterprise.worker:main"
 enterprise = [
   "alembic>=1.16,<2",
   "fastapi>=0.116,<1",
+  "pyarrow>=19,<23",
   "psycopg[binary]>=3.2,<4",
   "pydantic>=2.11,<3",
   "sqlalchemy>=2.0,<3",

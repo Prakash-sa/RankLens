@@ -146,6 +146,10 @@ class ReportRevision(Base):
     record_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     report_object_key: Mapped[str] = mapped_column(String(512), nullable=False)
     report_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    parquet_object_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    parquet_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parquet_schema_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    parquet_row_count: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     builder_version: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
