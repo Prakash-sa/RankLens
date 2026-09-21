@@ -211,16 +211,27 @@ class IngestionService:
                 )
             )
             if reservation is not None:
-                if reservation.payload_sha256 != segment.payload_sha256:
-                    raise AdmissionConflict("reservation_digest_conflict", "active range has different content")
                 if reservation.state == "committed":
                     raise AdmissionConflict(
                         "catalog_inconsistent",
                         "committed reservation is missing its manifest",
                         retriable=True,
                     )
-                reservation_id = reservation.reservation_id
-            else:
+                if reservation.state == "reserved":
+                    if reservation.payload_sha256 != segment.payload_sha256:
+                        raise AdmissionConflict(
+                            "reservation_digest_conflict",
+                            "active range has different content",
+                        )
+                    reservation_id = reservation.reservation_id
+                else:
+                    # Terminal reservations never own the range. Removing the
+                    # old row gives a retry a new identity, fencing any delayed
+                    # writer that still holds the former reservation id.
+                    session.delete(reservation)
+                    session.flush()
+                    reservation = None
+            if reservation is None:
                 reservation_id = str(uuid.uuid4())
                 session.add(
                     AdmissionReservation(

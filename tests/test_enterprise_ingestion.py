@@ -5,6 +5,7 @@ import hashlib
 import io
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -12,6 +13,7 @@ from sqlalchemy import func, select
 
 from ranklens_enterprise.contracts import SegmentUpload
 from ranklens_enterprise.database import (
+    AdmissionReservation,
     NormalizedSegment,
     OutboxRecord,
     ReportHead,
@@ -89,6 +91,39 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.service.admit(self.principal, self.segment(b'{"record":"changed"}\n'))
 
         self.assertEqual(raised.exception.code, "range_digest_conflict")
+
+    def test_retry_replaces_terminal_reservation_with_a_new_fenced_identity(self) -> None:
+        segment = self.segment()
+        old_id = "00000000-0000-0000-0000-000000000001"
+        with self.sessions.begin() as session:
+            session.add(
+                AdmissionReservation(
+                    reservation_id=old_id,
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-1",
+                    producer_id="node-agent-1",
+                    transport_epoch="epoch-1",
+                    stream_id="rank-summary",
+                    first_sequence=0,
+                    last_sequence=0,
+                    payload_sha256="f" * 64,
+                    object_key="stale/object.segment",
+                    deletion_generation=0,
+                    state="expired",
+                    created_at=datetime(2026, 9, 20, tzinfo=timezone.utc),
+                )
+            )
+
+        receipt = self.service.admit(self.principal, segment)
+
+        self.assertEqual(receipt.status, "DURABLE")
+        with self.sessions() as session:
+            reservation = session.scalar(select(AdmissionReservation))
+            assert reservation is not None
+            self.assertNotEqual(reservation.reservation_id, old_id)
+            self.assertEqual(reservation.state, "committed")
+            self.assertEqual(reservation.payload_sha256, segment.payload_sha256)
 
     def test_partial_sequence_overlap_is_rejected(self) -> None:
         eleven_records = b"".join(
