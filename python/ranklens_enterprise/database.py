@@ -39,6 +39,7 @@ class AdmissionReservation(Base):
             "ix_reservation_stream_lookup", "tenant_id", "cluster_id", "producer_id",
             "transport_epoch", "stream_id", "first_sequence", "last_sequence",
         ),
+        Index("ix_reservation_expiry", "state", "created_at", "reservation_id"),
     )
 
     reservation_id: Mapped[str] = mapped_column(String(36), primary_key=True)

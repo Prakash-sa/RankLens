@@ -5,7 +5,7 @@ import hashlib
 import io
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -26,7 +26,7 @@ from ranklens_enterprise.database import (
 from ranklens_enterprise.ingestion import AdmissionConflict, AdmissionError, IngestionService
 from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
-from ranklens_enterprise.worker import OutboxWorker, ReportRevisionWorker
+from ranklens_enterprise.worker import OutboxWorker, ReportRevisionWorker, ReservationSweeper
 
 
 class EnterpriseIngestionTests(unittest.TestCase):
@@ -124,6 +124,68 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertNotEqual(reservation.reservation_id, old_id)
             self.assertEqual(reservation.state, "committed")
             self.assertEqual(reservation.payload_sha256, segment.payload_sha256)
+
+    def test_reservation_sweeper_expires_only_abandoned_bounded_rows(self) -> None:
+        now = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
+        common = {
+            "tenant_id": "tenant-a",
+            "cluster_id": "cluster-a",
+            "attempt_id": "attempt-1",
+            "producer_id": "node-agent-1",
+            "transport_epoch": "epoch-1",
+            "stream_id": "rank-summary",
+            "payload_sha256": "a" * 64,
+            "object_key": "pending/object.segment",
+            "deletion_generation": 0,
+        }
+        with self.sessions.begin() as session:
+            session.add_all(
+                [
+                    AdmissionReservation(
+                        reservation_id="00000000-0000-0000-0000-000000000011",
+                        first_sequence=0,
+                        last_sequence=0,
+                        state="reserved",
+                        created_at=now - timedelta(minutes=20),
+                        **common,
+                    ),
+                    AdmissionReservation(
+                        reservation_id="00000000-0000-0000-0000-000000000012",
+                        first_sequence=1,
+                        last_sequence=1,
+                        state="reserved",
+                        created_at=now - timedelta(minutes=5),
+                        **common,
+                    ),
+                    AdmissionReservation(
+                        reservation_id="00000000-0000-0000-0000-000000000013",
+                        first_sequence=2,
+                        last_sequence=2,
+                        state="committed",
+                        created_at=now - timedelta(minutes=20),
+                        **common,
+                    ),
+                ]
+            )
+        sweeper = ReservationSweeper(
+            self.sessions,
+            ttl_seconds=900,
+            batch_size=1,
+            clock=lambda: now,
+        )
+
+        self.assertEqual(sweeper.run_once(), 1)
+        self.assertEqual(sweeper.run_once(), 0)
+
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(AdmissionReservation).order_by(
+                        AdmissionReservation.reservation_id
+                    )
+                )
+            )
+            self.assertEqual([row.state for row in rows], ["expired", "reserved", "committed"])
 
     def test_partial_sequence_overlap_is_rejected(self) -> None:
         eleven_records = b"".join(

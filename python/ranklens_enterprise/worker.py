@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .database import (
+    AdmissionReservation,
     AttemptGeneration,
     NormalizedSegment,
     OutboxRecord,
@@ -33,6 +34,46 @@ class WorkLease:
     outbox_id: str
     generation: int
     owner: str
+
+
+class ReservationSweeper:
+    """Expires abandoned pre-admission reservations in bounded transactions."""
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        *,
+        ttl_seconds: int = 900,
+        batch_size: int = 100,
+        clock=utc_now,
+    ):
+        if ttl_seconds < 60 or ttl_seconds > 86400:
+            raise ValueError("ttl_seconds must be within [60, 86400]")
+        if batch_size < 1 or batch_size > 1000:
+            raise ValueError("batch_size must be within [1, 1000]")
+        self._sessions = sessions
+        self._ttl_seconds = ttl_seconds
+        self._batch_size = batch_size
+        self._clock = clock
+
+    def run_once(self) -> int:
+        cutoff = self._clock() - timedelta(seconds=self._ttl_seconds)
+        with self._sessions.begin() as session:
+            query = (
+                select(AdmissionReservation)
+                .where(
+                    AdmissionReservation.state == "reserved",
+                    AdmissionReservation.created_at < cutoff,
+                )
+                .order_by(AdmissionReservation.created_at, AdmissionReservation.reservation_id)
+                .limit(self._batch_size)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            reservations = list(session.scalars(query))
+            for reservation in reservations:
+                reservation.state = "expired"
+            return len(reservations)
 
 
 class OutboxWorker:
@@ -616,6 +657,10 @@ def main() -> int:
     objects = LocalObjectStore(settings.object_root)
     worker = OutboxWorker(sessions, objects)
     report_worker = ReportRevisionWorker(sessions, objects)
+    reservation_sweeper = ReservationSweeper(
+        sessions, ttl_seconds=settings.reservation_ttl_seconds
+    )
+    next_reservation_sweep = 0.0
     stopping = False
 
     def stop(*_: object) -> None:
@@ -628,6 +673,10 @@ def main() -> int:
         while not stopping:
             worked = worker.run_once()
             worked = report_worker.run_once() or worked
+            monotonic_now = time.monotonic()
+            if monotonic_now >= next_reservation_sweep:
+                worked = reservation_sweeper.run_once() > 0 or worked
+                next_reservation_sweep = monotonic_now + settings.reservation_sweep_seconds
             if not worked:
                 time.sleep(0.5)
     finally:

@@ -21,6 +21,8 @@ class Settings:
     object_root: Path
     machine_tokens: Dict[str, MachinePrincipal]
     max_expanded_segment_bytes: int = 8 * 1024 * 1024
+    reservation_ttl_seconds: int = 900
+    reservation_sweep_seconds: int = 30
     bootstrap_schema: bool = False
 
     @classmethod
@@ -51,10 +53,21 @@ class Settings:
         object_root = os.environ.get("RANKLENS_OBJECT_ROOT")
         if not database_url or not object_root:
             raise RuntimeError("RANKLENS_DATABASE_URL and RANKLENS_OBJECT_ROOT are required")
+        try:
+            reservation_ttl = int(os.environ.get("RANKLENS_RESERVATION_TTL_SECONDS", "900"))
+            reservation_sweep = int(os.environ.get("RANKLENS_RESERVATION_SWEEP_SECONDS", "30"))
+        except ValueError as exc:
+            raise RuntimeError("reservation timing settings must be integers") from exc
+        if reservation_ttl < 60 or reservation_ttl > 86400:
+            raise RuntimeError("RANKLENS_RESERVATION_TTL_SECONDS must be within [60, 86400]")
+        if reservation_sweep < 1 or reservation_sweep > 3600:
+            raise RuntimeError("RANKLENS_RESERVATION_SWEEP_SECONDS must be within [1, 3600]")
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
             machine_tokens=principals,
+            reservation_ttl_seconds=reservation_ttl,
+            reservation_sweep_seconds=reservation_sweep,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},
         )
