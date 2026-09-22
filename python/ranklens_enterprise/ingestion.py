@@ -176,6 +176,7 @@ class IngestionService:
         with self._sessions.begin() as session:
             lock_stream(session, f"attempt:{attempt_identity}")
             lock_stream(session, f"stream:{stream_identity}")
+            lock_stream(session, f"object:{prepared.object_key}")
             generation = self._current_generation(session, principal.tenant_id, segment)
             if generation != segment.deletion_generation:
                 raise AdmissionConflict(
@@ -262,6 +263,7 @@ class IngestionService:
         with self._sessions.begin() as session:
             lock_stream(session, f"attempt:{attempt_identity}")
             lock_stream(session, f"stream:{stream_identity}")
+            lock_stream(session, f"object:{prepared.object_key}")
             generation = self._current_generation(session, principal.tenant_id, segment)
             reservation = session.get(AdmissionReservation, reservation_id)
             if reservation is None or reservation.state != "reserved":

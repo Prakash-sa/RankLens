@@ -23,6 +23,8 @@ class Settings:
     max_expanded_segment_bytes: int = 8 * 1024 * 1024
     reservation_ttl_seconds: int = 900
     reservation_sweep_seconds: int = 30
+    object_gc_grace_seconds: int = 3600
+    object_gc_sweep_seconds: int = 30
     bootstrap_schema: bool = False
 
     @classmethod
@@ -56,18 +58,26 @@ class Settings:
         try:
             reservation_ttl = int(os.environ.get("RANKLENS_RESERVATION_TTL_SECONDS", "900"))
             reservation_sweep = int(os.environ.get("RANKLENS_RESERVATION_SWEEP_SECONDS", "30"))
+            object_gc_grace = int(os.environ.get("RANKLENS_OBJECT_GC_GRACE_SECONDS", "3600"))
+            object_gc_sweep = int(os.environ.get("RANKLENS_OBJECT_GC_SWEEP_SECONDS", "30"))
         except ValueError as exc:
-            raise RuntimeError("reservation timing settings must be integers") from exc
+            raise RuntimeError("lifecycle timing settings must be integers") from exc
         if reservation_ttl < 60 or reservation_ttl > 86400:
             raise RuntimeError("RANKLENS_RESERVATION_TTL_SECONDS must be within [60, 86400]")
         if reservation_sweep < 1 or reservation_sweep > 3600:
             raise RuntimeError("RANKLENS_RESERVATION_SWEEP_SECONDS must be within [1, 3600]")
+        if object_gc_grace < 300 or object_gc_grace > 604800:
+            raise RuntimeError("RANKLENS_OBJECT_GC_GRACE_SECONDS must be within [300, 604800]")
+        if object_gc_sweep < 1 or object_gc_sweep > 3600:
+            raise RuntimeError("RANKLENS_OBJECT_GC_SWEEP_SECONDS must be within [1, 3600]")
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
             machine_tokens=principals,
             reservation_ttl_seconds=reservation_ttl,
             reservation_sweep_seconds=reservation_sweep,
+            object_gc_grace_seconds=object_gc_grace,
+            object_gc_sweep_seconds=object_gc_sweep,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},
         )

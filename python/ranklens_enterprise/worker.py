@@ -18,6 +18,7 @@ from .database import (
     AdmissionReservation,
     AttemptGeneration,
     NormalizedSegment,
+    ObjectGcCandidate,
     OutboxRecord,
     ReportHead,
     ReportRevision,
@@ -45,15 +46,19 @@ class ReservationSweeper:
         *,
         ttl_seconds: int = 900,
         batch_size: int = 100,
+        gc_grace_seconds: int = 3600,
         clock=utc_now,
     ):
         if ttl_seconds < 60 or ttl_seconds > 86400:
             raise ValueError("ttl_seconds must be within [60, 86400]")
         if batch_size < 1 or batch_size > 1000:
             raise ValueError("batch_size must be within [1, 1000]")
+        if gc_grace_seconds < 300 or gc_grace_seconds > 604800:
+            raise ValueError("gc_grace_seconds must be within [300, 604800]")
         self._sessions = sessions
         self._ttl_seconds = ttl_seconds
         self._batch_size = batch_size
+        self._gc_grace_seconds = gc_grace_seconds
         self._clock = clock
 
     def run_once(self) -> int:
@@ -73,7 +78,96 @@ class ReservationSweeper:
             reservations = list(session.scalars(query))
             for reservation in reservations:
                 reservation.state = "expired"
+                existing = session.scalar(
+                    select(ObjectGcCandidate.candidate_id).where(
+                        ObjectGcCandidate.object_key == reservation.object_key
+                    )
+                )
+                if existing is None:
+                    now = self._clock()
+                    session.add(
+                        ObjectGcCandidate(
+                            candidate_id=str(uuid.uuid4()),
+                            object_key=reservation.object_key,
+                            payload_sha256=reservation.payload_sha256,
+                            state="pending",
+                            not_before=now + timedelta(seconds=self._gc_grace_seconds),
+                            attempts=0,
+                            last_error=None,
+                            created_at=now,
+                            completed_at=None,
+                        )
+                    )
             return len(reservations)
+
+
+class ObjectGcWorker:
+    """Reclaims only unreferenced, checksum-verified objects after a grace period."""
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        objects: ImmutableObjectStore,
+        *,
+        clock=utc_now,
+    ):
+        self._sessions = sessions
+        self._objects = objects
+        self._clock = clock
+
+    def run_once(self) -> Optional[str]:
+        now = self._clock()
+        with self._sessions.begin() as session:
+            query = (
+                select(ObjectGcCandidate)
+                .where(
+                    ObjectGcCandidate.state == "pending",
+                    ObjectGcCandidate.not_before <= now,
+                )
+                .order_by(ObjectGcCandidate.not_before, ObjectGcCandidate.candidate_id)
+                .limit(1)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            candidate = session.scalar(query)
+            if candidate is None:
+                return None
+            candidate.attempts += 1
+            lock_stream(session, f"object:{candidate.object_key}")
+            manifest_reference = session.scalar(
+                select(SegmentManifest.receipt_id)
+                .where(SegmentManifest.object_key == candidate.object_key)
+                .limit(1)
+            )
+            reservation_reference = session.scalar(
+                select(AdmissionReservation.reservation_id)
+                .where(
+                    AdmissionReservation.object_key == candidate.object_key,
+                    AdmissionReservation.state.in_(("reserved", "committed")),
+                )
+                .limit(1)
+            )
+            if manifest_reference is not None or reservation_reference is not None:
+                candidate.state = "protected"
+                candidate.completed_at = now
+                candidate.last_error = None
+                return "protected"
+            try:
+                deleted = self._objects.delete_verified(
+                    candidate.object_key, candidate.payload_sha256
+                )
+            except ObjectIntegrityError as exc:
+                candidate.last_error = str(exc)[:512]
+                if candidate.attempts >= 5:
+                    candidate.state = "failed"
+                else:
+                    delay = min(3600, 30 * (2 ** (candidate.attempts - 1)))
+                    candidate.not_before = now + timedelta(seconds=delay)
+                return "failed" if candidate.state == "failed" else "retry"
+            candidate.state = "deleted" if deleted else "missing"
+            candidate.completed_at = now
+            candidate.last_error = None
+            return candidate.state
 
 
 class OutboxWorker:
@@ -658,9 +752,13 @@ def main() -> int:
     worker = OutboxWorker(sessions, objects)
     report_worker = ReportRevisionWorker(sessions, objects)
     reservation_sweeper = ReservationSweeper(
-        sessions, ttl_seconds=settings.reservation_ttl_seconds
+        sessions,
+        ttl_seconds=settings.reservation_ttl_seconds,
+        gc_grace_seconds=settings.object_gc_grace_seconds,
     )
+    object_gc = ObjectGcWorker(sessions, objects)
     next_reservation_sweep = 0.0
+    next_object_gc_sweep = 0.0
     stopping = False
 
     def stop(*_: object) -> None:
@@ -677,6 +775,9 @@ def main() -> int:
             if monotonic_now >= next_reservation_sweep:
                 worked = reservation_sweeper.run_once() > 0 or worked
                 next_reservation_sweep = monotonic_now + settings.reservation_sweep_seconds
+            if monotonic_now >= next_object_gc_sweep:
+                worked = object_gc.run_once() is not None or worked
+                next_object_gc_sweep = monotonic_now + settings.object_gc_sweep_seconds
             if not worked:
                 time.sleep(0.5)
     finally:

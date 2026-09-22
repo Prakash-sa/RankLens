@@ -15,6 +15,7 @@ from ranklens_enterprise.contracts import SegmentUpload
 from ranklens_enterprise.database import (
     AdmissionReservation,
     NormalizedSegment,
+    ObjectGcCandidate,
     OutboxRecord,
     ReportHead,
     ReportRevision,
@@ -26,7 +27,12 @@ from ranklens_enterprise.database import (
 from ranklens_enterprise.ingestion import AdmissionConflict, AdmissionError, IngestionService
 from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
-from ranklens_enterprise.worker import OutboxWorker, ReportRevisionWorker, ReservationSweeper
+from ranklens_enterprise.worker import (
+    ObjectGcWorker,
+    OutboxWorker,
+    ReportRevisionWorker,
+    ReservationSweeper,
+)
 
 
 class EnterpriseIngestionTests(unittest.TestCase):
@@ -186,6 +192,111 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 )
             )
             self.assertEqual([row.state for row in rows], ["expired", "reserved", "committed"])
+            candidates = list(session.scalars(select(ObjectGcCandidate)))
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].object_key, "pending/object.segment")
+
+    def test_orphan_gc_deletes_only_after_expiry_and_grace_period(self) -> None:
+        now = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
+        payload = b"orphaned upload"
+        digest = hashlib.sha256(payload).hexdigest()
+        object_key = "v2/orphan.segment"
+        self.objects.put_verified(object_key, payload, digest)
+        with self.sessions.begin() as session:
+            session.add(
+                AdmissionReservation(
+                    reservation_id="00000000-0000-0000-0000-000000000021",
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-1",
+                    producer_id="node-agent-1",
+                    transport_epoch="epoch-1",
+                    stream_id="rank-summary",
+                    first_sequence=0,
+                    last_sequence=0,
+                    payload_sha256=digest,
+                    object_key=object_key,
+                    deletion_generation=0,
+                    state="reserved",
+                    created_at=now - timedelta(minutes=20),
+                )
+            )
+        sweeper = ReservationSweeper(
+            self.sessions, ttl_seconds=900, gc_grace_seconds=300, clock=lambda: now
+        )
+        self.assertEqual(sweeper.run_once(), 1)
+        early_gc = ObjectGcWorker(self.sessions, self.objects, clock=lambda: now)
+        self.assertIsNone(early_gc.run_once())
+
+        gc = ObjectGcWorker(
+            self.sessions,
+            self.objects,
+            clock=lambda: now + timedelta(seconds=301),
+        )
+        self.assertEqual(gc.run_once(), "deleted")
+        self.assertFalse(self.objects.exists_verified(object_key, digest))
+        with self.sessions() as session:
+            candidate = session.scalar(select(ObjectGcCandidate))
+            assert candidate is not None
+            self.assertEqual(candidate.state, "deleted")
+            self.assertIsNotNone(candidate.completed_at)
+
+    def test_orphan_gc_preserves_object_when_delayed_commit_is_visible(self) -> None:
+        now = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
+        payload = b"delayed committed upload"
+        digest = hashlib.sha256(payload).hexdigest()
+        object_key = "v2/delayed.segment"
+        self.objects.put_verified(object_key, payload, digest)
+        with self.sessions.begin() as session:
+            session.add(
+                AdmissionReservation(
+                    reservation_id="00000000-0000-0000-0000-000000000022",
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-1",
+                    producer_id="node-agent-1",
+                    transport_epoch="epoch-1",
+                    stream_id="rank-summary",
+                    first_sequence=0,
+                    last_sequence=0,
+                    payload_sha256=digest,
+                    object_key=object_key,
+                    deletion_generation=0,
+                    state="reserved",
+                    created_at=now - timedelta(minutes=20),
+                )
+            )
+        sweeper = ReservationSweeper(
+            self.sessions, ttl_seconds=900, gc_grace_seconds=300, clock=lambda: now
+        )
+        self.assertEqual(sweeper.run_once(), 1)
+        with self.sessions.begin() as session:
+            session.add(
+                SegmentManifest(
+                    receipt_id="00000000-0000-0000-0000-000000000023",
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-1",
+                    producer_id="node-agent-1",
+                    transport_epoch="epoch-1",
+                    stream_id="rank-summary",
+                    first_sequence=0,
+                    last_sequence=0,
+                    record_count=1,
+                    payload_sha256=digest,
+                    object_key=object_key,
+                    deletion_generation=0,
+                    committed_at=now,
+                )
+            )
+        gc = ObjectGcWorker(
+            self.sessions,
+            self.objects,
+            clock=lambda: now + timedelta(seconds=301),
+        )
+
+        self.assertEqual(gc.run_once(), "protected")
+        self.assertTrue(self.objects.exists_verified(object_key, digest))
 
     def test_partial_sequence_overlap_is_rejected(self) -> None:
         eleven_records = b"".join(
