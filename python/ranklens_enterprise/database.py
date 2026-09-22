@@ -58,6 +58,24 @@ class AdmissionReservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ObjectGcCandidate(Base):
+    __tablename__ = "object_gc_candidates"
+    __table_args__ = (
+        UniqueConstraint("object_key", name="uq_object_gc_candidate_key"),
+        Index("ix_object_gc_due", "state", "not_before", "candidate_id"),
+    )
+
+    candidate_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    object_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    not_before: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SegmentManifest(Base):
     __tablename__ = "segment_manifests"
     __table_args__ = (

@@ -20,6 +20,8 @@ class ImmutableObjectStore(Protocol):
 
     def read_verified(self, object_key: str, sha256: str) -> bytes: ...
 
+    def delete_verified(self, object_key: str, sha256: str) -> bool: ...
+
 
 class LocalObjectStore:
     """Filesystem adapter for development, tests, and disconnected pilots.
@@ -91,3 +93,26 @@ class LocalObjectStore:
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+    def delete_verified(self, object_key: str, sha256: str) -> bool:
+        """Delete only the exact verified object and durably record the directory change."""
+
+        target = self._path(object_key)
+        if not target.exists():
+            return False
+        try:
+            payload = target.read_bytes()
+        except OSError as exc:
+            raise ObjectIntegrityError(f"cannot verify object before deletion: {exc}") from exc
+        if self._digest(payload) != sha256:
+            raise ObjectIntegrityError("object scheduled for deletion failed checksum verification")
+        try:
+            target.unlink()
+            directory_descriptor = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as exc:
+            raise ObjectIntegrityError(f"cannot delete verified object: {exc}") from exc
+        return True
