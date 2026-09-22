@@ -27,6 +27,7 @@ from ranklens_enterprise.database import (
 from ranklens_enterprise.ingestion import AdmissionConflict, AdmissionError, IngestionService
 from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
+from ranklens_enterprise.storage import ObjectIntegrityError
 from ranklens_enterprise.worker import (
     ObjectGcWorker,
     OutboxWorker,
@@ -297,6 +298,42 @@ class EnterpriseIngestionTests(unittest.TestCase):
 
         self.assertEqual(gc.run_once(), "protected")
         self.assertTrue(self.objects.exists_verified(object_key, digest))
+
+    def test_orphan_gc_retries_integrity_failures_then_quarantines_candidate(self) -> None:
+        now = [datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)]
+        with self.sessions.begin() as session:
+            session.add(
+                ObjectGcCandidate(
+                    candidate_id="00000000-0000-0000-0000-000000000031",
+                    object_key="v2/corrupt.segment",
+                    payload_sha256="a" * 64,
+                    state="pending",
+                    not_before=now[0],
+                    attempts=0,
+                    last_error=None,
+                    created_at=now[0],
+                    completed_at=None,
+                )
+            )
+
+        class FailingDeleteStore:
+            def delete_verified(self, object_key: str, sha256: str) -> bool:
+                raise ObjectIntegrityError("provider integrity failure")
+
+        worker = ObjectGcWorker(self.sessions, FailingDeleteStore(), clock=lambda: now[0])
+        for attempt in range(1, 6):
+            self.assertEqual(worker.run_once(), "failed" if attempt == 5 else "retry")
+            now[0] += timedelta(hours=2)
+
+        with self.sessions() as session:
+            candidate = session.get(
+                ObjectGcCandidate, "00000000-0000-0000-0000-000000000031"
+            )
+            assert candidate is not None
+            self.assertEqual(candidate.state, "failed")
+            self.assertEqual(candidate.attempts, 5)
+            self.assertIn("provider integrity failure", candidate.last_error or "")
+            self.assertIsNotNone(candidate.completed_at)
 
     def test_partial_sequence_overlap_is_rejected(self) -> None:
         eleven_records = b"".join(

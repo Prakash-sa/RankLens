@@ -160,6 +160,7 @@ class ObjectGcWorker:
                 candidate.last_error = str(exc)[:512]
                 if candidate.attempts >= 5:
                     candidate.state = "failed"
+                    candidate.completed_at = now
                 else:
                     delay = min(3600, 30 * (2 ** (candidate.attempts - 1)))
                     candidate.not_before = now + timedelta(seconds=delay)
