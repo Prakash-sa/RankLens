@@ -33,6 +33,10 @@ class AttemptRecord(Base):
 
     __tablename__ = "attempt_records"
     __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "cluster_id", "scheduler_source_identity",
+            name="uq_attempt_record_scheduler_identity",
+        ),
         Index(
             "ix_attempt_record_list",
             "tenant_id", "cluster_id", "attempt_id",

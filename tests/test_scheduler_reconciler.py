@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 from sqlalchemy import select
 
 from ranklens_enterprise.database import (
+    AttemptRecord,
     SchedulerObservation,
     SchedulerPollCursor,
     build_engine,
@@ -116,6 +117,77 @@ class SchedulerReconcilerTests(unittest.TestCase):
         rows = self.observations()
         self.assertEqual([row.state for row in rows], ["running", "succeeded"])
         self.assertIsNotNone(rows[1].ended_at)
+
+    def test_reconciler_updates_only_an_explicitly_bound_attempt(self) -> None:
+        observed = datetime(2026, 9, 16, 13, 0, tzinfo=timezone.utc)
+        scheduler_attempt = attempt_at(observed, ExecutionState.SUCCEEDED)
+        with self.sessions.begin() as session:
+            for attempt_id, source_identity in (
+                ("bound-attempt", scheduler_attempt.source_identity),
+                ("unbound-attempt", None),
+            ):
+                session.add(
+                    AttemptRecord(
+                        tenant_id="tenant-a",
+                        cluster_id="cluster-a",
+                        attempt_id=attempt_id,
+                        workflow_execution_id=None,
+                        logical_case_id=None,
+                        scheduler_source_identity=source_identity,
+                        scheduler_state="unknown",
+                        scheduler_observed_at=None,
+                        first_admitted_at=observed,
+                        last_admitted_at=observed,
+                        segment_count=1,
+                        record_count=1,
+                    )
+                )
+
+        reconciler = SchedulerReconciler(
+            self.sessions, StaticSchedulerAdapter([scheduler_attempt]), tenant_id="tenant-a"
+        )
+        reconciler.poll_once()
+
+        with self.sessions() as session:
+            bound = session.get(AttemptRecord, ("tenant-a", "cluster-a", "bound-attempt"))
+            unbound = session.get(AttemptRecord, ("tenant-a", "cluster-a", "unbound-attempt"))
+            assert bound is not None and unbound is not None
+            self.assertEqual(bound.scheduler_state, "succeeded")
+            self.assertEqual(bound.scheduler_observed_at.replace(tzinfo=timezone.utc), observed)
+            self.assertEqual(unbound.scheduler_state, "unknown")
+
+    def test_duplicate_observation_can_reconcile_a_later_binding(self) -> None:
+        observed = datetime(2026, 9, 16, 13, 0, tzinfo=timezone.utc)
+        scheduler_attempt = attempt_at(observed)
+        reconciler = SchedulerReconciler(
+            self.sessions, StaticSchedulerAdapter([scheduler_attempt]), tenant_id="tenant-a"
+        )
+        reconciler.poll_once()
+        with self.sessions.begin() as session:
+            session.add(
+                AttemptRecord(
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="late-binding",
+                    workflow_execution_id=None,
+                    logical_case_id=None,
+                    scheduler_source_identity=scheduler_attempt.source_identity,
+                    scheduler_state="unknown",
+                    scheduler_observed_at=None,
+                    first_admitted_at=observed,
+                    last_admitted_at=observed,
+                    segment_count=1,
+                    record_count=1,
+                )
+            )
+
+        result = reconciler.poll_once()
+
+        self.assertEqual(result.duplicates, 1)
+        with self.sessions() as session:
+            record = session.get(AttemptRecord, ("tenant-a", "cluster-a", "late-binding"))
+            assert record is not None
+            self.assertEqual(record.scheduler_state, "running")
 
     def test_derives_resource_change_intervals_with_explicit_poll_coverage(self) -> None:
         first_seen = datetime(2026, 9, 16, 13, 0, tzinfo=timezone.utc)

@@ -13,7 +13,13 @@ from typing import Any, Callable, Dict, Optional, Protocol, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .database import SchedulerObservation, SchedulerPollCursor, lock_stream, utc_now
+from .database import (
+    AttemptRecord,
+    SchedulerObservation,
+    SchedulerPollCursor,
+    lock_stream,
+    utc_now,
+)
 
 
 class ExecutionState(str, Enum):
@@ -167,9 +173,22 @@ class SchedulerReconciler:
                 ).scalar_one_or_none()
                 if existing is not None:
                     duplicates += 1
-                    continue
-                session.add(_observation_from_attempt(self._tenant_id, attempt, now))
-                inserted += 1
+                else:
+                    session.add(_observation_from_attempt(self._tenant_id, attempt, now))
+                    inserted += 1
+                record = session.scalar(
+                    select(AttemptRecord).where(
+                        AttemptRecord.tenant_id == self._tenant_id,
+                        AttemptRecord.cluster_id == attempt.cluster_id,
+                        AttemptRecord.scheduler_source_identity == attempt.source_identity,
+                    )
+                )
+                if record is not None and (
+                    record.scheduler_observed_at is None
+                    or _aware(attempt.observed_at) >= _aware(record.scheduler_observed_at)
+                ):
+                    record.scheduler_state = attempt.state.value
+                    record.scheduler_observed_at = attempt.observed_at
             session.commit()
         return SchedulerReconcileResult(
             fetched=len(attempts),
