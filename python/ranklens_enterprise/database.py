@@ -28,6 +28,37 @@ class AttemptGeneration(Base):
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AttemptRecord(Base):
+    """Durable telemetry identity with independently reconciled scheduler state."""
+
+    __tablename__ = "attempt_records"
+    __table_args__ = (
+        Index(
+            "ix_attempt_record_list",
+            "tenant_id", "cluster_id", "attempt_id",
+        ),
+        Index(
+            "ix_attempt_record_scheduler",
+            "tenant_id", "cluster_id", "scheduler_source_identity",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    workflow_execution_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    logical_case_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    scheduler_source_identity: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    scheduler_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    scheduler_observed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    segment_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    record_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
 class AdmissionReservation(Base):
     __tablename__ = "admission_reservations"
     __table_args__ = (

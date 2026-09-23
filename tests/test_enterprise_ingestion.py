@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from ranklens_enterprise.contracts import SegmentUpload
 from ranklens_enterprise.database import (
     AdmissionReservation,
+    AttemptRecord,
     NormalizedSegment,
     ObjectGcCandidate,
     OutboxRecord,
@@ -60,10 +61,16 @@ class EnterpriseIngestionTests(unittest.TestCase):
         record_count: int = 1,
         deletion_generation: int = 0,
         attempt_id: str = "attempt-1",
+        workflow_execution_id: str | None = None,
+        logical_case_id: str | None = None,
+        scheduler_source_identity: str | None = None,
     ) -> SegmentUpload:
         return SegmentUpload(
             cluster_id="cluster-a",
             attempt_id=attempt_id,
+            workflow_execution_id=workflow_execution_id,
+            logical_case_id=logical_case_id,
+            scheduler_source_identity=scheduler_source_identity,
             producer_id="node-agent-1",
             transport_epoch="epoch-1",
             stream_id="rank-summary",
@@ -98,6 +105,58 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.service.admit(self.principal, self.segment(b'{"record":"changed"}\n'))
 
         self.assertEqual(raised.exception.code, "range_digest_conflict")
+
+    def test_admission_creates_one_durable_attempt_identity_and_counts_once(self) -> None:
+        identity = "slurm:cluster-a:derived:abc"
+        first = self.segment(
+            workflow_execution_id="workflow-1",
+            logical_case_id="case-1",
+            scheduler_source_identity=identity,
+        )
+        self.service.admit(self.principal, first)
+        self.service.admit(self.principal, first)
+        self.service.admit(
+            self.principal,
+            self.segment(
+                b'{"record":"two"}\n',
+                first=1,
+                last=1,
+                workflow_execution_id="workflow-1",
+                logical_case_id="case-1",
+                scheduler_source_identity=identity,
+            ),
+        )
+
+        with self.sessions() as session:
+            record = session.get(AttemptRecord, ("tenant-a", "cluster-a", "attempt-1"))
+            assert record is not None
+            self.assertEqual(record.workflow_execution_id, "workflow-1")
+            self.assertEqual(record.logical_case_id, "case-1")
+            self.assertEqual(record.scheduler_source_identity, identity)
+            self.assertEqual(record.scheduler_state, "unknown")
+            self.assertEqual(record.segment_count, 2)
+            self.assertEqual(record.record_count, 2)
+
+    def test_admission_rejects_conflicting_attempt_binding(self) -> None:
+        self.service.admit(
+            self.principal,
+            self.segment(scheduler_source_identity="slurm:cluster-a:derived:first"),
+        )
+
+        with self.assertRaises(AdmissionConflict) as raised:
+            self.service.admit(
+                self.principal,
+                self.segment(
+                    b'{"record":"two"}\n',
+                    first=1,
+                    last=1,
+                    scheduler_source_identity="slurm:cluster-a:derived:second",
+                ),
+            )
+
+        self.assertEqual(raised.exception.code, "attempt_identity_conflict")
+        with self.sessions() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(SegmentManifest)), 1)
 
     def test_retry_replaces_terminal_reservation_with_a_new_fenced_identity(self) -> None:
         segment = self.segment()

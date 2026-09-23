@@ -18,6 +18,7 @@ from .contracts import DurableReceipt, ReceiptView, SegmentUpload
 from .database import (
     AdmissionReservation,
     AttemptGeneration,
+    AttemptRecord,
     OutboxRecord,
     SegmentManifest,
     lock_stream,
@@ -165,6 +166,49 @@ class IngestionService:
             payload_sha256=manifest.payload_sha256,
             committed_at=manifest.committed_at,
         )
+
+    @staticmethod
+    def _record_admission(
+        session: Session,
+        tenant_id: str,
+        segment: SegmentUpload,
+        committed_at: datetime,
+    ) -> None:
+        identity = (tenant_id, segment.cluster_id, segment.attempt_id)
+        record = session.get(AttemptRecord, identity)
+        bindings = {
+            "workflow_execution_id": segment.workflow_execution_id,
+            "logical_case_id": segment.logical_case_id,
+            "scheduler_source_identity": segment.scheduler_source_identity,
+        }
+        if record is None:
+            session.add(
+                AttemptRecord(
+                    tenant_id=tenant_id,
+                    cluster_id=segment.cluster_id,
+                    attempt_id=segment.attempt_id,
+                    **bindings,
+                    scheduler_state="unknown",
+                    scheduler_observed_at=None,
+                    first_admitted_at=committed_at,
+                    last_admitted_at=committed_at,
+                    segment_count=1,
+                    record_count=segment.record_count,
+                )
+            )
+            return
+        for field, supplied in bindings.items():
+            existing = getattr(record, field)
+            if supplied is not None and existing is not None and supplied != existing:
+                raise AdmissionConflict(
+                    "attempt_identity_conflict",
+                    f"{field} conflicts with the durable attempt identity",
+                )
+            if existing is None and supplied is not None:
+                setattr(record, field, supplied)
+        record.last_admitted_at = committed_at
+        record.segment_count += 1
+        record.record_count += segment.record_count
 
     def admit(self, principal: MachinePrincipal, segment: SegmentUpload) -> DurableReceipt:
         self._assert_scope(principal, segment)
@@ -314,6 +358,9 @@ class IngestionService:
                 committed_at=committed_at,
             )
             session.add(manifest)
+            self._record_admission(
+                session, principal.tenant_id, segment, committed_at
+            )
             session.add(
                 OutboxRecord(
                     outbox_id=str(uuid.uuid4()),

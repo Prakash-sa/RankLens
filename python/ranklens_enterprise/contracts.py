@@ -23,6 +23,15 @@ class SegmentUpload(BaseModel):
     envelope_major: Literal[2] = 2
     cluster_id: Identifier = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
     attempt_id: Identifier = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    workflow_execution_id: Optional[Identifier] = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+    logical_case_id: Optional[Identifier] = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+    scheduler_source_identity: Optional[Identifier] = Field(
+        default=None, min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_.:=,-]+$"
+    )
     producer_id: Identifier = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
     transport_epoch: Identifier = Field(
         min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
@@ -140,6 +149,32 @@ class ReportRevisionView(BaseModel):
     created_at: datetime
     current: bool
     download_available: Literal[False] = False
+
+
+class AttemptView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    cluster_id: str
+    attempt_id: str
+    workflow_execution_id: Optional[str] = None
+    logical_case_id: Optional[str] = None
+    scheduler_source_identity: Optional[str] = None
+    scheduler_state: str
+    scheduler_observed_at: Optional[datetime] = None
+    telemetry_status: Literal["available", "deleted"]
+    first_admitted_at: datetime
+    last_admitted_at: datetime
+    segment_count: int
+    record_count: int
+    latest_report_revision: Optional[int] = None
+
+
+class AttemptPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: List[AttemptView]
+    next_cursor: Optional[str] = None
 
 
 class HealthStatus(BaseModel):
