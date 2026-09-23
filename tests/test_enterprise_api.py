@@ -112,6 +112,59 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(wrong_type.status_code, 415)
         self.assertEqual(wrong_type.json()["code"], "unsupported_content_type")
 
+    def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
+        headers = {"authorization": f"Bearer {self.token}"}
+        first_body = self.request_body()
+        first_body.update(
+            {
+                "attempt_id": "attempt-a",
+                "workflow_execution_id": "workflow-1",
+                "logical_case_id": "case-a",
+                "scheduler_source_identity": "slurm:cluster-a:derived:a",
+            }
+        )
+        second_body = self.request_body()
+        second_body.update({"attempt_id": "attempt-b", "producer_id": "node-agent-2"})
+        self.assertEqual(
+            self.client.post("/v1/segments", json=first_body, headers=headers).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.client.post("/v1/segments", json=second_body, headers=headers).status_code,
+            201,
+        )
+
+        first_page = self.client.get(
+            "/v1/attempts", params={"cluster_id": "cluster-a", "limit": 1}, headers=headers
+        )
+        self.assertEqual(first_page.status_code, 200)
+        self.assertEqual([item["attempt_id"] for item in first_page.json()["items"]], ["attempt-a"])
+        self.assertEqual(first_page.json()["next_cursor"], "attempt-a")
+        second_page = self.client.get(
+            "/v1/attempts",
+            params={
+                "cluster_id": "cluster-a",
+                "limit": 1,
+                "cursor": first_page.json()["next_cursor"],
+            },
+            headers=headers,
+        )
+        self.assertEqual([item["attempt_id"] for item in second_page.json()["items"]], ["attempt-b"])
+        self.assertIsNone(second_page.json()["next_cursor"])
+
+        detail = self.client.get(
+            "/v1/attempts/attempt-a", params={"cluster_id": "cluster-a"}, headers=headers
+        )
+        denied = self.client.get(
+            "/v1/attempts/attempt-a", params={"cluster_id": "cluster-b"}, headers=headers
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["workflow_execution_id"], "workflow-1")
+        self.assertEqual(detail.json()["scheduler_state"], "unknown")
+        self.assertEqual(detail.json()["telemetry_status"], "available")
+        self.assertEqual(detail.json()["segment_count"], 1)
+        self.assertEqual(denied.status_code, 404)
+
     def test_production_schema_check_requires_migration_marker(self) -> None:
         engine = build_engine("sqlite:///:memory:")
         initialize_schema(engine)

@@ -18,6 +18,8 @@ from ranklens import __version__
 from .auth import MachineAuthenticator
 from .contracts import (
     AllocationTimelineView,
+    AttemptPage,
+    AttemptView,
     DurableReceipt,
     HealthStatus,
     ReceiptView,
@@ -27,6 +29,7 @@ from .contracts import (
 )
 from .database import (
     AttemptGeneration,
+    AttemptRecord,
     ReportHead,
     ReportRevision,
     SchedulerObservation,
@@ -140,6 +143,101 @@ def create_app(settings: Settings) -> FastAPI:
         if result is None or result.cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "receipt_not_found"})
         return result
+
+    def attempt_view(
+        record: AttemptRecord,
+        generation: Optional[AttemptGeneration],
+        head: Optional[ReportHead],
+    ) -> AttemptView:
+        deleted = generation is not None and generation.deleted_at is not None
+        current_revision = None
+        if (
+            not deleted
+            and generation is not None
+            and head is not None
+            and head.deletion_generation == generation.generation
+        ):
+            current_revision = head.revision_number
+        return AttemptView(
+            tenant_id=record.tenant_id,
+            cluster_id=record.cluster_id,
+            attempt_id=record.attempt_id,
+            workflow_execution_id=record.workflow_execution_id,
+            logical_case_id=record.logical_case_id,
+            scheduler_source_identity=record.scheduler_source_identity,
+            scheduler_state=record.scheduler_state,
+            scheduler_observed_at=record.scheduler_observed_at,
+            telemetry_status="deleted" if deleted else "available",
+            first_admitted_at=record.first_admitted_at,
+            last_admitted_at=record.last_admitted_at,
+            segment_count=record.segment_count,
+            record_count=record.record_count,
+            latest_report_revision=current_revision,
+        )
+
+    def attempt_statement(tenant_id: str, cluster_id: str):
+        return (
+            select(AttemptRecord, AttemptGeneration, ReportHead)
+            .outerjoin(
+                AttemptGeneration,
+                (AttemptGeneration.tenant_id == AttemptRecord.tenant_id)
+                & (AttemptGeneration.cluster_id == AttemptRecord.cluster_id)
+                & (AttemptGeneration.attempt_id == AttemptRecord.attempt_id),
+            )
+            .outerjoin(
+                ReportHead,
+                (ReportHead.tenant_id == AttemptRecord.tenant_id)
+                & (ReportHead.cluster_id == AttemptRecord.cluster_id)
+                & (ReportHead.attempt_id == AttemptRecord.attempt_id),
+            )
+            .where(
+                AttemptRecord.tenant_id == tenant_id,
+                AttemptRecord.cluster_id == cluster_id,
+            )
+        )
+
+    @app.get("/v1/attempts", response_model=AttemptPage)
+    def attempts(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        cursor: Optional[str] = Query(
+            default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> AttemptPage:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = attempt_statement(principal.tenant_id, cluster_id)
+        if cursor is not None:
+            statement = statement.where(AttemptRecord.attempt_id > cursor)
+        statement = statement.order_by(AttemptRecord.attempt_id).limit(limit + 1)
+        with sessions() as session:
+            rows = session.execute(statement).all()
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            return AttemptPage(
+                items=[attempt_view(*row) for row in page],
+                next_cursor=page[-1][0].attempt_id if has_more else None,
+            )
+
+    @app.get("/v1/attempts/{attempt_id}", response_model=AttemptView)
+    def attempt(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> AttemptView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = attempt_statement(principal.tenant_id, cluster_id).where(
+            AttemptRecord.attempt_id == attempt_id
+        )
+        with sessions() as session:
+            row = session.execute(statement).one_or_none()
+            if row is None:
+                raise HTTPException(status_code=404, detail={"code": "attempt_not_found"})
+            return attempt_view(*row)
 
     @app.get("/v1/scheduler/observations", response_model=List[SchedulerObservationView])
     def scheduler_observations(
