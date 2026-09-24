@@ -158,13 +158,15 @@ int process_id() {
 #endif
 }
 
-constexpr std::array<const char*, 26> kOperationNames = {
+constexpr std::array<const char*, 32> kOperationNames = {
     "MPI_Send", "MPI_Recv", "MPI_Isend", "MPI_Irecv", "MPI_Wait", "MPI_Test",
     "MPI_Waitall", "MPI_Waitany", "MPI_Waitsome", "MPI_Testall", "MPI_Testany",
     "MPI_Testsome", "MPI_Allreduce", "MPI_Bcast", "MPI_Barrier",
     "MPI_Cancel", "MPI_Request_free", "MPI_Send_init", "MPI_Recv_init",
     "MPI_Bsend_init", "MPI_Ssend_init", "MPI_Rsend_init", "MPI_Start",
-    "MPI_Startall", "MPI_Isend_complete", "MPI_Irecv_complete"};
+    "MPI_Startall", "MPI_Psend_init", "MPI_Precv_init", "MPI_Pready",
+    "MPI_Pready_range", "MPI_Pready_list", "MPI_Parrived",
+    "MPI_Isend_complete", "MPI_Irecv_complete"};
 
 std::size_t operation_index(const char* operation) {
   for (std::size_t index = 0; index < kOperationNames.size(); ++index) {
@@ -841,6 +843,77 @@ int ranklens_MPI_Rsend_init(const void* buffer, int count, MPI_Datatype datatype
   return result;
 }
 
+#if defined(RANKLENS_HAVE_MPI_PARTITIONED)
+int ranklens_MPI_Psend_init(const void* buffer, int partitions, MPI_Count count,
+                            MPI_Datatype datatype, int peer, int tag, MPI_Comm comm,
+                            MPI_Info info, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Psend_init(
+      buffer, partitions, count, datatype, peer, tag, comm, info, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, false, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Psend_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
+int ranklens_MPI_Precv_init(void* buffer, int partitions, MPI_Count count,
+                            MPI_Datatype datatype, int peer, int tag, MPI_Comm comm,
+                            MPI_Info info, MPI_Request* request) {
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Precv_init(
+      buffer, partitions, count, datatype, peer, tag, comm, info, request);
+  const auto end = ranklens::Clock::now();
+  const auto id = result == MPI_SUCCESS
+                      ? ranklens::remember(*request, true, comm, peer, tag, true)
+                      : -1;
+  ranklens::record("MPI_Precv_init", start, end, 0, peer, tag, result, comm, id);
+  return result;
+}
+
+int ranklens_MPI_Pready(int partition, MPI_Request request) {
+  const auto id = ranklens::request_id(ranklens::request_key(request));
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Pready(partition, request);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Pready", start, end, 0, -1, partition, result,
+                   MPI_COMM_WORLD, id);
+  return result;
+}
+
+int ranklens_MPI_Pready_range(int partition_low, int partition_high,
+                              MPI_Request request) {
+  const auto id = ranklens::request_id(ranklens::request_key(request));
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Pready_range(partition_low, partition_high, request);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Pready_range", start, end, 0, partition_low,
+                   partition_high, result, MPI_COMM_WORLD, id);
+  return result;
+}
+
+int ranklens_MPI_Pready_list(int length, int partitions[], MPI_Request request) {
+  const auto id = ranklens::request_id(ranklens::request_key(request));
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Pready_list(length, partitions, request);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Pready_list", start, end, 0, -1, length, result,
+                   MPI_COMM_WORLD, id);
+  return result;
+}
+
+int ranklens_MPI_Parrived(MPI_Request request, int partition, int* flag) {
+  const auto id = ranklens::request_id(ranklens::request_key(request));
+  const auto start = ranklens::Clock::now();
+  const int result = PMPI_Parrived(request, partition, flag);
+  const auto end = ranklens::Clock::now();
+  ranklens::record("MPI_Parrived", start, end, 0, -1, partition, result,
+                   MPI_COMM_WORLD, id);
+  return result;
+}
+#endif
+
 int ranklens_MPI_Start(MPI_Request* request) {
   const auto key = ranklens::request_key(*request);
   const auto start = ranklens::Clock::now();
@@ -1092,6 +1165,14 @@ RANKLENS_INTERPOSE(ranklens_MPI_Recv_init, MPI_Recv_init);
 RANKLENS_INTERPOSE(ranklens_MPI_Bsend_init, MPI_Bsend_init);
 RANKLENS_INTERPOSE(ranklens_MPI_Ssend_init, MPI_Ssend_init);
 RANKLENS_INTERPOSE(ranklens_MPI_Rsend_init, MPI_Rsend_init);
+#if defined(RANKLENS_HAVE_MPI_PARTITIONED)
+RANKLENS_INTERPOSE(ranklens_MPI_Psend_init, MPI_Psend_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Precv_init, MPI_Precv_init);
+RANKLENS_INTERPOSE(ranklens_MPI_Pready, MPI_Pready);
+RANKLENS_INTERPOSE(ranklens_MPI_Pready_range, MPI_Pready_range);
+RANKLENS_INTERPOSE(ranklens_MPI_Pready_list, MPI_Pready_list);
+RANKLENS_INTERPOSE(ranklens_MPI_Parrived, MPI_Parrived);
+#endif
 RANKLENS_INTERPOSE(ranklens_MPI_Start, MPI_Start);
 RANKLENS_INTERPOSE(ranklens_MPI_Startall, MPI_Startall);
 RANKLENS_INTERPOSE(ranklens_MPI_Wait, MPI_Wait);
@@ -1121,6 +1202,14 @@ int MPI_Recv_init(void* buffer, int count, MPI_Datatype datatype, int peer, int 
 int MPI_Bsend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Bsend_init(buffer, count, datatype, peer, tag, comm, request); }
 int MPI_Ssend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Ssend_init(buffer, count, datatype, peer, tag, comm, request); }
 int MPI_Rsend_init(const void* buffer, int count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Request* request) { return ranklens_MPI_Rsend_init(buffer, count, datatype, peer, tag, comm, request); }
+#if defined(RANKLENS_HAVE_MPI_PARTITIONED)
+int MPI_Psend_init(const void* buffer, int partitions, MPI_Count count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Info info, MPI_Request* request) { return ranklens_MPI_Psend_init(buffer, partitions, count, datatype, peer, tag, comm, info, request); }
+int MPI_Precv_init(void* buffer, int partitions, MPI_Count count, MPI_Datatype datatype, int peer, int tag, MPI_Comm comm, MPI_Info info, MPI_Request* request) { return ranklens_MPI_Precv_init(buffer, partitions, count, datatype, peer, tag, comm, info, request); }
+int MPI_Pready(int partition, MPI_Request request) { return ranklens_MPI_Pready(partition, request); }
+int MPI_Pready_range(int partition_low, int partition_high, MPI_Request request) { return ranklens_MPI_Pready_range(partition_low, partition_high, request); }
+int MPI_Pready_list(int length, int partitions[], MPI_Request request) { return ranklens_MPI_Pready_list(length, partitions, request); }
+int MPI_Parrived(MPI_Request request, int partition, int* flag) { return ranklens_MPI_Parrived(request, partition, flag); }
+#endif
 int MPI_Start(MPI_Request* request) { return ranklens_MPI_Start(request); }
 int MPI_Startall(int count, MPI_Request requests[]) { return ranklens_MPI_Startall(count, requests); }
 int MPI_Wait(MPI_Request* request, MPI_Status* status) { return ranklens_MPI_Wait(request, status); }

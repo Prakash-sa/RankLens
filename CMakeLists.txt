@@ -15,6 +15,21 @@ option(RANKLENS_BUILD_TESTS "Build and register RankLens tests" ON)
 
 find_package(MPI REQUIRED COMPONENTS CXX)
 
+include(CheckCXXSourceCompiles)
+set(_ranklens_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+set(CMAKE_REQUIRED_LIBRARIES MPI::MPI_CXX)
+check_cxx_source_compiles(
+  "#include <mpi.h>
+   int main() {
+     MPI_Request request = MPI_REQUEST_NULL;
+     return MPI_Psend_init(nullptr, 1, 0, MPI_BYTE, 0, 0, MPI_COMM_WORLD,
+                           MPI_INFO_NULL, &request);
+   }"
+  RANKLENS_HAVE_MPI_PARTITIONED
+)
+set(CMAKE_REQUIRED_LIBRARIES "${_ranklens_required_libraries}")
+unset(_ranklens_required_libraries)
+
 configure_file(
   include/ranklens/version.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/generated/ranklens/version.h
@@ -72,6 +87,14 @@ if(BUILD_TESTING AND RANKLENS_BUILD_TESTS)
     add_test(NAME ranklens_controlled_errors_integration COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_controlled_errors.py
       ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_controlled_errors>)
+    if(RANKLENS_HAVE_MPI_PARTITIONED)
+      add_test(NAME ranklens_partitioned_requests_integration COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/mpi_partitioned_requests.py
+        ${MPIEXEC_EXECUTABLE} $<TARGET_FILE:ranklens_mpi> $<TARGET_FILE:ranklens_partitioned_requests>)
+      set_tests_properties(ranklens_partitioned_requests_integration PROPERTIES
+        ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        TIMEOUT 60)
+    endif()
     set_tests_properties(ranklens_mpi_integration ranklens_nonblocking_integration
       ranklens_completion_families_integration ranklens_persistent_requests_integration
       ranklens_thread_multiple_integration ranklens_controlled_errors_integration

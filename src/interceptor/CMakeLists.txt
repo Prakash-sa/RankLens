@@ -16,6 +16,9 @@ target_include_directories(
     ${PROJECT_BINARY_DIR}/generated
 )
 target_link_libraries(ranklens_mpi PRIVATE MPI::MPI_CXX Threads::Threads)
+if(RANKLENS_HAVE_MPI_PARTITIONED)
+  target_compile_definitions(ranklens_mpi PRIVATE RANKLENS_HAVE_MPI_PARTITIONED=1)
+endif()
 
 set_target_properties(
   ranklens_mpi
