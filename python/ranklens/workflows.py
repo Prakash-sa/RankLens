@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import sqlite3
 import statistics
 import subprocess
@@ -32,6 +33,26 @@ def _percentile(values: list[float], percentile: float) -> float:
     if lower == upper:
         return ordered[int(rank)]
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
+
+
+def _bootstrap_interval(
+    values: list[float], statistic, *, confidence: float = 0.95, samples: int = 5000
+) -> list[float]:
+    """Return a deterministic percentile-bootstrap interval for observed trials.
+
+    This quantifies sampling uncertainty in the recorded run; it does not model
+    unobserved workload, placement, or system-noise regimes.
+    """
+
+    if not values:
+        return [0.0, 0.0]
+    generator = random.Random(0)
+    estimates = [
+        statistic([values[generator.randrange(len(values))] for _ in values])
+        for _ in range(samples)
+    ]
+    tail = (1.0 - confidence) / 2.0
+    return [_percentile(estimates, tail), _percentile(estimates, 1.0 - tail)]
 
 
 def export_csv(result, destination: Path) -> None:
@@ -161,12 +182,31 @@ def benchmark(
         paired_overheads.append((measured_elapsed / baseline_elapsed - 1) * 100)
     median_overhead = statistics.median(paired_overheads)
     p95_overhead = _percentile(paired_overheads, 0.95)
+    median_interval = _bootstrap_interval(paired_overheads, statistics.median)
+    p95_interval = _bootstrap_interval(
+        paired_overheads, lambda sample: _percentile(sample, 0.95)
+    )
+    budget_requested = (
+        max_median_overhead_percent is not None
+        or max_p95_overhead_percent is not None
+    )
+    minimum_budget_repeats = 5
+    conclusive = repeats >= minimum_budget_repeats
     budget = {
         "max_median_overhead_percent": max_median_overhead_percent,
         "max_p95_overhead_percent": max_p95_overhead_percent,
+        "minimum_repeats": minimum_budget_repeats,
+        "conclusive": conclusive,
         "passed": (
-            (max_median_overhead_percent is None or median_overhead <= max_median_overhead_percent)
-            and (max_p95_overhead_percent is None or p95_overhead <= max_p95_overhead_percent)
+            (not budget_requested or conclusive)
+            and (
+                max_median_overhead_percent is None
+                or median_interval[1] <= max_median_overhead_percent
+            )
+            and (
+                max_p95_overhead_percent is None
+                or p95_interval[1] <= max_p95_overhead_percent
+            )
         ),
     }
     result = {
@@ -180,6 +220,14 @@ def benchmark(
         "paired_overhead_percent": paired_overheads,
         "paired_median_overhead_percent": median_overhead,
         "paired_p95_overhead_percent": p95_overhead,
+        "paired_median_overhead_ci95_percent": median_interval,
+        "paired_p95_overhead_ci95_percent": p95_interval,
+        "statistics": {
+            "confidence_level": 0.95,
+            "method": "deterministic percentile bootstrap over paired trials",
+            "bootstrap_samples": 5000,
+            "scope": "sampling uncertainty for this recorded run only",
+        },
         "budget": budget,
         "stdout_equal": len({t["stdout_sha256"] for t in trials}) == 1,
         "stderr_equal": len({t["stderr_sha256"] for t in trials}) == 1,
@@ -194,5 +242,8 @@ def benchmark(
     }
     (output / "benchmark.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     if not budget["passed"]:
-        raise ValueError(f"benchmark overhead budget failed; inspect {output / 'benchmark.json'}")
+        raise ValueError(
+            "benchmark overhead budget failed or evidence was inconclusive; "
+            f"inspect {output / 'benchmark.json'}"
+        )
     return result

@@ -111,10 +111,11 @@ ranklens benchmark --library build/src/interceptor/libranklens_mpi.so \
   -- mpirun -n 4 ./solver input.json
 ```
 
-`ranklens benchmark` alternates baseline and instrumented trials, records output hashes, and can
-fail when observed median or p95 overhead exceeds the budget you set. Matching hashes are useful
-evidence, but scientific validity must still be checked with the application’s own tolerances and
-validators.
+`ranklens benchmark` alternates baseline and instrumented trials, records output hashes, and reports
+paired median and p95 overhead with bootstrap confidence intervals. A configured budget needs at
+least five pairs and passes only when the confidence interval stays within the limit. Matching
+hashes are useful evidence, but scientific validity must still be checked with the application’s
+own tolerances and validators.
 
 ## Contributing and support
 

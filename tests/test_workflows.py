@@ -89,7 +89,14 @@ class WorkflowTests(unittest.TestCase):
             stdout = b"same-science-output\n"
             stderr = b""
 
-        timings = iter([100, 200, 300, 415, 500, 620, 700, 800])
+        clock = 0
+        timing_values = []
+        for trial in range(5):
+            durations = [100, 115] if trial % 2 == 0 else [115, 100]
+            for duration in durations:
+                timing_values.extend((clock, clock + duration))
+                clock += duration + 10
+        timings = iter(timing_values)
         seen_env = []
 
         def run_trial(command, **kwargs):
@@ -108,22 +115,31 @@ class WorkflowTests(unittest.TestCase):
                 ["solver", "input.json"],
                 Path("libranklens_mpi.so"),
                 self.path / "benchmark",
-                repeats=2,
+                repeats=5,
                 max_median_overhead_percent=25,
                 max_p95_overhead_percent=40,
             )
 
         self.assertEqual(result["mode"], "summary")
-        self.assertAlmostEqual(result["paired_overhead_percent"][0], 15.0)
-        self.assertAlmostEqual(result["paired_overhead_percent"][1], 20.0)
-        self.assertAlmostEqual(result["paired_median_overhead_percent"], 17.5)
-        self.assertAlmostEqual(result["paired_p95_overhead_percent"], 19.75)
+        self.assertEqual(len(result["paired_overhead_percent"]), 5)
+        self.assertAlmostEqual(result["paired_median_overhead_percent"], 15.0)
+        self.assertAlmostEqual(result["paired_p95_overhead_percent"], 15.0)
+        for interval in (
+            result["paired_median_overhead_ci95_percent"],
+            result["paired_p95_overhead_ci95_percent"],
+        ):
+            self.assertAlmostEqual(interval[0], 15.0)
+            self.assertAlmostEqual(interval[1], 15.0)
+        self.assertTrue(result["budget"]["conclusive"])
         self.assertTrue(result["budget"]["passed"])
         self.assertTrue(result["stdout_equal"])
         instrumented_envs = [env for env in seen_env if env is not None]
-        self.assertEqual([env["RANKLENS_TRACE_EVENTS"] for env in instrumented_envs], ["0", "0"])
+        self.assertEqual(
+            [env["RANKLENS_TRACE_EVENTS"] for env in instrumented_envs],
+            ["0", "0", "0", "0", "0"],
+        )
         saved = json.loads((self.path / "benchmark" / "benchmark.json").read_text())
-        self.assertAlmostEqual(saved["paired_p95_overhead_percent"], 19.75)
+        self.assertAlmostEqual(saved["paired_p95_overhead_percent"], 15.0)
 
     def test_benchmark_writes_report_before_budget_failure(self):
         class Completed:
@@ -151,4 +167,42 @@ class WorkflowTests(unittest.TestCase):
                 )
         saved = json.loads((self.path / "failed-budget" / "benchmark.json").read_text())
         self.assertFalse(saved["budget"]["passed"])
+        self.assertFalse(saved["budget"]["conclusive"])
         self.assertEqual(saved["environment"]["ranklens_trace_events"], "1")
+
+    def test_benchmark_does_not_pass_a_budget_with_too_few_pairs(self):
+        class Completed:
+            returncode = 0
+            stdout = b"same\n"
+            stderr = b""
+
+        timings = iter([0, 100, 110, 210, 220, 320, 330, 430])
+        destination = self.path / "inconclusive-budget"
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("ranklens.workflows.subprocess.run", return_value=Completed())
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.time.perf_counter_ns",
+                    side_effect=lambda: next(timings),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.analyze",
+                    return_value=type("Capture", (), {"complete": True})(),
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "inconclusive"):
+                benchmark(
+                    ["solver"],
+                    Path("libranklens_mpi.so"),
+                    destination,
+                    repeats=2,
+                    max_median_overhead_percent=100,
+                )
+
+        saved = json.loads((destination / "benchmark.json").read_text())
+        self.assertFalse(saved["budget"]["conclusive"])
+        self.assertFalse(saved["budget"]["passed"])
