@@ -84,6 +84,16 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         help="fail if paired p95 overhead is above this percentage",
     )
+    bench_parser.add_argument(
+        "--max-median-added-time-ms",
+        type=float,
+        help="fail if the paired median added wall time exceeds this value",
+    )
+    bench_parser.add_argument(
+        "--max-p95-added-time-ms",
+        type=float,
+        help="fail if the paired p95 added wall time exceeds this value",
+    )
     bench_parser.add_argument("command", nargs=argparse.REMAINDER)
     subcommands.add_parser("doctor", help="check local launcher and interceptor availability")
     return parser
@@ -178,6 +188,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     mode=arguments.mode,
                     max_median_overhead_percent=arguments.max_median_overhead_percent,
                     max_p95_overhead_percent=arguments.max_p95_overhead_percent,
+                    max_median_added_time_ms=arguments.max_median_added_time_ms,
+                    max_p95_added_time_ms=arguments.max_p95_added_time_ms,
                 ),
                 indent=2,
             ))

@@ -124,6 +124,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(result["paired_overhead_percent"]), 5)
         self.assertAlmostEqual(result["paired_median_overhead_percent"], 15.0)
         self.assertAlmostEqual(result["paired_p95_overhead_percent"], 15.0)
+        self.assertEqual(result["paired_added_time_ns"], [15, 15, 15, 15, 15])
+        self.assertEqual(result["paired_median_added_time_ns"], 15)
+        self.assertEqual(result["paired_p95_added_time_ns"], 15.0)
         for interval in (
             result["paired_median_overhead_ci95_percent"],
             result["paired_p95_overhead_ci95_percent"],
@@ -206,3 +209,48 @@ class WorkflowTests(unittest.TestCase):
         saved = json.loads((destination / "benchmark.json").read_text())
         self.assertFalse(saved["budget"]["conclusive"])
         self.assertFalse(saved["budget"]["passed"])
+
+    def test_benchmark_can_gate_absolute_added_time_for_short_runs(self):
+        class Completed:
+            returncode = 0
+            stdout = b"same\n"
+            stderr = b""
+
+        clock = 0
+        timing_values = []
+        for trial in range(5):
+            durations = [1_000_000, 3_000_000] if trial % 2 == 0 else [3_000_000, 1_000_000]
+            for duration in durations:
+                timing_values.extend((clock, clock + duration))
+                clock += duration + 100
+        timings = iter(timing_values)
+        destination = self.path / "absolute-budget"
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("ranklens.workflows.subprocess.run", return_value=Completed())
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.time.perf_counter_ns",
+                    side_effect=lambda: next(timings),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.analyze",
+                    return_value=type("Capture", (), {"complete": True})(),
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "budget failed"):
+                benchmark(
+                    ["solver"],
+                    Path("libranklens_mpi.so"),
+                    destination,
+                    repeats=5,
+                    max_median_added_time_ms=1.0,
+                )
+
+        saved = json.loads((destination / "benchmark.json").read_text())
+        self.assertTrue(saved["budget"]["conclusive"])
+        self.assertFalse(saved["budget"]["passed"])
+        self.assertEqual(saved["paired_median_added_time_ns"], 2_000_000)

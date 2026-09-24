@@ -131,6 +131,8 @@ def benchmark(
     mode: str = "summary",
     max_median_overhead_percent: Optional[float] = None,
     max_p95_overhead_percent: Optional[float] = None,
+    max_median_added_time_ms: Optional[float] = None,
+    max_p95_added_time_ms: Optional[float] = None,
 ) -> dict:
     """Alternate baseline/instrumented trials and optionally enforce overhead budgets."""
     if (
@@ -142,7 +144,12 @@ def benchmark(
         or mode not in {"summary", "detail"}
     ):
         raise ValueError("provide a command, 2–100 repeats, positive finite timeout, and valid mode")
-    for budget in (max_median_overhead_percent, max_p95_overhead_percent):
+    for budget in (
+        max_median_overhead_percent,
+        max_p95_overhead_percent,
+        max_median_added_time_ms,
+        max_p95_added_time_ms,
+    ):
         if budget is not None and (not math.isfinite(budget) or budget < 0):
             raise ValueError("overhead budgets must be finite non-negative percentages")
     output.mkdir(parents=True, exist_ok=False)
@@ -176,25 +183,37 @@ def benchmark(
     baseline = statistics.median(t["elapsed_ns"] for t in trials if not t["instrumented"])
     measured = statistics.median(t["elapsed_ns"] for t in trials if t["instrumented"])
     paired_overheads = []
+    paired_added_time = []
     for trial in range(repeats):
         baseline_elapsed = next(t["elapsed_ns"] for t in trials if t["trial"] == trial and not t["instrumented"])
         measured_elapsed = next(t["elapsed_ns"] for t in trials if t["trial"] == trial and t["instrumented"])
         paired_overheads.append((measured_elapsed / baseline_elapsed - 1) * 100)
+        paired_added_time.append(measured_elapsed - baseline_elapsed)
     median_overhead = statistics.median(paired_overheads)
     p95_overhead = _percentile(paired_overheads, 0.95)
     median_interval = _bootstrap_interval(paired_overheads, statistics.median)
     p95_interval = _bootstrap_interval(
         paired_overheads, lambda sample: _percentile(sample, 0.95)
     )
+    median_added_time = statistics.median(paired_added_time)
+    p95_added_time = _percentile(paired_added_time, 0.95)
+    median_added_interval = _bootstrap_interval(paired_added_time, statistics.median)
+    p95_added_interval = _bootstrap_interval(
+        paired_added_time, lambda sample: _percentile(sample, 0.95)
+    )
     budget_requested = (
         max_median_overhead_percent is not None
         or max_p95_overhead_percent is not None
+        or max_median_added_time_ms is not None
+        or max_p95_added_time_ms is not None
     )
     minimum_budget_repeats = 5
     conclusive = repeats >= minimum_budget_repeats
     budget = {
         "max_median_overhead_percent": max_median_overhead_percent,
         "max_p95_overhead_percent": max_p95_overhead_percent,
+        "max_median_added_time_ms": max_median_added_time_ms,
+        "max_p95_added_time_ms": max_p95_added_time_ms,
         "minimum_repeats": minimum_budget_repeats,
         "conclusive": conclusive,
         "passed": (
@@ -206,6 +225,14 @@ def benchmark(
             and (
                 max_p95_overhead_percent is None
                 or p95_interval[1] <= max_p95_overhead_percent
+            )
+            and (
+                max_median_added_time_ms is None
+                or median_added_interval[1] <= max_median_added_time_ms * 1_000_000
+            )
+            and (
+                max_p95_added_time_ms is None
+                or p95_added_interval[1] <= max_p95_added_time_ms * 1_000_000
             )
         ),
     }
@@ -222,6 +249,11 @@ def benchmark(
         "paired_p95_overhead_percent": p95_overhead,
         "paired_median_overhead_ci95_percent": median_interval,
         "paired_p95_overhead_ci95_percent": p95_interval,
+        "paired_added_time_ns": paired_added_time,
+        "paired_median_added_time_ns": median_added_time,
+        "paired_p95_added_time_ns": p95_added_time,
+        "paired_median_added_time_ci95_ns": median_added_interval,
+        "paired_p95_added_time_ci95_ns": p95_added_interval,
         "statistics": {
             "confidence_level": 0.95,
             "method": "deterministic percentile bootstrap over paired trials",

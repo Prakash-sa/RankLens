@@ -115,7 +115,8 @@ ranklens benchmark --library build/src/interceptor/libranklens_mpi.so \
 paired median and p95 overhead with bootstrap confidence intervals. A configured budget needs at
 least five pairs and passes only when the confidence interval stays within the limit. Matching
 hashes are useful evidence, but scientific validity must still be checked with the application’s
-own tolerances and validators.
+own tolerances and validators. Absolute added wall time is reported as well, and short-run studies
+can gate it with `--max-median-added-time-ms` or `--max-p95-added-time-ms`.
 
 ## Contributing and support
 
