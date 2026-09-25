@@ -106,6 +106,13 @@ std::size_t event_buffer_limit() {
   catch (...) { return 1024; }
 }
 
+std::size_t configured_request_tracking_limit() {
+  const std::string value = env_value("RANKLENS_MAX_TRACKED_REQUESTS");
+  if (value.empty()) return 65536;
+  try { return std::max<std::size_t>(1, std::min<std::size_t>(std::stoull(value), 65536)); }
+  catch (...) { return 65536; }
+}
+
 // Translate communicator-local peers without introducing MPI collectives.
 int world_peer(MPI_Comm communicator, int peer) {
   if (peer < 0 || communicator == MPI_COMM_WORLD) return peer;
@@ -215,7 +222,7 @@ struct RecorderSnapshot {
 
 class Recorder {
  public:
-  Recorder(int rank, int world_size)
+  Recorder(int rank, int world_size, std::size_t request_tracking_limit)
       : rank_(rank),
         world_size_(world_size),
         host_(hostname()),
@@ -223,6 +230,7 @@ class Recorder {
         started_at_(Clock::now()),
         max_events_(event_limit()),
         event_buffer_capacity_(event_buffer_limit()),
+        request_tracking_limit_(request_tracking_limit),
         trace_events_(env_enabled("RANKLENS_TRACE_EVENTS", true)) {
     const char* configured_output = std::getenv("RANKLENS_OUTPUT_DIR");
     output_directory_ = configured_output == nullptr ? "ranklens-results" : configured_output;
@@ -396,6 +404,7 @@ class Recorder {
             << "\", \"event_buffer_records\": \"" << event_buffer_capacity_
             << "\", \"request_tracking_overflows\": \""
             << state.request_tracking_overflows
+            << "\", \"request_tracking_limit\": \"" << request_tracking_limit_
             << "\", \"writer_failed\": \""
             << (writer_failed_.load(std::memory_order_acquire) ? "true" : "false")
             << "\", \"tracing_enabled\": \"" << (trace_events_ ? "true" : "false") << "\"";
@@ -471,6 +480,7 @@ class Recorder {
   Clock::time_point started_at_;
   std::uint64_t max_events_ = 0;
   std::size_t event_buffer_capacity_ = 0;
+  std::size_t request_tracking_limit_ = 0;
   bool trace_events_ = true;
   bool disabled_ = false;
   std::filesystem::path output_directory_;
@@ -512,6 +522,7 @@ using RequestKey = MPI_Request;
 std::map<RequestKey, std::vector<Pending>> pending;
 std::map<RequestKey, Pending> persistent;
 long long next_request_id = 0;
+std::size_t request_tracking_limit = 65536;
 
 std::size_t pending_size() noexcept {
   std::size_t total = 0;
@@ -526,7 +537,7 @@ long long remember(MPI_Request request, bool receive, MPI_Comm comm, int peer, i
   try {
     std::lock_guard<std::mutex> lock(pending_mutex);
     const auto current_size = persistent_request ? persistent.size() : pending_size();
-    if (current_size >= 65536) {
+    if (current_size >= request_tracking_limit) {
       if (recorder) recorder->request_tracking_overflow();
       return -1;
     }
@@ -588,6 +599,10 @@ long long start_persistent(RequestKey key) noexcept {
     std::lock_guard<std::mutex> lock(pending_mutex);
     auto saved = persistent.find(key);
     if (saved == persistent.end()) return -1;
+    if (pending_size() >= request_tracking_limit) {
+      if (recorder) recorder->request_tracking_overflow();
+      return -1;
+    }
     pending[key].push_back(Pending{saved->second.id, saved->second.receive, saved->second.peers,
                                    saved->second.peer, saved->second.tag, true});
     return saved->second.id;
@@ -637,7 +652,8 @@ void initialize_recorder() noexcept {
       PMPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS) {
     return;
   }
-  recorder = std::make_unique<Recorder>(rank, world_size);
+  request_tracking_limit = configured_request_tracking_limit();
+  recorder = std::make_unique<Recorder>(rank, world_size, request_tracking_limit);
   } catch (...) { recorder.reset(); }
 }
 
