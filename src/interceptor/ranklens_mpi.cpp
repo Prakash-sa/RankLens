@@ -408,6 +408,14 @@ class Recorder {
             << "\", \"writer_failed\": \""
             << (writer_failed_.load(std::memory_order_acquire) ? "true" : "false")
             << "\", \"tracing_enabled\": \"" << (trace_events_ ? "true" : "false") << "\"";
+    summary << ", \"mpi_standard_version\": \"" << MPI_VERSION << '.' << MPI_SUBVERSION
+            << "\", \"partitioned_requests\": \""
+#if defined(RANKLENS_HAVE_MPI_PARTITIONED)
+            << "supported";
+#else
+            << "unavailable";
+#endif
+    summary << "\"";
 #if !defined(_WIN32)
     struct rusage usage {};
     if (getrusage(RUSAGE_SELF, &usage) == 0) {

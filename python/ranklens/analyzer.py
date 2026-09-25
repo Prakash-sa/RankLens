@@ -384,9 +384,25 @@ def analyze(directory: Path, straggler_threshold: float = 1.20) -> AnalysisResul
     complete = len(summaries) == world_size and all(s.complete for s in summaries)
     if not complete:
         warnings.append("capture is incomplete; runtimes and findings describe partial evidence")
-    if any(s.context.get("events_dropped", "0") != "0" for s in summaries):
+    event_paths = list(directory.glob("rank-*-events.jsonl"))
+    events_dropped = any(s.context.get("events_dropped", "0") != "0" for s in summaries)
+    request_overflow_known = all(
+        "request_tracking_overflows" in summary.context for summary in summaries
+    )
+    request_overflow = any(
+        s.context.get("request_tracking_overflows", "0") != "0" for s in summaries
+    )
+    writer_failed = any(s.context.get("writer_failed") == "true" for s in summaries)
+    if events_dropped:
         warnings.append("event limit reached; communication edges and timeline are partial, operation totals remain complete")
-    if not list(directory.glob("rank-*-events.jsonl")):
+    if request_overflow:
+        warnings.append(
+            "request tracking limit reached; request lifecycle completion evidence is partial, "
+            "API operation totals remain complete"
+        )
+    if writer_failed:
+        warnings.append("background event writer failed; event detail may be incomplete")
+    if not event_paths:
         warnings.append("no event streams; communication and timeline coverage unavailable")
     if metadata.get("return_code", 0) != 0:
         warnings.append("launcher did not complete successfully; review run metadata")
@@ -396,6 +412,52 @@ def analyze(directory: Path, straggler_threshold: float = 1.20) -> AnalysisResul
         raise TelemetryError("mixed run identities in capture")
     if mpi_time > aggregate_runtime:
         warnings.append("summed MPI call time exceeds wall time; concurrent threads may overlap")
+
+    event_warning_count = len(warnings)
+    communication_edges = _load_communication_edges(
+        directory, total_bytes_sent, warnings, world_size, timeline, maximum_runtime
+    )
+    event_records_rejected = len(warnings) > event_warning_count
+
+    partitioned_capabilities = {
+        summary.context.get("partitioned_requests", "unknown") for summary in summaries
+    }
+    coverage_reasons = []
+    if not complete:
+        coverage_reasons.append("capture_incomplete")
+    if not event_paths:
+        coverage_reasons.append("event_stream_unavailable")
+    if events_dropped:
+        coverage_reasons.append("event_limit_reached")
+    if writer_failed:
+        coverage_reasons.append("event_writer_failed")
+    if event_records_rejected:
+        coverage_reasons.append("event_records_rejected")
+    if request_overflow:
+        coverage_reasons.append("request_tracking_limit_reached")
+    coverage = {
+        "summary": "complete" if complete else "partial",
+        "event_detail": (
+            "unavailable"
+            if not event_paths
+            else "partial"
+            if events_dropped or writer_failed or event_records_rejected
+            else "observed"
+        ),
+        "request_lifecycle": (
+            "partial"
+            if request_overflow
+            else "observed"
+            if request_overflow_known
+            else "unknown"
+        ),
+        "partitioned_requests": (
+            next(iter(partitioned_capabilities))
+            if len(partitioned_capabilities) == 1
+            else "unknown"
+        ),
+        "reasons": coverage_reasons,
+    }
 
     result = AnalysisResult(
         source=str(directory),
@@ -410,9 +472,10 @@ def analyze(directory: Path, straggler_threshold: float = 1.20) -> AnalysisResul
         straggler_threshold=straggler_threshold,
         straggler_ranks=stragglers,
         operations=_aggregate_operations(summaries),
-        communication_edges=_load_communication_edges(directory, total_bytes_sent, warnings, world_size, timeline, maximum_runtime),
+        communication_edges=communication_edges,
         rank_runtimes=sorted((summary.rank, summary.runtime_ns) for summary in summaries),
         warnings=warnings,
+        coverage=coverage,
         synthetic=any(s.synthetic for s in summaries),
         complete=complete,
         metadata=metadata,

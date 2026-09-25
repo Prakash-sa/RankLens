@@ -66,6 +66,7 @@ class AnalysisResult:
     rank_runtimes: List[Tuple[int, int]] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    coverage: dict = field(default_factory=dict)
     schema_version: int = 1
     synthetic: bool = False
     complete: bool = True

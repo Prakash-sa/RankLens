@@ -85,6 +85,55 @@ class AnalyzerTests(unittest.TestCase):
             self.assertTrue(result.complete)
             self.assertEqual(result.operations["MPI_Isend"].calls, 1)
             self.assertEqual(result.operations["MPI_Isend_complete"].calls, 1)
+            self.assertEqual(result.coverage["request_lifecycle"], "unknown")
+            self.assertEqual(result.coverage["partitioned_requests"], "unknown")
+
+    def test_reports_independent_partial_request_lifecycle_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            summary = {
+                "schema_version": 2,
+                "complete": True,
+                "capture_state": "finalized",
+                "finalize_return_code": 0,
+                "context": {
+                    "events_dropped": "0",
+                    "request_tracking_overflows": "3",
+                    "writer_failed": "false",
+                    "partitioned_requests": "unavailable",
+                },
+                "rank": 0,
+                "world_size": 1,
+                "hostname": "node-a",
+                "pid": 42,
+                "runtime_ns": 100,
+                "mpi_time_ns": 20,
+                "mpi_calls": 1,
+                "request_completions": 0,
+                "failed_calls": 0,
+                "bytes_sent": 0,
+                "bytes_received": 0,
+                "operations": {
+                    "MPI_Irecv": {
+                        "calls": 1,
+                        "duration_ns": 20,
+                        "payload_bytes": 0,
+                        "record_kind": "api_call",
+                    }
+                },
+            }
+            (directory / "rank-00000-summary.json").write_text(
+                json.dumps(summary), encoding="utf-8"
+            )
+
+            result = analyze(directory)
+
+            self.assertTrue(result.complete)
+            self.assertEqual(result.coverage["summary"], "complete")
+            self.assertEqual(result.coverage["event_detail"], "unavailable")
+            self.assertEqual(result.coverage["request_lifecycle"], "partial")
+            self.assertEqual(result.coverage["partitioned_requests"], "unavailable")
+            self.assertIn("request_tracking_limit_reached", result.coverage["reasons"])
 
     def test_rejects_version_two_with_mixed_call_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

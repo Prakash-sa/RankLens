@@ -23,6 +23,9 @@ try:
         assert result.operations["MPI_Isend"].calls == 8
         assert result.operations["MPI_Irecv_complete"].calls == 4
         assert "MPI_Isend_complete" not in result.operations
+        assert result.coverage["request_lifecycle"] == "partial"
+        assert "request_tracking_limit_reached" in result.coverage["reasons"]
+        assert any("request tracking limit" in warning for warning in result.warnings)
         for summary in output.glob("rank-*-summary.json"):
             data = json.loads(summary.read_text())
             assert data["context"]["request_tracking_limit"] == "2"

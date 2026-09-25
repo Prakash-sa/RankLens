@@ -27,6 +27,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(result.warnings), 4)
         self.assertTrue(result.synthetic)
         self.assertEqual(sum(row["calls"] for row in result.timeline), 32)
+        self.assertEqual(result.coverage["event_detail"], "partial")
+        self.assertIn("event_records_rejected", result.coverage["reasons"])
 
     def test_rank_and_schema_validation(self):
         path = self.capture / "rank-00000-summary.json"

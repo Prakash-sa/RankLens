@@ -22,8 +22,10 @@ class ReportTests(unittest.TestCase):
 
             self.assertIn("RANKLENS PERFORMANCE REPORT", text)
             self.assertIn("Runtime stragglers detected", text)
+            self.assertIn("Evidence coverage", text)
             self.assertIn("<!doctype html>", html)
             self.assertIn("Rank runtime distribution", html)
+            self.assertIn("Request lifecycle", html)
             self.assertIn("not promised speedups", html)
 
     def test_json_report_is_machine_readable(self) -> None:
@@ -38,8 +40,8 @@ class ReportTests(unittest.TestCase):
 
             self.assertEqual(payload["world_size"], 4)
             self.assertEqual(payload["straggler_ranks"], [3])
+            self.assertIn("event_detail", payload["coverage"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

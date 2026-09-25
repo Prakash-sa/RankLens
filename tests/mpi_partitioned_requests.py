@@ -15,6 +15,7 @@ with tempfile.TemporaryDirectory() as temporary:
     assert run([launcher, "-n", "2", executable], Path(library), output) == 0
     result = analyze(output)
     assert result.complete
+    assert result.coverage["partitioned_requests"] == "supported"
     expected_calls = {
         "MPI_Psend_init": 2,
         "MPI_Precv_init": 2,

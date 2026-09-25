@@ -47,6 +47,16 @@ def render_text(result: AnalysisResult) -> str:
             f"{fraction:>6.1%}  {_bytes(stats.payload_bytes):>10}"
         )
 
+    if result.coverage:
+        lines.extend(["", "Evidence coverage", "-" * 56])
+        for label, key in (
+            ("Summary", "summary"),
+            ("Event detail", "event_detail"),
+            ("Request lifecycle", "request_lifecycle"),
+            ("Partitioned requests", "partitioned_requests"),
+        ):
+            lines.append(f"{label:<22} {result.coverage.get(key, 'unknown')}")
+
     lines.extend(["", "Findings", "-" * 56])
     for finding in result.findings:
         lines.extend(
@@ -123,6 +133,16 @@ def render_html(result: AnalysisResult) -> str:
         for edge in result.communication_edges[:10]
     ) or '<tr><td colspan="5">Event tracing was disabled or no point-to-point sends were observed.</td></tr>'
     warning_html = "".join(f"<li>{html.escape(warning)}</li>" for warning in result.warnings)
+    coverage_html = "".join(
+        f'<div class="metric"><span>{html.escape(label)}</span>'
+        f'<strong>{html.escape(str(result.coverage.get(key, "unknown")))}</strong></div>'
+        for label, key in (
+            ("Summary coverage", "summary"),
+            ("Event detail", "event_detail"),
+            ("Request lifecycle", "request_lifecycle"),
+            ("Partitioned requests", "partitioned_requests"),
+        )
+    )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -165,6 +185,7 @@ def render_html(result: AnalysisResult) -> str:
     <div class="metric"><span>Max / median</span><strong>{result.imbalance_ratio:.2f}×</strong></div>
     <div class="metric"><span>MPI time fraction</span><strong>{result.mpi_fraction:.1%}</strong></div>
   </section>
+  <h2>Evidence coverage</h2><section class="metrics">{coverage_html}</section>
   <h2>Rank runtime distribution</h2><section class="panel">{_bar_rows(result)}</section>
   <h2>Diagnosis</h2><section class="findings">{finding_cards}</section>
   <h2>Instrumented operations</h2><section class="panel"><table><thead><tr><th>Operation</th><th>Calls</th><th>Time</th><th>Rank-time share</th><th>Payload</th></tr></thead><tbody>{operation_rows}</tbody></table></section>
