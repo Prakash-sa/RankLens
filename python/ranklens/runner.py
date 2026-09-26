@@ -135,6 +135,14 @@ def run(command: Sequence[str], library: Path, output: Path, *, workload: str = 
     except OSError as exc:
         metadata["error"] = str(exc)
         code = 127
+    summaries = list(output.glob("rank-*-summary.json"))
+    event_streams = list(output.glob("rank-*-events.jsonl"))
+    metadata["telemetry"] = {
+        "status": "observed" if summaries else "unavailable",
+        "rank_summaries": len(summaries),
+        "event_streams": len(event_streams),
+        "reason": None if summaries else "no_rank_summaries",
+    }
     metadata.update(return_code=code, state="completed" if code == 0 else "failed",
                     finished_at=datetime.now(timezone.utc).isoformat())
     save_metadata()

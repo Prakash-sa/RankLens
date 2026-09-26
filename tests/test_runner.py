@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from ranklens.runner import (
     _forward_macos_openmpi_environment,
     discover_library,
     instrumented_environment,
+    run,
 )
 
 
@@ -52,6 +54,46 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(command[0], "mpirun")
         self.assertEqual(command.count("-x"), 3)
         self.assertEqual(command[-3:], ["-n", "2", "solver"])
+
+    def test_successful_application_records_unavailable_telemetry_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+            "ranklens.runner.subprocess.run",
+            return_value=mock.Mock(returncode=0),
+        ):
+            output = Path(temporary) / "capture"
+            code = run(["solver"], Path("library.so"), output)
+
+            metadata = json.loads((output / "run.json").read_text())
+            self.assertEqual(code, 0)
+            self.assertEqual(metadata["state"], "completed")
+            self.assertEqual(
+                metadata["telemetry"],
+                {
+                    "status": "unavailable",
+                    "rank_summaries": 0,
+                    "event_streams": 0,
+                    "reason": "no_rank_summaries",
+                },
+            )
+
+    def test_runner_records_observed_summary_and_event_counts(self) -> None:
+        def completed(_command, **kwargs):
+            output = Path(kwargs["env"]["RANKLENS_OUTPUT_DIR"])
+            (output / "rank-00000-summary.json").write_text("{}")
+            (output / "rank-00000-events.jsonl").write_text("")
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+            "ranklens.runner.subprocess.run", side_effect=completed
+        ):
+            output = Path(temporary) / "capture"
+            run(["solver"], Path("library.so"), output)
+
+            metadata = json.loads((output / "run.json").read_text())
+            self.assertEqual(metadata["telemetry"]["status"], "observed")
+            self.assertEqual(metadata["telemetry"]["rank_summaries"], 1)
+            self.assertEqual(metadata["telemetry"]["event_streams"], 1)
+            self.assertIsNone(metadata["telemetry"]["reason"])
 
 
 if __name__ == "__main__":
