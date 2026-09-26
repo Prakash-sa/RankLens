@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -660,6 +661,11 @@ void initialize_recorder() noexcept {
       PMPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS) {
     return;
   }
+#if defined(RANKLENS_ENABLE_TEST_FAULTS)
+  if (env_enabled("RANKLENS_TEST_FAIL_RECORDER_INITIALIZATION", false)) {
+    throw std::bad_alloc();
+  }
+#endif
   request_tracking_limit = configured_request_tracking_limit();
   recorder = std::make_unique<Recorder>(rank, world_size, request_tracking_limit);
   } catch (...) { recorder.reset(); }

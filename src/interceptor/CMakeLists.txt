@@ -19,6 +19,9 @@ target_link_libraries(ranklens_mpi PRIVATE MPI::MPI_CXX Threads::Threads)
 if(RANKLENS_HAVE_MPI_PARTITIONED)
   target_compile_definitions(ranklens_mpi PRIVATE RANKLENS_HAVE_MPI_PARTITIONED=1)
 endif()
+if(BUILD_TESTING AND RANKLENS_BUILD_TESTS)
+  target_compile_definitions(ranklens_mpi PRIVATE RANKLENS_ENABLE_TEST_FAULTS=1)
+endif()
 
 set_target_properties(
   ranklens_mpi
