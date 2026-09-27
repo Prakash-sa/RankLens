@@ -175,7 +175,7 @@ class WorkflowTests(unittest.TestCase):
             stack.enter_context(
                 patch("ranklens.workflows.analyze", return_value=type("Capture", (), {"complete": True})())
             )
-            with self.assertRaisesRegex(ValueError, "budget failed"):
+            with self.assertRaisesRegex(ValueError, "acceptance gate failed"):
                 benchmark(
                     ["solver"],
                     Path("libranklens_mpi.so"),
@@ -259,7 +259,7 @@ class WorkflowTests(unittest.TestCase):
                     return_value=type("Capture", (), {"complete": True})(),
                 )
             )
-            with self.assertRaisesRegex(ValueError, "budget failed"):
+            with self.assertRaisesRegex(ValueError, "acceptance gate failed"):
                 benchmark(
                     ["solver"],
                     Path("libranklens_mpi.so"),
@@ -319,3 +319,49 @@ class WorkflowTests(unittest.TestCase):
             self.assertAlmostEqual(overhead, 10.0)
         self.assertEqual(analyze_capture.call_count, 3)
         self.assertTrue((destination / "warmup-0-instrumented" / "stdout.txt").exists())
+
+    def test_benchmark_can_require_pairwise_output_equality(self):
+        class Completed:
+            returncode = 0
+            stderr = b""
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        outputs = iter((b"same\n", b"changed\n", b"same\n", b"same\n"))
+        timings = iter((0, 100, 200, 310, 400, 510, 600, 700))
+        destination = self.path / "output-gate"
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.subprocess.run",
+                    side_effect=lambda *args, **kwargs: Completed(next(outputs)),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.time.perf_counter_ns",
+                    side_effect=lambda: next(timings),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.analyze",
+                    return_value=type("Capture", (), {"complete": True})(),
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "acceptance gate failed"):
+                benchmark(
+                    ["solver"],
+                    Path("libranklens_mpi.so"),
+                    destination,
+                    repeats=2,
+                    warmups=0,
+                    require_output_match=True,
+                )
+
+        saved = json.loads((destination / "benchmark.json").read_text())
+        self.assertEqual(saved["paired_output_match"], [False, True])
+        self.assertTrue(saved["budget"]["require_output_match"])
+        self.assertFalse(saved["budget"]["output_match_passed"])
+        self.assertFalse(saved["budget"]["passed"])

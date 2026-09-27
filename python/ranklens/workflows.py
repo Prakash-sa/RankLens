@@ -157,6 +157,7 @@ def benchmark(
     *,
     warmups: int = 1,
     mode: str = "summary",
+    require_output_match: bool = False,
     max_median_overhead_percent: Optional[float] = None,
     max_p95_overhead_percent: Optional[float] = None,
     max_median_added_time_ms: Optional[float] = None,
@@ -246,6 +247,21 @@ def benchmark(
     p95_added_interval = _bootstrap_interval(
         paired_added_time, lambda sample: _percentile(sample, 0.95)
     )
+    paired_output_match = []
+    for trial in range(repeats):
+        baseline_trial = next(
+            sample for sample in trials
+            if sample["trial"] == trial and not sample["instrumented"]
+        )
+        instrumented_trial = next(
+            sample for sample in trials
+            if sample["trial"] == trial and sample["instrumented"]
+        )
+        paired_output_match.append(
+            baseline_trial["stdout_sha256"] == instrumented_trial["stdout_sha256"]
+            and baseline_trial["stderr_sha256"] == instrumented_trial["stderr_sha256"]
+        )
+    output_match_passed = all(paired_output_match)
     baseline_first_overheads = [
         paired_overheads[trial] for trial in range(repeats) if trial % 2 == 0
     ]
@@ -273,8 +289,11 @@ def benchmark(
         "max_p95_added_time_ms": max_p95_added_time_ms,
         "minimum_repeats": minimum_budget_repeats,
         "conclusive": conclusive,
+        "require_output_match": require_output_match,
+        "output_match_passed": output_match_passed,
         "passed": (
             (not budget_requested or conclusive)
+            and (not require_output_match or output_match_passed)
             and (
                 max_median_overhead_percent is None
                 or median_interval[1] <= max_median_overhead_percent
@@ -313,6 +332,7 @@ def benchmark(
         "paired_p95_added_time_ns": p95_added_time,
         "paired_median_added_time_ci95_ns": median_added_interval,
         "paired_p95_added_time_ci95_ns": p95_added_interval,
+        "paired_output_match": paired_output_match,
         "distributions": {
             "baseline_elapsed_ns": _distribution(baseline_times),
             "instrumented_elapsed_ns": _distribution(instrumented_times),
@@ -363,7 +383,7 @@ def benchmark(
     (output / "benchmark.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     if not budget["passed"]:
         raise ValueError(
-            "benchmark overhead budget failed or evidence was inconclusive; "
+            "benchmark acceptance gate failed or evidence was inconclusive; "
             f"inspect {output / 'benchmark.json'}"
         )
     return result

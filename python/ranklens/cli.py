@@ -81,6 +81,11 @@ def _parser() -> argparse.ArgumentParser:
         help="capture mode for instrumented trials; summary disables event tracing",
     )
     bench_parser.add_argument(
+        "--require-output-match",
+        action="store_true",
+        help="fail unless stdout and stderr hashes match within every measured pair",
+    )
+    bench_parser.add_argument(
         "--max-median-overhead-percent",
         type=float,
         help="fail if paired median overhead is above this percentage",
@@ -193,6 +198,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     arguments.timeout,
                     warmups=arguments.warmups,
                     mode=arguments.mode,
+                    require_output_match=arguments.require_output_match,
                     max_median_overhead_percent=arguments.max_median_overhead_percent,
                     max_p95_overhead_percent=arguments.max_p95_overhead_percent,
                     max_median_added_time_ms=arguments.max_median_added_time_ms,

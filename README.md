@@ -107,6 +107,7 @@ ranklens doctor
 ranklens analyze captures/solver-a --html report.html --json analysis.json --csv ranks.csv
 ranklens benchmark --library build/src/interceptor/libranklens_mpi.so \
   --output overhead-study --warmups 1 --repeats 5 --mode summary \
+  --require-output-match \
   --max-median-overhead-percent 2 --max-p95-overhead-percent 5 \
   -- mpirun -n 4 ./solver input.json
 ```
@@ -116,7 +117,9 @@ trials, records output hashes, and reports paired median and p95 overhead with b
 intervals. A configured budget needs at
 least five pairs and passes only when the confidence interval stays within the limit. Matching
 hashes are useful evidence, but scientific validity must still be checked with the application’s
-own tolerances and validators. Absolute added wall time is reported as well, and short-run studies
+own tolerances and validators. `--require-output-match` can fail the study when stdout or stderr
+differs within any measured pair; use an application-aware validator instead when legitimate
+floating-point output varies. Absolute added wall time is reported as well, and short-run studies
 can gate it with `--max-median-added-time-ms` or `--max-p95-added-time-ms`. The saved report also
 includes observed timing distributions, launch-order diagnostics, and a platform/interceptor
 fingerprint so teams can spot noisy studies and reproduce the tested collector build.
