@@ -117,7 +117,9 @@ intervals. A configured budget needs at
 least five pairs and passes only when the confidence interval stays within the limit. Matching
 hashes are useful evidence, but scientific validity must still be checked with the application’s
 own tolerances and validators. Absolute added wall time is reported as well, and short-run studies
-can gate it with `--max-median-added-time-ms` or `--max-p95-added-time-ms`.
+can gate it with `--max-median-added-time-ms` or `--max-p95-added-time-ms`. The saved report also
+includes observed timing distributions, launch-order diagnostics, and a platform/interceptor
+fingerprint so teams can spot noisy studies and reproduce the tested collector build.
 
 ## Contributing and support
 

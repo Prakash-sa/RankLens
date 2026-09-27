@@ -7,7 +7,9 @@ import hashlib
 import json
 import math
 import os
+import platform
 import random
+import shutil
 import sqlite3
 import statistics
 import subprocess
@@ -53,6 +55,31 @@ def _bootstrap_interval(
     ]
     tail = (1.0 - confidence) / 2.0
     return [_percentile(estimates, tail), _percentile(estimates, 1.0 - tail)]
+
+
+def _distribution(values: list[float]) -> dict:
+    """Summarize observed samples without implying a population model."""
+    median = statistics.median(values)
+    deviations = [abs(value - median) for value in values]
+    return {
+        "values": values,
+        "minimum": min(values),
+        "p05": _percentile(values, 0.05),
+        "median": median,
+        "p95": _percentile(values, 0.95),
+        "maximum": max(values),
+        "median_absolute_deviation": statistics.median(deviations),
+    }
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def export_csv(result, destination: Path) -> None:
@@ -198,6 +225,8 @@ def benchmark(
             trials.append(run_sample("trial", trial, instrumented))
     baseline = statistics.median(t["elapsed_ns"] for t in trials if not t["instrumented"])
     measured = statistics.median(t["elapsed_ns"] for t in trials if t["instrumented"])
+    baseline_times = [t["elapsed_ns"] for t in trials if not t["instrumented"]]
+    instrumented_times = [t["elapsed_ns"] for t in trials if t["instrumented"]]
     paired_overheads = []
     paired_added_time = []
     for trial in range(repeats):
@@ -216,6 +245,18 @@ def benchmark(
     median_added_interval = _bootstrap_interval(paired_added_time, statistics.median)
     p95_added_interval = _bootstrap_interval(
         paired_added_time, lambda sample: _percentile(sample, 0.95)
+    )
+    baseline_first_overheads = [
+        paired_overheads[trial] for trial in range(repeats) if trial % 2 == 0
+    ]
+    instrumented_first_overheads = [
+        paired_overheads[trial] for trial in range(repeats) if trial % 2 == 1
+    ]
+    baseline_first_median = statistics.median(baseline_first_overheads)
+    instrumented_first_median = (
+        statistics.median(instrumented_first_overheads)
+        if instrumented_first_overheads
+        else None
     )
     budget_requested = (
         max_median_overhead_percent is not None
@@ -272,6 +313,27 @@ def benchmark(
         "paired_p95_added_time_ns": p95_added_time,
         "paired_median_added_time_ci95_ns": median_added_interval,
         "paired_p95_added_time_ci95_ns": p95_added_interval,
+        "distributions": {
+            "baseline_elapsed_ns": _distribution(baseline_times),
+            "instrumented_elapsed_ns": _distribution(instrumented_times),
+            "paired_overhead_percent": _distribution(paired_overheads),
+            "paired_added_time_ns": _distribution(paired_added_time),
+        },
+        "order_effect": {
+            "baseline_first_pairs": len(baseline_first_overheads),
+            "instrumented_first_pairs": len(instrumented_first_overheads),
+            "baseline_first_median_overhead_percent": baseline_first_median,
+            "instrumented_first_median_overhead_percent": instrumented_first_median,
+            "median_difference_percent_points": (
+                baseline_first_median - instrumented_first_median
+                if instrumented_first_median is not None
+                else None
+            ),
+            "interpretation": (
+                "A large difference can indicate launch-order drift or system noise; "
+                "it does not identify a cause."
+            ),
+        },
         "statistics": {
             "confidence_level": 0.95,
             "method": "deterministic percentile bootstrap over paired trials",
@@ -288,6 +350,14 @@ def benchmark(
         "environment": {
             "ranklens_trace_events": "1" if mode == "detail" else "0",
             "python_hash_seed": os.environ.get("PYTHONHASHSEED", ""),
+            "operating_system": platform.system(),
+            "os_release": platform.release(),
+            "machine": platform.machine(),
+            "logical_cpu_count": os.cpu_count(),
+            "python_version": platform.python_version(),
+            "command_executable": shutil.which(str(command[0])),
+            "interceptor_path": str(library.resolve()),
+            "interceptor_sha256": _sha256_file(library),
         },
     }
     (output / "benchmark.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

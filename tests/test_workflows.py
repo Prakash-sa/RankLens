@@ -139,6 +139,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(result["budget"]["conclusive"])
         self.assertTrue(result["budget"]["passed"])
         self.assertTrue(result["stdout_equal"])
+        self.assertEqual(
+            result["distributions"]["baseline_elapsed_ns"]["values"],
+            [100, 100, 100, 100, 100],
+        )
+        self.assertEqual(
+            result["distributions"]["paired_added_time_ns"]["median_absolute_deviation"],
+            0,
+        )
+        self.assertAlmostEqual(
+            result["order_effect"]["median_difference_percent_points"], 0.0
+        )
+        self.assertIn("python_version", result["environment"])
+        self.assertIsNone(result["environment"]["interceptor_sha256"])
         instrumented_envs = [env for env in seen_env if env is not None]
         self.assertEqual(
             [env["RANKLENS_TRACE_EVENTS"] for env in instrumented_envs],
