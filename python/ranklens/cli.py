@@ -67,6 +67,12 @@ def _parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("--library", type=Path)
     bench_parser.add_argument("--output", type=Path, required=True)
     bench_parser.add_argument("--repeats", type=int, default=3)
+    bench_parser.add_argument(
+        "--warmups",
+        type=int,
+        default=1,
+        help="discard this many alternating baseline/instrumented warmup pairs (default: 1)",
+    )
     bench_parser.add_argument("--timeout", type=float, default=300)
     bench_parser.add_argument(
         "--mode",
@@ -185,6 +191,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     arguments.output,
                     arguments.repeats,
                     arguments.timeout,
+                    warmups=arguments.warmups,
                     mode=arguments.mode,
                     max_median_overhead_percent=arguments.max_median_overhead_percent,
                     max_p95_overhead_percent=arguments.max_p95_overhead_percent,

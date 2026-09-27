@@ -106,13 +106,14 @@ the [security policy](SECURITY.md) before enabling network ingestion.
 ranklens doctor
 ranklens analyze captures/solver-a --html report.html --json analysis.json --csv ranks.csv
 ranklens benchmark --library build/src/interceptor/libranklens_mpi.so \
-  --output overhead-study --repeats 5 --mode summary \
+  --output overhead-study --warmups 1 --repeats 5 --mode summary \
   --max-median-overhead-percent 2 --max-p95-overhead-percent 5 \
   -- mpirun -n 4 ./solver input.json
 ```
 
-`ranklens benchmark` alternates baseline and instrumented trials, records output hashes, and reports
-paired median and p95 overhead with bootstrap confidence intervals. A configured budget needs at
+`ranklens benchmark` runs discarded warmup pairs, alternates baseline and instrumented measured
+trials, records output hashes, and reports paired median and p95 overhead with bootstrap confidence
+intervals. A configured budget needs at
 least five pairs and passes only when the confidence interval stays within the limit. Matching
 hashes are useful evidence, but scientific validity must still be checked with the application’s
 own tolerances and validators. Absolute added wall time is reported as well, and short-run studies

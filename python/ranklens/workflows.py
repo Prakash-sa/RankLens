@@ -128,22 +128,28 @@ def benchmark(
     repeats=3,
     timeout=300,
     *,
+    warmups: int = 1,
     mode: str = "summary",
     max_median_overhead_percent: Optional[float] = None,
     max_p95_overhead_percent: Optional[float] = None,
     max_median_added_time_ms: Optional[float] = None,
     max_p95_added_time_ms: Optional[float] = None,
 ) -> dict:
-    """Alternate baseline/instrumented trials and optionally enforce overhead budgets."""
+    """Warm up, then alternate baseline/instrumented trials and enforce optional budgets."""
     if (
         not command
         or repeats < 2
         or repeats > 100
+        or warmups < 0
+        or warmups > 20
         or not math.isfinite(timeout)
         or timeout <= 0
         or mode not in {"summary", "detail"}
     ):
-        raise ValueError("provide a command, 2–100 repeats, positive finite timeout, and valid mode")
+        raise ValueError(
+            "provide a command, 2–100 repeats, 0–20 warmups, positive finite timeout, "
+            "and valid mode"
+        )
     for budget in (
         max_median_overhead_percent,
         max_p95_overhead_percent,
@@ -153,33 +159,43 @@ def benchmark(
         if budget is not None and (not math.isfinite(budget) or budget < 0):
             raise ValueError("overhead budgets must be finite non-negative percentages")
     output.mkdir(parents=True, exist_ok=False)
+    def run_sample(kind: str, index: int, instrumented: bool) -> dict:
+        directory = output / f"{kind}-{index}-{'instrumented' if instrumented else 'baseline'}"
+        directory.mkdir()
+        env = instrumented_environment(library, directory) if instrumented else None
+        if env is not None:
+            env["RANKLENS_TRACE_EVENTS"] = "1" if mode == "detail" else "0"
+        launch = _forward_macos_openmpi_environment(command, env) if env else command
+        started = time.perf_counter_ns()
+        completed = subprocess.run(
+            launch, env=env, capture_output=True, timeout=timeout, check=False
+        )
+        elapsed = time.perf_counter_ns() - started
+        (directory / "stdout.txt").write_bytes(completed.stdout)
+        (directory / "stderr.txt").write_bytes(completed.stderr)
+        if completed.returncode:
+            raise ValueError(f"benchmark {kind} failed ({completed.returncode}); inspect {directory}")
+        if instrumented:
+            captured = analyze(directory)
+            if not captured.complete:
+                raise ValueError(f"benchmark capture incomplete: {directory}")
+        return {
+            kind: index,
+            "instrumented": instrumented,
+            "elapsed_ns": elapsed,
+            "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
+        }
+
+    warmup_samples = []
+    for warmup in range(warmups):
+        for instrumented in ([False, True] if warmup % 2 == 0 else [True, False]):
+            warmup_samples.append(run_sample("warmup", warmup, instrumented))
+
     trials = []
     for trial in range(repeats):
         for instrumented in ([False, True] if trial % 2 == 0 else [True, False]):
-            directory = output / f"trial-{trial}-{'instrumented' if instrumented else 'baseline'}"
-            directory.mkdir()
-            env = instrumented_environment(library, directory) if instrumented else None
-            if env is not None:
-                env["RANKLENS_TRACE_EVENTS"] = "1" if mode == "detail" else "0"
-            launch = _forward_macos_openmpi_environment(command, env) if env else command
-            started = time.perf_counter_ns()
-            completed = subprocess.run(launch, env=env, capture_output=True, timeout=timeout, check=False)
-            elapsed = time.perf_counter_ns() - started
-            (directory / "stdout.txt").write_bytes(completed.stdout)
-            (directory / "stderr.txt").write_bytes(completed.stderr)
-            if completed.returncode:
-                raise ValueError(f"benchmark trial failed ({completed.returncode}); inspect {directory}")
-            if instrumented:
-                captured = analyze(directory)
-                if not captured.complete:
-                    raise ValueError(f"benchmark capture incomplete: {directory}")
-            trials.append({
-                "trial": trial,
-                "instrumented": instrumented,
-                "elapsed_ns": elapsed,
-                "stdout_sha256": hashlib.sha256(completed.stdout).hexdigest(),
-                "stderr_sha256": hashlib.sha256(completed.stderr).hexdigest(),
-            })
+            trials.append(run_sample("trial", trial, instrumented))
     baseline = statistics.median(t["elapsed_ns"] for t in trials if not t["instrumented"])
     measured = statistics.median(t["elapsed_ns"] for t in trials if t["instrumented"])
     paired_overheads = []
@@ -239,6 +255,8 @@ def benchmark(
     result = {
         "command": list(command),
         "mode": mode,
+        "warmup_pairs": warmups,
+        "warmups": warmup_samples,
         "repeats": repeats,
         "trials": trials,
         "baseline_median_ns": baseline,

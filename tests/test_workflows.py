@@ -118,6 +118,7 @@ class WorkflowTests(unittest.TestCase):
                 Path("libranklens_mpi.so"),
                 self.path / "benchmark",
                 repeats=5,
+                warmups=0,
                 max_median_overhead_percent=25,
                 max_p95_overhead_percent=40,
             )
@@ -167,6 +168,7 @@ class WorkflowTests(unittest.TestCase):
                     Path("libranklens_mpi.so"),
                     self.path / "failed-budget",
                     repeats=2,
+                    warmups=0,
                     mode="detail",
                     max_median_overhead_percent=10,
                 )
@@ -205,6 +207,7 @@ class WorkflowTests(unittest.TestCase):
                     Path("libranklens_mpi.so"),
                     destination,
                     repeats=2,
+                    warmups=0,
                     max_median_overhead_percent=100,
                 )
 
@@ -249,6 +252,7 @@ class WorkflowTests(unittest.TestCase):
                     Path("libranklens_mpi.so"),
                     destination,
                     repeats=5,
+                    warmups=0,
                     max_median_added_time_ms=1.0,
                 )
 
@@ -256,3 +260,49 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(saved["budget"]["conclusive"])
         self.assertFalse(saved["budget"]["passed"])
         self.assertEqual(saved["paired_median_added_time_ns"], 2_000_000)
+
+    def test_benchmark_discards_validated_warmup_pairs(self):
+        class Completed:
+            returncode = 0
+            stdout = b"same\n"
+            stderr = b""
+
+        # The slow warmup pair must not affect the two measured 10% overhead pairs.
+        timings = iter(
+            [
+                0, 1_000, 2_000, 3_500,
+                4_000, 4_100, 5_000, 5_110,
+                6_000, 6_110, 7_000, 7_100,
+            ]
+        )
+        destination = self.path / "warmup-benchmark"
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("ranklens.workflows.subprocess.run", return_value=Completed())
+            )
+            stack.enter_context(
+                patch(
+                    "ranklens.workflows.time.perf_counter_ns",
+                    side_effect=lambda: next(timings),
+                )
+            )
+            analyze_capture = stack.enter_context(
+                patch(
+                    "ranklens.workflows.analyze",
+                    return_value=type("Capture", (), {"complete": True})(),
+                )
+            )
+            result = benchmark(
+                ["solver"],
+                Path("libranklens_mpi.so"),
+                destination,
+                repeats=2,
+                warmups=1,
+            )
+
+        self.assertEqual(result["warmup_pairs"], 1)
+        self.assertEqual(len(result["warmups"]), 2)
+        for overhead in result["paired_overhead_percent"]:
+            self.assertAlmostEqual(overhead, 10.0)
+        self.assertEqual(analyze_capture.call_count, 3)
+        self.assertTrue((destination / "warmup-0-instrumented" / "stdout.txt").exists())
