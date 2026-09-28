@@ -525,7 +525,7 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 revisions[0].report_object_key, revisions[0].report_sha256
             )
         )
-        self.assertEqual(revisions[1].parquet_schema_version, "normalized-record-v1")
+        self.assertEqual(revisions[1].parquet_schema_version, "normalized-record-v2")
         self.assertEqual(revisions[1].parquet_row_count, 2)
         assert revisions[1].parquet_object_key is not None
         assert revisions[1].parquet_sha256 is not None

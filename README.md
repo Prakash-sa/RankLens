@@ -97,7 +97,9 @@ fabric, storage, and cluster-wide infrastructure counters are not yet collected 
 
 For teams building a shared service, the repository also includes an authenticated ingestion API,
 a durable Go node agent, PostgreSQL migrations, a leased worker, a read-only Slurm adapter, and a
-container-based development profile. Start with [the deployment guide](deploy/README.md) and review
+versioned Parquet projection with typed rank-summary and MPI-event columns. The projection also
+retains each canonical source record for forward-compatible analysis. Start with the
+[deployment guide](deploy/README.md) and review
 the [security policy](SECURITY.md) before enabling network ingestion.
 
 ## Useful commands
