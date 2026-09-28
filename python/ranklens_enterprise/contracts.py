@@ -151,6 +151,29 @@ class ReportRevisionView(BaseModel):
     download_available: Literal[False] = False
 
 
+class RankAggregateView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision_id: str
+    revision_number: int
+    attempt_id: str
+    parquet_schema_version: Literal["normalized-record-v2"]
+    source_row_count: int
+    projected_summary_records: int
+    rank_count: int
+    expected_world_size: Optional[int] = None
+    finalized_rank_count: int
+    runtime_min_ns: Optional[int] = None
+    runtime_median_ns: Optional[float] = None
+    runtime_max_ns: Optional[int] = None
+    mpi_time_total_ns: int
+    mpi_calls_total: int
+    request_completions_total: int
+    failed_calls_total: int
+    coverage_status: Literal["complete", "partial"]
+    coverage_reasons: List[str]
+
+
 class AttemptView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -16,6 +16,7 @@ from sqlalchemy import text
 from ranklens import __version__
 
 from .auth import MachineAuthenticator
+from .analytics import RankAggregateError, aggregate_rank_summaries
 from .contracts import (
     AllocationTimelineView,
     AttemptPage,
@@ -23,6 +24,7 @@ from .contracts import (
     DurableReceipt,
     HealthStatus,
     ReceiptView,
+    RankAggregateView,
     ReportRevisionView,
     SchedulerObservationView,
     SegmentUpload,
@@ -41,7 +43,7 @@ from .database import (
 from .ingestion import AdmissionError, IngestionService
 from .scheduler import derive_allocation_timeline
 from .settings import MachinePrincipal, Settings
-from .storage import LocalObjectStore
+from .storage import LocalObjectStore, ObjectIntegrityError
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -323,18 +325,13 @@ def create_app(settings: Settings) -> FastAPI:
                 intervals=[asdict(interval) for interval in timeline.intervals],
             )
 
-    @app.get("/v1/reports/{attempt_id}", response_model=ReportRevisionView)
-    def report_revision(
-        attempt_id: str = Path(
-            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
-        ),
-        cluster_id: str = Query(min_length=1, max_length=128),
-        revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
-    ) -> ReportRevisionView:
-        if cluster_id not in principal.clusters:
-            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
-        identity = (principal.tenant_id, cluster_id, attempt_id)
+    def resolve_report_revision(
+        tenant_id: str,
+        cluster_id: str,
+        attempt_id: str,
+        revision_number: Optional[int],
+    ) -> tuple[ReportRevision, ReportHead]:
+        identity = (tenant_id, cluster_id, attempt_id)
         with sessions() as session:
             generation = session.get(AttemptGeneration, identity)
             head = session.get(ReportHead, identity)
@@ -346,7 +343,7 @@ def create_app(settings: Settings) -> FastAPI:
             ):
                 raise HTTPException(status_code=404, detail={"code": "report_not_found"})
             statement = select(ReportRevision).where(
-                ReportRevision.tenant_id == principal.tenant_id,
+                ReportRevision.tenant_id == tenant_id,
                 ReportRevision.cluster_id == cluster_id,
                 ReportRevision.attempt_id == attempt_id,
                 ReportRevision.deletion_generation == generation.generation,
@@ -358,29 +355,93 @@ def create_app(settings: Settings) -> FastAPI:
             revision = session.scalar(statement)
             if revision is None:
                 raise HTTPException(status_code=404, detail={"code": "report_not_found"})
-            return ReportRevisionView(
-                revision_id=revision.revision_id,
-                tenant_id=revision.tenant_id,
-                cluster_id=revision.cluster_id,
-                attempt_id=revision.attempt_id,
-                deletion_generation=revision.deletion_generation,
-                revision_number=revision.revision_number,
-                input_fingerprint=revision.input_fingerprint,
-                segment_count=revision.segment_count,
-                record_count=revision.record_count,
-                report_sha256=revision.report_sha256,
-                parquet_sha256=revision.parquet_sha256,
-                parquet_schema_version=revision.parquet_schema_version,
-                parquet_row_count=revision.parquet_row_count,
-                parquet_available=bool(
-                    revision.parquet_object_key
-                    and revision.parquet_sha256
-                    and revision.parquet_schema_version
-                ),
-                builder_version=revision.builder_version,
-                created_at=revision.created_at,
-                current=revision.revision_id == head.revision_id,
+            return revision, head
+
+    @app.get("/v1/reports/{attempt_id}", response_model=ReportRevisionView)
+    def report_revision(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> ReportRevisionView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        revision, head = resolve_report_revision(
+            principal.tenant_id, cluster_id, attempt_id, revision_number
+        )
+        return ReportRevisionView(
+            revision_id=revision.revision_id,
+            tenant_id=revision.tenant_id,
+            cluster_id=revision.cluster_id,
+            attempt_id=revision.attempt_id,
+            deletion_generation=revision.deletion_generation,
+            revision_number=revision.revision_number,
+            input_fingerprint=revision.input_fingerprint,
+            segment_count=revision.segment_count,
+            record_count=revision.record_count,
+            report_sha256=revision.report_sha256,
+            parquet_sha256=revision.parquet_sha256,
+            parquet_schema_version=revision.parquet_schema_version,
+            parquet_row_count=revision.parquet_row_count,
+            parquet_available=bool(
+                revision.parquet_object_key
+                and revision.parquet_sha256
+                and revision.parquet_schema_version
+            ),
+            builder_version=revision.builder_version,
+            created_at=revision.created_at,
+            current=revision.revision_id == head.revision_id,
+        )
+
+    @app.get(
+        "/v1/reports/{attempt_id}/rank-aggregates",
+        response_model=RankAggregateView,
+    )
+    def report_rank_aggregates(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
+        principal: MachinePrincipal = Depends(authenticator.authenticate),
+    ) -> RankAggregateView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        revision, _ = resolve_report_revision(
+            principal.tenant_id, cluster_id, attempt_id, revision_number
+        )
+        if (
+            revision.parquet_schema_version != "normalized-record-v2"
+            or not revision.parquet_object_key
+            or not revision.parquet_sha256
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "rank_projection_unavailable"},
             )
+        try:
+            payload = objects.read_verified(
+                revision.parquet_object_key, revision.parquet_sha256
+            )
+            aggregate = aggregate_rank_summaries(payload)
+        except ObjectIntegrityError as exc:
+            raise HTTPException(
+                status_code=503, detail={"code": "report_artifact_unavailable"}
+            ) from exc
+        except RankAggregateError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "rank_query_rejected", "message": str(exc)},
+            ) from exc
+        return RankAggregateView(
+            revision_id=revision.revision_id,
+            revision_number=revision.revision_number,
+            attempt_id=revision.attempt_id,
+            parquet_schema_version="normalized-record-v2",
+            **asdict(aggregate),
+        )
 
     return app
 

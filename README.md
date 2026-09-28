@@ -98,7 +98,9 @@ fabric, storage, and cluster-wide infrastructure counters are not yet collected 
 For teams building a shared service, the repository also includes an authenticated ingestion API,
 a durable Go node agent, PostgreSQL migrations, a leased worker, a read-only Slurm adapter, and a
 versioned Parquet projection with typed rank-summary and MPI-event columns. The projection also
-retains each canonical source record for forward-compatible analysis. Start with the
+retains each canonical source record for forward-compatible analysis. An authenticated report API
+can calculate coverage-aware rank totals and runtime ranges from projections of up to 100,000
+source rows; larger studies are rejected instead of creating an unbounded service query. Start with the
 [deployment guide](deploy/README.md) and review
 the [security policy](SECURITY.md) before enabling network ingestion.
 

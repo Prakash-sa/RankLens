@@ -20,18 +20,21 @@ from ranklens_enterprise.database import (
     build_session_factory,
     initialize_schema,
 )
+from ranklens_enterprise.parquet import ParquetSegment, build_normalized_parquet
 from ranklens_enterprise.settings import MachinePrincipal, Settings
+from ranklens_enterprise.storage import LocalObjectStore
 
 
 class EnterpriseApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.object_root = root / "objects"
         self.database_url = f"sqlite:///{root / 'catalog.sqlite3'}"
         self.token = "test-token-with-at-least-24-characters"
         settings = Settings(
             database_url=self.database_url,
-            object_root=root / "objects",
+            object_root=self.object_root,
             machine_tokens={
                 self.token: MachinePrincipal("tenant-a", frozenset({"cluster-a"}))
             },
@@ -325,6 +328,102 @@ class EnterpriseApiTests(unittest.TestCase):
             headers=headers,
         )
         self.assertEqual(deleted.status_code, 404)
+
+    def test_rank_aggregates_are_bounded_to_an_authorized_report(self) -> None:
+        payload = (
+            b'{"schema_version":2,"rank":0,"hostname":"node-a","world_size":2,'
+            b'"runtime_ns":100,"mpi_time_ns":20,"mpi_calls":4,'
+            b'"request_completions":1,"failed_calls":0,"complete":true,'
+            b'"capture_state":"finalized"}\n'
+            b'{"schema_version":2,"rank":1,"hostname":"node-b","world_size":2,'
+            b'"runtime_ns":120,"mpi_time_ns":40,"mpi_calls":6,'
+            b'"request_completions":2,"failed_calls":1,"complete":true,'
+            b'"capture_state":"finalized"}\n'
+        )
+        artifact = build_normalized_parquet(
+            tenant_id="tenant-a",
+            cluster_id="cluster-a",
+            attempt_id="attempt-ranks",
+            segments=[
+                ParquetSegment(
+                    receipt_id="receipt-ranks",
+                    payload_sha256="a" * 64,
+                    expected_records=2,
+                    payload=payload,
+                )
+            ],
+        )
+        parquet_digest = hashlib.sha256(artifact.payload).hexdigest()
+        object_key = "reports/test/ranks.parquet"
+        LocalObjectStore(self.object_root).put_verified(
+            object_key, artifact.payload, parquet_digest
+        )
+        now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions.begin() as session:
+            session.add(
+                AttemptGeneration(
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-ranks",
+                    generation=0,
+                    deleted_at=None,
+                )
+            )
+            session.add(
+                ReportRevision(
+                    revision_id="revision-ranks",
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-ranks",
+                    deletion_generation=0,
+                    revision_number=1,
+                    input_fingerprint="4" * 64,
+                    segment_count=1,
+                    record_count=2,
+                    report_object_key="reports/test/ranks.json",
+                    report_sha256="5" * 64,
+                    parquet_object_key=object_key,
+                    parquet_sha256=parquet_digest,
+                    parquet_schema_version="normalized-record-v2",
+                    parquet_row_count=2,
+                    builder_version="attempt-manifest-v1",
+                    created_at=now,
+                )
+            )
+            session.add(
+                ReportHead(
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-ranks",
+                    deletion_generation=0,
+                    revision_number=1,
+                    revision_id="revision-ranks",
+                    input_fingerprint="4" * 64,
+                    updated_at=now,
+                )
+            )
+        engine.dispose()
+        headers = {"authorization": f"Bearer {self.token}"}
+
+        allowed = self.client.get(
+            "/v1/reports/attempt-ranks/rank-aggregates",
+            params={"cluster_id": "cluster-a"},
+            headers=headers,
+        )
+        denied = self.client.get(
+            "/v1/reports/attempt-ranks/rank-aggregates",
+            params={"cluster_id": "cluster-b"},
+            headers=headers,
+        )
+
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.json()["rank_count"], 2)
+        self.assertEqual(allowed.json()["runtime_median_ns"], 110)
+        self.assertEqual(allowed.json()["mpi_calls_total"], 10)
+        self.assertEqual(allowed.json()["coverage_status"], "complete")
+        self.assertEqual(denied.status_code, 404)
 
 
 if __name__ == "__main__":
