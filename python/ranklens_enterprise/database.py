@@ -28,6 +28,32 @@ class AttemptGeneration(Base):
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AttemptDeletion(Base):
+    """Durable, generation-fenced physical erasure request and audit result."""
+
+    __tablename__ = "attempt_deletions"
+    __table_args__ = (
+        Index("ix_attempt_deletion_pending", "state", "requested_at"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    deletion_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_segment_objects: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retained_shared_objects: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deleted_report_objects: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deleted_catalog_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class AttemptRecord(Base):
     """Durable telemetry identity with independently reconciled scheduler state."""
 

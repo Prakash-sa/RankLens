@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .contracts import DurableReceipt, ReceiptView, SegmentUpload
 from .database import (
     AdmissionReservation,
+    AttemptDeletion,
     AttemptGeneration,
     AttemptRecord,
     OutboxRecord,
@@ -426,4 +427,37 @@ class IngestionService:
             elif state.deleted_at is None:
                 state.generation += 1
                 state.deleted_at = utc_now()
+            deletion = session.get(
+                AttemptDeletion, (tenant_id, cluster_id, attempt_id)
+            )
+            if deletion is None:
+                session.add(
+                    AttemptDeletion(
+                        tenant_id=tenant_id,
+                        cluster_id=cluster_id,
+                        attempt_id=attempt_id,
+                        deletion_generation=state.generation,
+                        state="pending",
+                        attempts=0,
+                        lease_owner=None,
+                        lease_generation=0,
+                        lease_expires_at=None,
+                        deleted_segment_objects=0,
+                        retained_shared_objects=0,
+                        deleted_report_objects=0,
+                        deleted_catalog_rows=0,
+                        last_error=None,
+                        requested_at=state.deleted_at,
+                        completed_at=None,
+                    )
+                )
+            elif deletion.deletion_generation != state.generation:
+                deletion.deletion_generation = state.generation
+                deletion.state = "pending"
+                deletion.attempts = 0
+                deletion.lease_owner = None
+                deletion.lease_expires_at = None
+                deletion.last_error = None
+                deletion.requested_at = state.deleted_at
+                deletion.completed_at = None
             return state.generation

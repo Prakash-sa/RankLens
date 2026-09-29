@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from ranklens_enterprise.contracts import SegmentUpload
 from ranklens_enterprise.database import (
     AdmissionReservation,
+    AttemptDeletion,
     AttemptRecord,
     NormalizedSegment,
     ObjectGcCandidate,
@@ -424,12 +425,25 @@ class EnterpriseIngestionTests(unittest.TestCase):
     def test_deletion_fences_late_segments(self) -> None:
         self.service.admit(self.principal, self.segment())
         generation = self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+        replayed_generation = self.service.delete_attempt(
+            "tenant-a", "cluster-a", "attempt-1"
+        )
 
         with self.assertRaises(AdmissionConflict) as raised:
             self.service.admit(self.principal, self.segment(first=1, last=1))
 
         self.assertEqual(generation, 1)
+        self.assertEqual(replayed_generation, 1)
         self.assertEqual(raised.exception.code, "attempt_deleted")
+        with self.sessions() as session:
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            self.assertIsNotNone(deletion)
+            assert deletion is not None
+            self.assertEqual(deletion.deletion_generation, 1)
+            self.assertEqual(deletion.state, "pending")
+            self.assertEqual(deletion.attempts, 0)
 
     def test_receipt_lookup_is_tenant_scoped(self) -> None:
         receipt = self.service.admit(self.principal, self.segment())
