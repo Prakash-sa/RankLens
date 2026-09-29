@@ -31,6 +31,7 @@ from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
 from ranklens_enterprise.storage import ObjectIntegrityError
 from ranklens_enterprise.worker import (
+    AttemptDeletionWorker,
     ObjectGcWorker,
     OutboxWorker,
     ReportRevisionWorker,
@@ -576,6 +577,107 @@ class EnterpriseIngestionTests(unittest.TestCase):
             report_outbox = session.get(OutboxRecord, lease.outbox_id)
             assert report_outbox is not None
             self.assertEqual(report_outbox.state, "suppressed")
+
+    def test_attempt_deletion_worker_erases_catalog_and_objects(self) -> None:
+        receipt = self.service.admit(
+            self.principal,
+            self.segment(scheduler_source_identity="slurm:cluster-a:derived:delete-me"),
+        )
+        normalizer = OutboxWorker(self.sessions, self.objects, owner="normalizer-a")
+        reporter = ReportRevisionWorker(self.sessions, self.objects, owner="reporter-a")
+        self.assertTrue(normalizer.run_once())
+        self.assertTrue(reporter.run_once())
+        with self.sessions() as session:
+            revision = session.scalar(select(ReportRevision))
+            assert revision is not None
+            report_key = revision.report_object_key
+            report_digest = revision.report_sha256
+            assert revision.parquet_object_key is not None
+            assert revision.parquet_sha256 is not None
+            parquet_key = revision.parquet_object_key
+            parquet_digest = revision.parquet_sha256
+
+        self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+        deletions = AttemptDeletionWorker(
+            self.sessions, self.objects, owner="deletion-a"
+        )
+        self.assertTrue(deletions.run_once())
+        self.assertFalse(deletions.run_once())
+
+        self.assertFalse(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
+        self.assertFalse(self.objects.exists_verified(report_key, report_digest))
+        self.assertFalse(self.objects.exists_verified(parquet_key, parquet_digest))
+        with self.sessions() as session:
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert deletion is not None
+            self.assertEqual(deletion.state, "completed")
+            self.assertEqual(deletion.deleted_segment_objects, 1)
+            self.assertEqual(deletion.deleted_report_objects, 2)
+            for model in (
+                AdmissionReservation,
+                AttemptRecord,
+                NormalizedSegment,
+                OutboxRecord,
+                ReportHead,
+                ReportRevision,
+                SegmentManifest,
+            ):
+                self.assertEqual(session.scalar(select(func.count()).select_from(model)), 0)
+
+    def test_attempt_deletion_retains_a_segment_shared_by_another_attempt(self) -> None:
+        first = self.service.admit(self.principal, self.segment())
+        second_segment = self.segment(attempt_id="attempt-2").model_copy(
+            update={"producer_id": "node-agent-2"}
+        )
+        self.service.admit(self.principal, second_segment)
+        self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+
+        worker = AttemptDeletionWorker(self.sessions, self.objects, owner="deletion-a")
+        self.assertTrue(worker.run_once())
+
+        self.assertTrue(self.objects.exists_verified(first.object_key, first.payload_sha256))
+        with self.sessions() as session:
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert deletion is not None
+            self.assertEqual(deletion.retained_shared_objects, 1)
+            remaining = list(session.scalars(select(SegmentManifest)))
+            self.assertEqual([item.attempt_id for item in remaining], ["attempt-2"])
+
+    def test_attempt_deletion_retries_object_provider_failure(self) -> None:
+        receipt = self.service.admit(self.principal, self.segment())
+        self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+
+        class FailOnceStore:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.failed = False
+
+            def delete_verified(self, object_key: str, sha256: str) -> bool:
+                if not self.failed:
+                    self.failed = True
+                    raise ObjectIntegrityError("temporary provider failure")
+                return self.delegate.delete_verified(object_key, sha256)
+
+        worker = AttemptDeletionWorker(
+            self.sessions, FailOnceStore(self.objects), owner="deletion-a"
+        )
+        self.assertFalse(worker.run_once())
+        with self.sessions() as session:
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert deletion is not None
+            self.assertEqual(deletion.state, "pending")
+            self.assertEqual(deletion.attempts, 1)
+            self.assertIn("temporary provider failure", deletion.last_error or "")
+        self.assertTrue(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
+
+        self.assertTrue(worker.run_once())
+        self.assertFalse(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
 
 
 if __name__ == "__main__":

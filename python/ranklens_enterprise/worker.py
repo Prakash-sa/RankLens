@@ -11,17 +11,20 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .database import (
     AdmissionReservation,
+    AttemptDeletion,
     AttemptGeneration,
+    AttemptRecord,
     NormalizedSegment,
     ObjectGcCandidate,
     OutboxRecord,
     ReportHead,
     ReportRevision,
+    SchedulerObservation,
     SegmentManifest,
     lock_stream,
     utc_now,
@@ -35,6 +38,306 @@ class WorkLease:
     outbox_id: str
     generation: int
     owner: str
+
+
+@dataclass(frozen=True)
+class DeletionLease:
+    tenant_id: str
+    cluster_id: str
+    attempt_id: str
+    deletion_generation: int
+    lease_generation: int
+    owner: str
+
+
+class AttemptDeletionWorker:
+    """Physically erase one fenced attempt while retaining its minimal tombstone."""
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        objects: ImmutableObjectStore,
+        *,
+        owner: Optional[str] = None,
+        lease_seconds: int = 60,
+    ):
+        self._sessions = sessions
+        self._objects = objects
+        self._owner = owner or f"deletion-worker-{uuid.uuid4()}"
+        self._lease_seconds = lease_seconds
+
+    def claim(self) -> Optional[DeletionLease]:
+        now = utc_now()
+        with self._sessions.begin() as session:
+            query = (
+                select(AttemptDeletion)
+                .where(
+                    (AttemptDeletion.state == "pending")
+                    | (
+                        (AttemptDeletion.state == "processing")
+                        & (AttemptDeletion.lease_expires_at < now)
+                    )
+                )
+                .order_by(AttemptDeletion.requested_at)
+                .limit(1)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            request = session.scalar(query)
+            if request is None:
+                return None
+            request.state = "processing"
+            request.attempts += 1
+            request.lease_owner = self._owner
+            request.lease_generation += 1
+            request.lease_expires_at = now + timedelta(seconds=self._lease_seconds)
+            request.last_error = None
+            return DeletionLease(
+                tenant_id=request.tenant_id,
+                cluster_id=request.cluster_id,
+                attempt_id=request.attempt_id,
+                deletion_generation=request.deletion_generation,
+                lease_generation=request.lease_generation,
+                owner=self._owner,
+            )
+
+    @staticmethod
+    def _matches(lease: DeletionLease, request: AttemptDeletion) -> bool:
+        return (
+            request.state == "processing"
+            and request.lease_owner == lease.owner
+            and request.lease_generation == lease.lease_generation
+            and request.deletion_generation == lease.deletion_generation
+        )
+
+    @staticmethod
+    def _deleted_rows(result) -> int:
+        return max(result.rowcount or 0, 0)
+
+    def execute(self, lease: DeletionLease) -> bool:
+        identity = (lease.tenant_id, lease.cluster_id, lease.attempt_id)
+        try:
+            with self._sessions.begin() as session:
+                request = session.get(AttemptDeletion, identity)
+                if request is None or not self._matches(lease, request):
+                    return False
+                lock_stream(
+                    session,
+                    f"attempt:{lease.tenant_id}:{lease.cluster_id}:{lease.attempt_id}",
+                )
+                generation = session.get(AttemptGeneration, identity)
+                if (
+                    generation is None
+                    or generation.deleted_at is None
+                    or generation.generation != lease.deletion_generation
+                ):
+                    raise ValueError("attempt deletion generation is no longer current")
+
+                manifests = list(
+                    session.scalars(
+                        select(SegmentManifest).where(
+                            SegmentManifest.tenant_id == lease.tenant_id,
+                            SegmentManifest.cluster_id == lease.cluster_id,
+                            SegmentManifest.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                revisions = list(
+                    session.scalars(
+                        select(ReportRevision).where(
+                            ReportRevision.tenant_id == lease.tenant_id,
+                            ReportRevision.cluster_id == lease.cluster_id,
+                            ReportRevision.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                attempt = session.get(AttemptRecord, identity)
+                receipt_ids = [manifest.receipt_id for manifest in manifests]
+                segment_objects = {
+                    manifest.object_key: manifest.payload_sha256 for manifest in manifests
+                }
+                shared_objects = set()
+                if segment_objects:
+                    keys = list(segment_objects)
+                    for key in sorted(keys):
+                        lock_stream(session, f"object:{key}")
+                    manifest_references = session.execute(
+                        select(
+                            SegmentManifest.object_key,
+                            SegmentManifest.tenant_id,
+                            SegmentManifest.cluster_id,
+                            SegmentManifest.attempt_id,
+                        ).where(SegmentManifest.object_key.in_(keys))
+                    ).all()
+                    reservation_references = session.execute(
+                        select(
+                            AdmissionReservation.object_key,
+                            AdmissionReservation.tenant_id,
+                            AdmissionReservation.cluster_id,
+                            AdmissionReservation.attempt_id,
+                        ).where(
+                            AdmissionReservation.object_key.in_(keys),
+                            AdmissionReservation.state.in_(("reserved", "committed")),
+                        )
+                    ).all()
+                    for key, tenant_id, cluster_id, attempt_id in (
+                        manifest_references + reservation_references
+                    ):
+                        if (tenant_id, cluster_id, attempt_id) != identity:
+                            shared_objects.add(key)
+
+                report_objects = {}
+                for revision in revisions:
+                    report_objects[revision.report_object_key] = revision.report_sha256
+                    if revision.parquet_object_key and revision.parquet_sha256:
+                        report_objects[revision.parquet_object_key] = revision.parquet_sha256
+                for key in sorted(report_objects):
+                    lock_stream(session, f"object:{key}")
+
+                deletable_segments = {
+                    key: digest for key, digest in segment_objects.items()
+                    if key not in shared_objects
+                }
+                for key, digest in sorted(
+                    {**deletable_segments, **report_objects}.items()
+                ):
+                    self._objects.delete_verified(key, digest)
+
+                deleted_rows = 0
+                if receipt_ids:
+                    deleted_rows += self._deleted_rows(
+                        session.execute(
+                            delete(OutboxRecord).where(
+                                OutboxRecord.event_type == "segment.admitted",
+                                OutboxRecord.aggregate_id.in_(receipt_ids),
+                            )
+                        )
+                    )
+                    deleted_rows += self._deleted_rows(
+                        session.execute(
+                            delete(NormalizedSegment).where(
+                                NormalizedSegment.receipt_id.in_(receipt_ids)
+                            )
+                        )
+                    )
+
+                report_requests = list(
+                    session.scalars(
+                        select(OutboxRecord).where(
+                            OutboxRecord.tenant_id == lease.tenant_id,
+                            OutboxRecord.event_type == "attempt.report.requested",
+                            OutboxRecord.aggregate_id == lease.attempt_id,
+                        )
+                    )
+                )
+                for record in report_requests:
+                    try:
+                        payload = json.loads(record.payload_json)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("cluster_id") == lease.cluster_id
+                    ):
+                        session.delete(record)
+                        deleted_rows += 1
+
+                deleted_rows += self._deleted_rows(
+                    session.execute(
+                        delete(ReportRevision).where(
+                            ReportRevision.tenant_id == lease.tenant_id,
+                            ReportRevision.cluster_id == lease.cluster_id,
+                            ReportRevision.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                deleted_rows += self._deleted_rows(
+                    session.execute(
+                        delete(ReportHead).where(
+                            ReportHead.tenant_id == lease.tenant_id,
+                            ReportHead.cluster_id == lease.cluster_id,
+                            ReportHead.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                deleted_rows += self._deleted_rows(
+                    session.execute(
+                        delete(SegmentManifest).where(
+                            SegmentManifest.tenant_id == lease.tenant_id,
+                            SegmentManifest.cluster_id == lease.cluster_id,
+                            SegmentManifest.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                deleted_rows += self._deleted_rows(
+                    session.execute(
+                        delete(AdmissionReservation).where(
+                            AdmissionReservation.tenant_id == lease.tenant_id,
+                            AdmissionReservation.cluster_id == lease.cluster_id,
+                            AdmissionReservation.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                if attempt is not None and attempt.scheduler_source_identity:
+                    deleted_rows += self._deleted_rows(
+                        session.execute(
+                            delete(SchedulerObservation).where(
+                                SchedulerObservation.tenant_id == lease.tenant_id,
+                                SchedulerObservation.cluster_id == lease.cluster_id,
+                                SchedulerObservation.source_identity
+                                == attempt.scheduler_source_identity,
+                            )
+                        )
+                    )
+                deleted_rows += self._deleted_rows(
+                    session.execute(
+                        delete(AttemptRecord).where(
+                            AttemptRecord.tenant_id == lease.tenant_id,
+                            AttemptRecord.cluster_id == lease.cluster_id,
+                            AttemptRecord.attempt_id == lease.attempt_id,
+                        )
+                    )
+                )
+                deleted_object_keys = [*deletable_segments, *report_objects]
+                if deleted_object_keys:
+                    deleted_rows += self._deleted_rows(
+                        session.execute(
+                            delete(ObjectGcCandidate).where(
+                                ObjectGcCandidate.object_key.in_(deleted_object_keys)
+                            )
+                        )
+                    )
+
+                request.state = "completed"
+                request.lease_owner = None
+                request.lease_expires_at = None
+                request.deleted_segment_objects = len(deletable_segments)
+                request.retained_shared_objects = len(shared_objects)
+                request.deleted_report_objects = len(report_objects)
+                request.deleted_catalog_rows = deleted_rows
+                request.last_error = None
+                request.completed_at = utc_now()
+                return True
+        except (ObjectIntegrityError, ValueError) as exc:
+            self.fail(lease, str(exc))
+            return False
+
+    def fail(self, lease: DeletionLease, message: str) -> None:
+        identity = (lease.tenant_id, lease.cluster_id, lease.attempt_id)
+        with self._sessions.begin() as session:
+            request = session.get(AttemptDeletion, identity)
+            if request is None or not self._matches(lease, request):
+                return
+            request.state = "failed" if request.attempts >= 5 else "pending"
+            request.lease_owner = None
+            request.lease_expires_at = None
+            request.last_error = message[:512]
+
+    def run_once(self) -> bool:
+        lease = self.claim()
+        if lease is None:
+            return False
+        return self.execute(lease)
 
 
 class ReservationSweeper:
@@ -750,6 +1053,7 @@ def main() -> int:
         assert_schema_ready(engine)
     sessions = build_session_factory(engine)
     objects = LocalObjectStore(settings.object_root)
+    deletion_worker = AttemptDeletionWorker(sessions, objects)
     worker = OutboxWorker(sessions, objects)
     report_worker = ReportRevisionWorker(sessions, objects)
     reservation_sweeper = ReservationSweeper(
@@ -770,7 +1074,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     try:
         while not stopping:
-            worked = worker.run_once()
+            worked = deletion_worker.run_once()
+            worked = worker.run_once() or worked
             worked = report_worker.run_once() or worked
             monotonic_now = time.monotonic()
             if monotonic_now >= next_reservation_sweep:

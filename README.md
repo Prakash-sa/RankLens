@@ -104,6 +104,10 @@ source rows; larger studies are rejected instead of creating an unbounded servic
 [deployment guide](deploy/README.md) and review
 the [security policy](SECURITY.md) before enabling network ingestion.
 
+Attempt deletion is generation-fenced before a leased background worker removes its telemetry,
+report artifacts, and catalog rows. Shared content-addressed segments are retained while another
+attempt still references them, and a minimal deletion audit record remains for safe retries.
+
 ## Useful commands
 
 ```bash
