@@ -450,7 +450,19 @@ class ObjectGcWorker:
                 )
                 .limit(1)
             )
-            if manifest_reference is not None or reservation_reference is not None:
+            report_reference = session.scalar(
+                select(ReportRevision.revision_id)
+                .where(
+                    (ReportRevision.report_object_key == candidate.object_key)
+                    | (ReportRevision.parquet_object_key == candidate.object_key)
+                )
+                .limit(1)
+            )
+            if (
+                manifest_reference is not None
+                or reservation_reference is not None
+                or report_reference is not None
+            ):
                 candidate.state = "protected"
                 candidate.completed_at = now
                 candidate.last_error = None

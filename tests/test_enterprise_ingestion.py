@@ -560,6 +560,42 @@ class EnterpriseIngestionTests(unittest.TestCase):
         self.assertIn(second_receipt.receipt_id.encode("ascii"), report)
         self.assertIn(revisions[1].parquet_sha256.encode("ascii"), report)
 
+    def test_orphan_gc_preserves_published_report_artifacts(self) -> None:
+        self.service.admit(self.principal, self.segment())
+        self.assertTrue(OutboxWorker(self.sessions, self.objects).run_once())
+        self.assertTrue(ReportRevisionWorker(self.sessions, self.objects).run_once())
+        now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+
+        with self.sessions.begin() as session:
+            revision = session.scalar(select(ReportRevision))
+            assert revision is not None
+            assert revision.parquet_object_key is not None
+            assert revision.parquet_sha256 is not None
+            artifacts = (
+                (revision.report_object_key, revision.report_sha256),
+                (revision.parquet_object_key, revision.parquet_sha256),
+            )
+            for index, (object_key, digest) in enumerate(artifacts, start=41):
+                session.add(
+                    ObjectGcCandidate(
+                        candidate_id=f"00000000-0000-0000-0000-{index:012d}",
+                        object_key=object_key,
+                        payload_sha256=digest,
+                        state="pending",
+                        not_before=now,
+                        attempts=0,
+                        last_error=None,
+                        created_at=now,
+                        completed_at=None,
+                    )
+                )
+
+        gc = ObjectGcWorker(self.sessions, self.objects, clock=lambda: now)
+        self.assertEqual(gc.run_once(), "protected")
+        self.assertEqual(gc.run_once(), "protected")
+        for object_key, digest in artifacts:
+            self.assertTrue(self.objects.exists_verified(object_key, digest))
+
     def test_attempt_deletion_suppresses_report_head_publication(self) -> None:
         self.service.admit(self.principal, self.segment())
         normalizer = OutboxWorker(self.sessions, self.objects, owner="normalizer-a")
