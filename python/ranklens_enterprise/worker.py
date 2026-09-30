@@ -997,6 +997,10 @@ class ReportRevisionWorker:
                     or record.lease_generation != lease.generation
                 ):
                     return False
+                # Serialize generation validation and publication with admission/deletion.
+                # A deletion that wins this lock is observed below; one that loses it
+                # must discover and erase this revision before completing.
+                lock_stream(session, f"attempt:{tenant_id}:{cluster_id}:{attempt_id}")
                 lock_stream(session, f"report:{tenant_id}:{cluster_id}:{attempt_id}")
                 generation_state = session.get(
                     AttemptGeneration, (tenant_id, cluster_id, attempt_id)
