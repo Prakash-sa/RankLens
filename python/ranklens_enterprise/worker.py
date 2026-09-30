@@ -691,7 +691,10 @@ class ReportRevisionWorker:
         max_segments: int = 10_000,
         max_records: int = 10_000_000,
         max_input_bytes: int = 64 * 1024 * 1024,
+        orphan_gc_grace_seconds: int = 3600,
     ):
+        if not 300 <= orphan_gc_grace_seconds <= 604800:
+            raise ValueError("orphan_gc_grace_seconds must be within [300, 604800]")
         self._sessions = sessions
         self._objects = objects
         self._owner = owner or f"report-worker-{uuid.uuid4()}"
@@ -699,6 +702,7 @@ class ReportRevisionWorker:
         self._max_segments = max_segments
         self._max_records = max_records
         self._max_input_bytes = max_input_bytes
+        self._orphan_gc_grace_seconds = orphan_gc_grace_seconds
 
     def claim(self) -> Optional[WorkLease]:
         now = utc_now()
@@ -855,6 +859,67 @@ class ReportRevisionWorker:
         )
         return f"reports/v1/{scope}/{digest}.{suffix}"
 
+    @staticmethod
+    def _ensure_artifact_candidate(
+        session: Session,
+        object_key: str,
+        digest: str,
+        now,
+        not_before,
+    ) -> ObjectGcCandidate:
+        candidate = session.scalar(
+            select(ObjectGcCandidate).where(ObjectGcCandidate.object_key == object_key)
+        )
+        if candidate is None:
+            candidate = ObjectGcCandidate(
+                candidate_id=str(uuid.uuid4()),
+                object_key=object_key,
+                payload_sha256=digest,
+                state="pending",
+                not_before=not_before,
+                attempts=0,
+                last_error=None,
+                created_at=now,
+                completed_at=None,
+            )
+            session.add(candidate)
+            return candidate
+        if candidate.payload_sha256 != digest:
+            raise ValueError("artifact garbage-collection digest does not match")
+        if candidate.state in ("deleted", "missing", "failed"):
+            candidate.state = "pending"
+            candidate.not_before = not_before
+            candidate.attempts = 0
+            candidate.last_error = None
+            candidate.completed_at = None
+        return candidate
+
+    def _reserve_artifacts(self, artifacts: dict[str, str]) -> None:
+        now = utc_now()
+        not_before = now + timedelta(seconds=self._orphan_gc_grace_seconds)
+        with self._sessions.begin() as session:
+            for object_key, digest in sorted(artifacts.items()):
+                lock_stream(session, f"object:{object_key}")
+                self._ensure_artifact_candidate(
+                    session, object_key, digest, now, not_before
+                )
+
+    @staticmethod
+    def _protect_artifacts(
+        session: Session, artifacts: dict[str, str], now
+    ) -> None:
+        for object_key, digest in artifacts.items():
+            candidate = session.scalar(
+                select(ObjectGcCandidate).where(
+                    ObjectGcCandidate.object_key == object_key
+                )
+            )
+            if candidate is None or candidate.payload_sha256 != digest:
+                raise ValueError("artifact garbage-collection reservation is missing")
+            candidate.state = "protected"
+            candidate.last_error = None
+            candidate.completed_at = now
+
     def execute(self, lease: WorkLease) -> bool:
         try:
             with self._sessions() as session:
@@ -902,7 +967,6 @@ class ReportRevisionWorker:
             parquet_key = self._object_key(
                 tenant_id, cluster_id, attempt_id, parquet_digest, "parquet"
             )
-            self._objects.put_verified(parquet_key, parquet.payload, parquet_digest)
             payload = self._report_payload(
                 tenant_id,
                 cluster_id,
@@ -918,7 +982,11 @@ class ReportRevisionWorker:
             object_key = self._object_key(
                 tenant_id, cluster_id, attempt_id, report_digest, "json"
             )
-            self._objects.put_verified(object_key, payload, report_digest)
+            artifacts = {
+                object_key: report_digest,
+                parquet_key: parquet_digest,
+            }
+            self._reserve_artifacts(artifacts)
 
             with self._sessions.begin() as session:
                 record = session.get(OutboxRecord, lease.outbox_id)
@@ -953,6 +1021,16 @@ class ReportRevisionWorker:
                     record.last_error = "normalized inputs changed during report build"
                     return False
 
+                now = utc_now()
+                not_before = now + timedelta(seconds=self._orphan_gc_grace_seconds)
+                for artifact_key, digest in sorted(artifacts.items()):
+                    lock_stream(session, f"object:{artifact_key}")
+                    self._ensure_artifact_candidate(
+                        session, artifact_key, digest, now, not_before
+                    )
+                self._objects.put_verified(parquet_key, parquet.payload, parquet_digest)
+                self._objects.put_verified(object_key, payload, report_digest)
+
                 head_key = (tenant_id, cluster_id, attempt_id)
                 head = session.get(ReportHead, head_key)
                 if (
@@ -964,6 +1042,7 @@ class ReportRevisionWorker:
                     record.lease_owner = None
                     record.lease_expires_at = None
                     record.last_error = None
+                    self._protect_artifacts(session, artifacts, now)
                     return True
 
                 existing = session.scalar(
@@ -975,7 +1054,6 @@ class ReportRevisionWorker:
                         ReportRevision.input_fingerprint == fingerprint,
                     )
                 )
-                now = utc_now()
                 if existing is None:
                     revision_number = (
                         head.revision_number + 1
@@ -1003,6 +1081,13 @@ class ReportRevisionWorker:
                     )
                     session.add(existing)
                     session.flush()
+                elif (
+                    existing.report_object_key != object_key
+                    or existing.report_sha256 != report_digest
+                    or existing.parquet_object_key != parquet_key
+                    or existing.parquet_sha256 != parquet_digest
+                ):
+                    raise ValueError("existing report revision artifacts differ")
                 if head is None:
                     head = ReportHead(
                         tenant_id=tenant_id,
@@ -1025,6 +1110,7 @@ class ReportRevisionWorker:
                 record.lease_owner = None
                 record.lease_expires_at = None
                 record.last_error = None
+                self._protect_artifacts(session, artifacts, now)
                 return True
         except (ObjectIntegrityError, json.JSONDecodeError, ValueError) as exc:
             self.fail(lease, str(exc))
@@ -1067,7 +1153,11 @@ def main() -> int:
     objects = LocalObjectStore(settings.object_root)
     deletion_worker = AttemptDeletionWorker(sessions, objects)
     worker = OutboxWorker(sessions, objects)
-    report_worker = ReportRevisionWorker(sessions, objects)
+    report_worker = ReportRevisionWorker(
+        sessions,
+        objects,
+        orphan_gc_grace_seconds=settings.object_gc_grace_seconds,
+    )
     reservation_sweeper = ReservationSweeper(
         sessions,
         ttl_seconds=settings.reservation_ttl_seconds,

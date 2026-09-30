@@ -575,26 +575,76 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 (revision.report_object_key, revision.report_sha256),
                 (revision.parquet_object_key, revision.parquet_sha256),
             )
-            for index, (object_key, digest) in enumerate(artifacts, start=41):
-                session.add(
-                    ObjectGcCandidate(
-                        candidate_id=f"00000000-0000-0000-0000-{index:012d}",
-                        object_key=object_key,
-                        payload_sha256=digest,
-                        state="pending",
-                        not_before=now,
-                        attempts=0,
-                        last_error=None,
-                        created_at=now,
-                        completed_at=None,
-                    )
-                )
+            candidates = list(session.scalars(select(ObjectGcCandidate)))
+            self.assertEqual(len(candidates), 2)
+            self.assertEqual({candidate.state for candidate in candidates}, {"protected"})
+            for candidate in candidates:
+                candidate.state = "pending"
+                candidate.not_before = now
+                candidate.completed_at = None
 
         gc = ObjectGcWorker(self.sessions, self.objects, clock=lambda: now)
         self.assertEqual(gc.run_once(), "protected")
         self.assertEqual(gc.run_once(), "protected")
         for object_key, digest in artifacts:
             self.assertTrue(self.objects.exists_verified(object_key, digest))
+
+    def test_failed_report_publication_leaves_reclaimable_artifact_reservations(self) -> None:
+        self.service.admit(self.principal, self.segment())
+        self.assertTrue(OutboxWorker(self.sessions, self.objects).run_once())
+
+        class FailingPutStore:
+            def read_verified(inner_self, object_key: str, digest: str) -> bytes:
+                return self.objects.read_verified(object_key, digest)
+
+            def put_verified(
+                inner_self, object_key: str, payload: bytes, digest: str
+            ) -> None:
+                if object_key.endswith(".json"):
+                    raise ObjectIntegrityError("simulated report object write failure")
+                self.objects.put_verified(object_key, payload, digest)
+
+        failing = ReportRevisionWorker(
+            self.sessions,
+            FailingPutStore(),
+            owner="reporter-failing",
+            orphan_gc_grace_seconds=300,
+        )
+        lease = failing.claim()
+        assert lease is not None
+        self.assertFalse(failing.execute(lease))
+
+        with self.sessions() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(ReportRevision)), 0)
+            self.assertEqual(session.scalar(select(func.count()).select_from(ReportHead)), 0)
+            candidates = list(session.scalars(select(ObjectGcCandidate)))
+            self.assertEqual(len(candidates), 2)
+            self.assertEqual({candidate.state for candidate in candidates}, {"pending"})
+            parquet_candidate = next(
+                candidate
+                for candidate in candidates
+                if candidate.object_key.endswith(".parquet")
+            )
+            self.assertTrue(
+                self.objects.exists_verified(
+                    parquet_candidate.object_key, parquet_candidate.payload_sha256
+                )
+            )
+            report_outbox = session.get(OutboxRecord, lease.outbox_id)
+            assert report_outbox is not None
+            self.assertEqual(report_outbox.state, "pending")
+
+        retry = ReportRevisionWorker(
+            self.sessions,
+            self.objects,
+            owner="reporter-retry",
+            orphan_gc_grace_seconds=300,
+        )
+        self.assertTrue(retry.run_once())
+        with self.sessions() as session:
+            candidates = list(session.scalars(select(ObjectGcCandidate)))
+            self.assertEqual({candidate.state for candidate in candidates}, {"protected"})
+            self.assertEqual(session.scalar(select(func.count()).select_from(ReportRevision)), 1)
 
     def test_attempt_deletion_suppresses_report_head_publication(self) -> None:
         self.service.admit(self.principal, self.segment())
