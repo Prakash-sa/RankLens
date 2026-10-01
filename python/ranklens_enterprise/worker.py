@@ -523,8 +523,18 @@ class ObjectGcAuditWorker:
             query = (
                 select(ObjectGcCandidate)
                 .where(
-                    ObjectGcCandidate.state.in_(("protected", "failed")),
-                    ObjectGcCandidate.not_before <= now,
+                    (
+                        (ObjectGcCandidate.state == "protected")
+                        & (ObjectGcCandidate.not_before <= now)
+                    )
+                    | (
+                        (ObjectGcCandidate.state == "failed")
+                        & ObjectGcCandidate.completed_at.is_not(None)
+                        & (
+                            ObjectGcCandidate.completed_at
+                            <= now - timedelta(seconds=self._audit_interval_seconds)
+                        )
+                    )
                 )
                 .order_by(ObjectGcCandidate.not_before, ObjectGcCandidate.candidate_id)
                 .limit(self._batch_size)

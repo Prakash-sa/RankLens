@@ -460,7 +460,7 @@ class EnterpriseIngestionTests(unittest.TestCase):
                     attempts=5,
                     last_error="previous provider failure",
                     created_at=now - timedelta(days=1),
-                    completed_at=now - timedelta(hours=1),
+                    completed_at=now,
                 )
             )
 
@@ -471,6 +471,15 @@ class EnterpriseIngestionTests(unittest.TestCase):
             audit_interval_seconds=600,
             clock=lambda: now,
         )
+        self.assertEqual(audit.run_once(), {})
+        after_cooldown = now + timedelta(seconds=601)
+        audit = ObjectGcAuditWorker(
+            self.sessions,
+            self.objects,
+            gc_grace_seconds=300,
+            audit_interval_seconds=600,
+            clock=lambda: after_cooldown,
+        )
         self.assertEqual(audit.run_once(), {"pending": 1})
         with self.sessions() as session:
             candidate = session.get(
@@ -480,14 +489,14 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(candidate.attempts, 0)
             self.assertEqual(
                 candidate.not_before,
-                (now + timedelta(seconds=300)).replace(tzinfo=None),
+                (after_cooldown + timedelta(seconds=300)).replace(tzinfo=None),
             )
             self.assertIsNone(candidate.completed_at)
 
         gc = ObjectGcWorker(
             self.sessions,
             self.objects,
-            clock=lambda: now + timedelta(seconds=301),
+            clock=lambda: after_cooldown + timedelta(seconds=301),
         )
         self.assertEqual(gc.run_once(), "deleted")
         self.assertFalse(self.objects.exists_verified(object_key, digest))
