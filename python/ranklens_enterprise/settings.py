@@ -25,6 +25,9 @@ class Settings:
     reservation_sweep_seconds: int = 30
     object_gc_grace_seconds: int = 3600
     object_gc_sweep_seconds: int = 30
+    object_gc_audit_interval_seconds: int = 86400
+    object_gc_audit_sweep_seconds: int = 300
+    object_gc_audit_batch_size: int = 100
     bootstrap_schema: bool = False
 
     @classmethod
@@ -60,6 +63,15 @@ class Settings:
             reservation_sweep = int(os.environ.get("RANKLENS_RESERVATION_SWEEP_SECONDS", "30"))
             object_gc_grace = int(os.environ.get("RANKLENS_OBJECT_GC_GRACE_SECONDS", "3600"))
             object_gc_sweep = int(os.environ.get("RANKLENS_OBJECT_GC_SWEEP_SECONDS", "30"))
+            object_gc_audit_interval = int(
+                os.environ.get("RANKLENS_OBJECT_GC_AUDIT_INTERVAL_SECONDS", "86400")
+            )
+            object_gc_audit_sweep = int(
+                os.environ.get("RANKLENS_OBJECT_GC_AUDIT_SWEEP_SECONDS", "300")
+            )
+            object_gc_audit_batch = int(
+                os.environ.get("RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE", "100")
+            )
         except ValueError as exc:
             raise RuntimeError("lifecycle timing settings must be integers") from exc
         if reservation_ttl < 60 or reservation_ttl > 86400:
@@ -70,6 +82,18 @@ class Settings:
             raise RuntimeError("RANKLENS_OBJECT_GC_GRACE_SECONDS must be within [300, 604800]")
         if object_gc_sweep < 1 or object_gc_sweep > 3600:
             raise RuntimeError("RANKLENS_OBJECT_GC_SWEEP_SECONDS must be within [1, 3600]")
+        if object_gc_audit_interval < 300 or object_gc_audit_interval > 604800:
+            raise RuntimeError(
+                "RANKLENS_OBJECT_GC_AUDIT_INTERVAL_SECONDS must be within [300, 604800]"
+            )
+        if object_gc_audit_sweep < 1 or object_gc_audit_sweep > 3600:
+            raise RuntimeError(
+                "RANKLENS_OBJECT_GC_AUDIT_SWEEP_SECONDS must be within [1, 3600]"
+            )
+        if object_gc_audit_batch < 1 or object_gc_audit_batch > 10000:
+            raise RuntimeError(
+                "RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE must be within [1, 10000]"
+            )
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
@@ -78,6 +102,9 @@ class Settings:
             reservation_sweep_seconds=reservation_sweep,
             object_gc_grace_seconds=object_gc_grace,
             object_gc_sweep_seconds=object_gc_sweep,
+            object_gc_audit_interval_seconds=object_gc_audit_interval,
+            object_gc_audit_sweep_seconds=object_gc_audit_sweep,
+            object_gc_audit_batch_size=object_gc_audit_batch,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},
         )

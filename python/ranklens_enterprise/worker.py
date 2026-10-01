@@ -1259,8 +1259,16 @@ def main() -> int:
         gc_grace_seconds=settings.object_gc_grace_seconds,
     )
     object_gc = ObjectGcWorker(sessions, objects)
+    object_gc_audit = ObjectGcAuditWorker(
+        sessions,
+        objects,
+        gc_grace_seconds=settings.object_gc_grace_seconds,
+        audit_interval_seconds=settings.object_gc_audit_interval_seconds,
+        batch_size=settings.object_gc_audit_batch_size,
+    )
     next_reservation_sweep = 0.0
     next_object_gc_sweep = 0.0
+    next_object_gc_audit_sweep = 0.0
     stopping = False
 
     def stop(*_: object) -> None:
@@ -1281,6 +1289,11 @@ def main() -> int:
             if monotonic_now >= next_object_gc_sweep:
                 worked = object_gc.run_once() is not None or worked
                 next_object_gc_sweep = monotonic_now + settings.object_gc_sweep_seconds
+            if monotonic_now >= next_object_gc_audit_sweep:
+                worked = bool(object_gc_audit.run_once()) or worked
+                next_object_gc_audit_sweep = (
+                    monotonic_now + settings.object_gc_audit_sweep_seconds
+                )
             if not worked:
                 time.sleep(0.5)
     finally:
