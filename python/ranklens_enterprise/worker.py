@@ -437,32 +437,7 @@ class ObjectGcWorker:
                 return None
             candidate.attempts += 1
             lock_stream(session, f"object:{candidate.object_key}")
-            manifest_reference = session.scalar(
-                select(SegmentManifest.receipt_id)
-                .where(SegmentManifest.object_key == candidate.object_key)
-                .limit(1)
-            )
-            reservation_reference = session.scalar(
-                select(AdmissionReservation.reservation_id)
-                .where(
-                    AdmissionReservation.object_key == candidate.object_key,
-                    AdmissionReservation.state.in_(("reserved", "committed")),
-                )
-                .limit(1)
-            )
-            report_reference = session.scalar(
-                select(ReportRevision.revision_id)
-                .where(
-                    (ReportRevision.report_object_key == candidate.object_key)
-                    | (ReportRevision.parquet_object_key == candidate.object_key)
-                )
-                .limit(1)
-            )
-            if (
-                manifest_reference is not None
-                or reservation_reference is not None
-                or report_reference is not None
-            ):
+            if _object_has_reference(session, candidate.object_key):
                 candidate.state = "protected"
                 candidate.completed_at = now
                 candidate.last_error = None
@@ -484,6 +459,122 @@ class ObjectGcWorker:
             candidate.completed_at = now
             candidate.last_error = None
             return candidate.state
+
+
+def _object_has_reference(session: Session, object_key: str) -> bool:
+    manifest_reference = session.scalar(
+        select(SegmentManifest.receipt_id)
+        .where(SegmentManifest.object_key == object_key)
+        .limit(1)
+    )
+    if manifest_reference is not None:
+        return True
+    reservation_reference = session.scalar(
+        select(AdmissionReservation.reservation_id)
+        .where(
+            AdmissionReservation.object_key == object_key,
+            AdmissionReservation.state.in_(("reserved", "committed")),
+        )
+        .limit(1)
+    )
+    if reservation_reference is not None:
+        return True
+    report_reference = session.scalar(
+        select(ReportRevision.revision_id)
+        .where(
+            (ReportRevision.report_object_key == object_key)
+            | (ReportRevision.parquet_object_key == object_key)
+        )
+        .limit(1)
+    )
+    return report_reference is not None
+
+
+class ObjectGcAuditWorker:
+    """Periodically reconciles protected and quarantined objects with catalog truth."""
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        objects: ImmutableObjectStore,
+        *,
+        gc_grace_seconds: int = 3600,
+        audit_interval_seconds: int = 86400,
+        batch_size: int = 100,
+        clock=utc_now,
+    ):
+        if not 300 <= gc_grace_seconds <= 604800:
+            raise ValueError("gc_grace_seconds must be within [300, 604800]")
+        if not 300 <= audit_interval_seconds <= 604800:
+            raise ValueError("audit_interval_seconds must be within [300, 604800]")
+        if not 1 <= batch_size <= 10_000:
+            raise ValueError("batch_size must be within [1, 10000]")
+        self._sessions = sessions
+        self._objects = objects
+        self._gc_grace_seconds = gc_grace_seconds
+        self._audit_interval_seconds = audit_interval_seconds
+        self._batch_size = batch_size
+        self._clock = clock
+
+    def run_once(self) -> dict[str, int]:
+        now = self._clock()
+        outcomes: dict[str, int] = {}
+        with self._sessions.begin() as session:
+            query = (
+                select(ObjectGcCandidate)
+                .where(
+                    ObjectGcCandidate.state.in_(("protected", "failed")),
+                    ObjectGcCandidate.not_before <= now,
+                )
+                .order_by(ObjectGcCandidate.not_before, ObjectGcCandidate.candidate_id)
+                .limit(self._batch_size)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            candidates = list(session.scalars(query))
+            for candidate in candidates:
+                lock_stream(session, f"object:{candidate.object_key}")
+                referenced = _object_has_reference(session, candidate.object_key)
+                try:
+                    exists = self._objects.exists_verified(
+                        candidate.object_key, candidate.payload_sha256
+                    )
+                except ObjectIntegrityError as exc:
+                    candidate.state = "failed"
+                    candidate.last_error = f"audit integrity failure: {exc}"[:512]
+                    candidate.completed_at = now
+                    candidate.not_before = now + timedelta(
+                        seconds=self._audit_interval_seconds
+                    )
+                else:
+                    if referenced and exists:
+                        candidate.state = "protected"
+                        candidate.last_error = None
+                        candidate.completed_at = now
+                        candidate.not_before = now + timedelta(
+                            seconds=self._audit_interval_seconds
+                        )
+                    elif referenced:
+                        candidate.state = "failed"
+                        candidate.last_error = "audit found a referenced object missing"
+                        candidate.completed_at = now
+                        candidate.not_before = now + timedelta(
+                            seconds=self._audit_interval_seconds
+                        )
+                    elif exists:
+                        candidate.state = "pending"
+                        candidate.attempts = 0
+                        candidate.last_error = None
+                        candidate.completed_at = None
+                        candidate.not_before = now + timedelta(
+                            seconds=self._gc_grace_seconds
+                        )
+                    else:
+                        candidate.state = "missing"
+                        candidate.last_error = None
+                        candidate.completed_at = now
+                outcomes[candidate.state] = outcomes.get(candidate.state, 0) + 1
+        return outcomes
 
 
 class OutboxWorker:

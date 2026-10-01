@@ -32,6 +32,7 @@ from ranklens_enterprise.storage import LocalObjectStore
 from ranklens_enterprise.storage import ObjectIntegrityError
 from ranklens_enterprise.worker import (
     AttemptDeletionWorker,
+    ObjectGcAuditWorker,
     ObjectGcWorker,
     OutboxWorker,
     ReportRevisionWorker,
@@ -395,6 +396,101 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(candidate.attempts, 5)
             self.assertIn("provider integrity failure", candidate.last_error or "")
             self.assertIsNotNone(candidate.completed_at)
+
+    def test_object_gc_audit_verifies_referenced_report_artifacts(self) -> None:
+        self.service.admit(self.principal, self.segment())
+        self.assertTrue(OutboxWorker(self.sessions, self.objects).run_once())
+        self.assertTrue(ReportRevisionWorker(self.sessions, self.objects).run_once())
+        now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+        with self.sessions.begin() as session:
+            candidates = list(session.scalars(select(ObjectGcCandidate)))
+            self.assertEqual(len(candidates), 2)
+            for candidate in candidates:
+                candidate.not_before = now
+
+        audit = ObjectGcAuditWorker(
+            self.sessions,
+            self.objects,
+            audit_interval_seconds=600,
+            clock=lambda: now,
+        )
+        self.assertEqual(audit.run_once(), {"protected": 2})
+        with self.sessions() as session:
+            candidates = list(session.scalars(select(ObjectGcCandidate)))
+            self.assertTrue(
+                all(
+                    candidate.not_before
+                    == (now + timedelta(seconds=600)).replace(tzinfo=None)
+                    for candidate in candidates
+                )
+            )
+
+        missing = next(
+            candidate for candidate in candidates if candidate.object_key.endswith(".json")
+        )
+        self.assertTrue(
+            self.objects.delete_verified(missing.object_key, missing.payload_sha256)
+        )
+        with self.sessions.begin() as session:
+            candidate = session.get(ObjectGcCandidate, missing.candidate_id)
+            assert candidate is not None
+            candidate.not_before = now
+
+        self.assertEqual(audit.run_once(), {"failed": 1})
+        with self.sessions() as session:
+            candidate = session.get(ObjectGcCandidate, missing.candidate_id)
+            assert candidate is not None
+            self.assertEqual(candidate.state, "failed")
+            self.assertIn("referenced object missing", candidate.last_error or "")
+
+    def test_object_gc_audit_releases_repaired_unreferenced_quarantine(self) -> None:
+        now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+        payload = b"repaired orphan"
+        digest = hashlib.sha256(payload).hexdigest()
+        object_key = "v2/repaired-orphan.segment"
+        self.objects.put_verified(object_key, payload, digest)
+        with self.sessions.begin() as session:
+            session.add(
+                ObjectGcCandidate(
+                    candidate_id="00000000-0000-0000-0000-000000000051",
+                    object_key=object_key,
+                    payload_sha256=digest,
+                    state="failed",
+                    not_before=now,
+                    attempts=5,
+                    last_error="previous provider failure",
+                    created_at=now - timedelta(days=1),
+                    completed_at=now - timedelta(hours=1),
+                )
+            )
+
+        audit = ObjectGcAuditWorker(
+            self.sessions,
+            self.objects,
+            gc_grace_seconds=300,
+            audit_interval_seconds=600,
+            clock=lambda: now,
+        )
+        self.assertEqual(audit.run_once(), {"pending": 1})
+        with self.sessions() as session:
+            candidate = session.get(
+                ObjectGcCandidate, "00000000-0000-0000-0000-000000000051"
+            )
+            assert candidate is not None
+            self.assertEqual(candidate.attempts, 0)
+            self.assertEqual(
+                candidate.not_before,
+                (now + timedelta(seconds=300)).replace(tzinfo=None),
+            )
+            self.assertIsNone(candidate.completed_at)
+
+        gc = ObjectGcWorker(
+            self.sessions,
+            self.objects,
+            clock=lambda: now + timedelta(seconds=301),
+        )
+        self.assertEqual(gc.run_once(), "deleted")
+        self.assertFalse(self.objects.exists_verified(object_key, digest))
 
     def test_partial_sequence_overlap_is_rejected(self) -> None:
         eleven_records = b"".join(
