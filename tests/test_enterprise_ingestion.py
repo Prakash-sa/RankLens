@@ -15,6 +15,8 @@ from ranklens_enterprise.contracts import SegmentUpload
 from ranklens_enterprise.database import (
     AdmissionReservation,
     AttemptDeletion,
+    AttemptGeneration,
+    AttemptHold,
     AttemptRecord,
     NormalizedSegment,
     ObjectGcCandidate,
@@ -26,7 +28,12 @@ from ranklens_enterprise.database import (
     build_session_factory,
     initialize_schema,
 )
-from ranklens_enterprise.ingestion import AdmissionConflict, AdmissionError, IngestionService
+from ranklens_enterprise.ingestion import (
+    AdmissionConflict,
+    AdmissionError,
+    DeletionHeldError,
+    IngestionService,
+)
 from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
 from ranklens_enterprise.storage import ObjectIntegrityError
@@ -550,6 +557,68 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(deletion.deletion_generation, 1)
             self.assertEqual(deletion.state, "pending")
             self.assertEqual(deletion.attempts, 0)
+
+    def test_retention_holds_block_deletion_until_every_hold_is_released(self) -> None:
+        receipt = self.service.admit(self.principal, self.segment())
+        first_hold = "00000000-0000-0000-0000-000000000061"
+        second_hold = "00000000-0000-0000-0000-000000000062"
+        self.service.place_attempt_hold(
+            "tenant-a", "cluster-a", "attempt-1", first_hold, "legal review"
+        )
+        self.service.place_attempt_hold(
+            "tenant-a", "cluster-a", "attempt-1", first_hold, "legal review"
+        )
+        self.service.place_attempt_hold(
+            "tenant-a", "cluster-a", "attempt-1", second_hold, "customer request"
+        )
+
+        with self.assertRaises(DeletionHeldError) as raised:
+            self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+        self.assertEqual(raised.exception.hold_ids, (first_hold, second_hold))
+        with self.sessions() as session:
+            generation = session.get(
+                AttemptGeneration, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert generation is not None
+            assert deletion is not None
+            self.assertIsNone(generation.deleted_at)
+            self.assertEqual(generation.generation, 0)
+            self.assertEqual(deletion.state, "held")
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(AttemptHold)), 2
+            )
+        self.assertTrue(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
+
+        self.assertTrue(self.service.release_attempt_hold(first_hold))
+        with self.sessions() as session:
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert deletion is not None
+            self.assertEqual(deletion.state, "held")
+
+        self.assertTrue(self.service.release_attempt_hold(second_hold))
+        self.assertFalse(self.service.release_attempt_hold(second_hold))
+        with self.sessions() as session:
+            generation = session.get(
+                AttemptGeneration, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert generation is not None
+            assert deletion is not None
+            self.assertEqual(generation.generation, 1)
+            self.assertIsNotNone(generation.deleted_at)
+            self.assertEqual(deletion.deletion_generation, 1)
+            self.assertEqual(deletion.state, "pending")
+
+        worker = AttemptDeletionWorker(self.sessions, self.objects, owner="deletion-a")
+        self.assertTrue(worker.run_once())
+        self.assertFalse(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
 
     def test_receipt_lookup_is_tenant_scoped(self) -> None:
         receipt = self.service.admit(self.principal, self.segment())

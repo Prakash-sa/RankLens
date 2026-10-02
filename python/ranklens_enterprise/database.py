@@ -28,6 +28,32 @@ class AttemptGeneration(Base):
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AttemptHold(Base):
+    """Administrative retention hold that takes precedence over physical erasure."""
+
+    __tablename__ = "attempt_holds"
+    __table_args__ = (
+        Index(
+            "ix_attempt_hold_active",
+            "tenant_id",
+            "cluster_id",
+            "attempt_id",
+            "state",
+        ),
+    )
+
+    hold_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    placed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    released_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class AttemptDeletion(Base):
     """Durable, generation-fenced physical erasure request and audit result."""
 

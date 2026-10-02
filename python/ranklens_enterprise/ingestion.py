@@ -19,6 +19,7 @@ from .database import (
     AdmissionReservation,
     AttemptDeletion,
     AttemptGeneration,
+    AttemptHold,
     AttemptRecord,
     OutboxRecord,
     SegmentManifest,
@@ -40,6 +41,12 @@ class AdmissionError(RuntimeError):
 class AdmissionConflict(AdmissionError):
     def __init__(self, code: str, message: str, *, retriable: bool = False):
         super().__init__(code, message, status_code=409, retriable=retriable)
+
+
+class DeletionHeldError(RuntimeError):
+    def __init__(self, hold_ids: tuple[str, ...]):
+        super().__init__("attempt deletion is blocked by an active retention hold")
+        self.hold_ids = hold_ids
 
 
 @dataclass(frozen=True)
@@ -404,6 +411,121 @@ class IngestionService:
                 last_sequence=manifest.last_sequence,
             )
 
+    @staticmethod
+    def _active_hold_ids(
+        session: Session, tenant_id: str, cluster_id: str, attempt_id: str
+    ) -> tuple[str, ...]:
+        return tuple(
+            session.scalars(
+                select(AttemptHold.hold_id)
+                .where(
+                    AttemptHold.tenant_id == tenant_id,
+                    AttemptHold.cluster_id == cluster_id,
+                    AttemptHold.attempt_id == attempt_id,
+                    AttemptHold.state == "active",
+                )
+                .order_by(AttemptHold.hold_id)
+            )
+        )
+
+    def place_attempt_hold(
+        self,
+        tenant_id: str,
+        cluster_id: str,
+        attempt_id: str,
+        hold_id: str,
+        reason: str,
+    ) -> None:
+        try:
+            normalized_hold_id = str(uuid.UUID(hold_id))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("hold_id must be a canonical UUID") from exc
+        if normalized_hold_id != hold_id:
+            raise ValueError("hold_id must be a canonical UUID")
+        reason = reason.strip()
+        if not reason or len(reason) > 512:
+            raise ValueError("hold reason must contain between 1 and 512 characters")
+        identity = (tenant_id, cluster_id, attempt_id)
+        with self._sessions.begin() as session:
+            lock_stream(session, f"attempt:{':'.join(identity)}")
+            if (
+                session.get(AttemptRecord, identity) is None
+                and session.get(AttemptGeneration, identity) is None
+            ):
+                raise ValueError("cannot hold an unknown attempt")
+            deletion = session.get(AttemptDeletion, identity)
+            if deletion is not None and deletion.state == "completed":
+                raise ValueError("cannot hold an attempt after erasure completed")
+            existing = session.get(AttemptHold, hold_id)
+            if existing is not None:
+                if (
+                    (existing.tenant_id, existing.cluster_id, existing.attempt_id)
+                    != identity
+                    or existing.reason != reason
+                ):
+                    raise ValueError("hold_id is already bound to different hold data")
+                if existing.state != "active":
+                    raise ValueError("a released hold_id cannot be reused")
+                return
+            session.add(
+                AttemptHold(
+                    hold_id=hold_id,
+                    tenant_id=tenant_id,
+                    cluster_id=cluster_id,
+                    attempt_id=attempt_id,
+                    reason=reason,
+                    state="active",
+                    placed_at=utc_now(),
+                    released_at=None,
+                )
+            )
+            if deletion is not None:
+                deletion.state = "held"
+                deletion.lease_owner = None
+                deletion.lease_expires_at = None
+                deletion.last_error = "physical erasure blocked by retention hold"
+                deletion.completed_at = None
+
+    def release_attempt_hold(self, hold_id: str) -> bool:
+        with self._sessions.begin() as session:
+            hold = session.get(AttemptHold, hold_id)
+            if hold is None:
+                raise ValueError("retention hold does not exist")
+            identity = (hold.tenant_id, hold.cluster_id, hold.attempt_id)
+            lock_stream(session, f"attempt:{':'.join(identity)}")
+            if hold.state == "released":
+                return False
+            hold.state = "released"
+            hold.released_at = utc_now()
+            session.flush()
+            if self._active_hold_ids(session, *identity):
+                return True
+            deletion = session.get(AttemptDeletion, identity)
+            if deletion is None or deletion.state != "held":
+                return True
+            generation = session.get(AttemptGeneration, identity)
+            now = utc_now()
+            if generation is None:
+                generation = AttemptGeneration(
+                    tenant_id=identity[0],
+                    cluster_id=identity[1],
+                    attempt_id=identity[2],
+                    generation=1,
+                    deleted_at=now,
+                )
+                session.add(generation)
+            elif generation.deleted_at is None:
+                generation.generation += 1
+                generation.deleted_at = now
+            deletion.deletion_generation = generation.generation
+            deletion.state = "pending"
+            deletion.attempts = 0
+            deletion.lease_owner = None
+            deletion.lease_expires_at = None
+            deletion.last_error = None
+            deletion.completed_at = None
+            return True
+
     def delete_attempt(self, tenant_id: str, cluster_id: str, attempt_id: str) -> int:
         """Fence new admission for one attempt and return its new generation.
 
@@ -411,11 +533,52 @@ class IngestionService:
         API intentionally does not expose this administrative primitive yet.
         """
 
-        identity = ":".join((tenant_id, cluster_id, attempt_id))
+        identity = (tenant_id, cluster_id, attempt_id)
+        blocked_holds: tuple[str, ...] = ()
         with self._sessions.begin() as session:
-            lock_stream(session, f"attempt:{identity}")
-            state = session.get(AttemptGeneration, (tenant_id, cluster_id, attempt_id))
-            if state is None:
+            lock_stream(session, f"attempt:{':'.join(identity)}")
+            state = session.get(AttemptGeneration, identity)
+            blocked_holds = self._active_hold_ids(session, *identity)
+            if blocked_holds:
+                now = utc_now()
+                if state is None:
+                    state = AttemptGeneration(
+                        tenant_id=tenant_id,
+                        cluster_id=cluster_id,
+                        attempt_id=attempt_id,
+                        generation=0,
+                        deleted_at=None,
+                    )
+                    session.add(state)
+                deletion = session.get(AttemptDeletion, identity)
+                if deletion is None:
+                    session.add(
+                        AttemptDeletion(
+                            tenant_id=tenant_id,
+                            cluster_id=cluster_id,
+                            attempt_id=attempt_id,
+                            deletion_generation=state.generation,
+                            state="held",
+                            attempts=0,
+                            lease_owner=None,
+                            lease_generation=0,
+                            lease_expires_at=None,
+                            deleted_segment_objects=0,
+                            retained_shared_objects=0,
+                            deleted_report_objects=0,
+                            deleted_catalog_rows=0,
+                            last_error="physical erasure blocked by retention hold",
+                            requested_at=now,
+                            completed_at=None,
+                        )
+                    )
+                elif deletion.state != "completed":
+                    deletion.state = "held"
+                    deletion.lease_owner = None
+                    deletion.lease_expires_at = None
+                    deletion.last_error = "physical erasure blocked by retention hold"
+                    deletion.completed_at = None
+            elif state is None:
                 state = AttemptGeneration(
                     tenant_id=tenant_id,
                     cluster_id=cluster_id,
@@ -427,37 +590,41 @@ class IngestionService:
             elif state.deleted_at is None:
                 state.generation += 1
                 state.deleted_at = utc_now()
-            deletion = session.get(
-                AttemptDeletion, (tenant_id, cluster_id, attempt_id)
-            )
-            if deletion is None:
-                session.add(
-                    AttemptDeletion(
-                        tenant_id=tenant_id,
-                        cluster_id=cluster_id,
-                        attempt_id=attempt_id,
-                        deletion_generation=state.generation,
-                        state="pending",
-                        attempts=0,
-                        lease_owner=None,
-                        lease_generation=0,
-                        lease_expires_at=None,
-                        deleted_segment_objects=0,
-                        retained_shared_objects=0,
-                        deleted_report_objects=0,
-                        deleted_catalog_rows=0,
-                        last_error=None,
-                        requested_at=state.deleted_at,
-                        completed_at=None,
+            if blocked_holds:
+                generation = state.generation
+            else:
+                deletion = session.get(AttemptDeletion, identity)
+                if deletion is None:
+                    session.add(
+                        AttemptDeletion(
+                            tenant_id=tenant_id,
+                            cluster_id=cluster_id,
+                            attempt_id=attempt_id,
+                            deletion_generation=state.generation,
+                            state="pending",
+                            attempts=0,
+                            lease_owner=None,
+                            lease_generation=0,
+                            lease_expires_at=None,
+                            deleted_segment_objects=0,
+                            retained_shared_objects=0,
+                            deleted_report_objects=0,
+                            deleted_catalog_rows=0,
+                            last_error=None,
+                            requested_at=state.deleted_at,
+                            completed_at=None,
+                        )
                     )
-                )
-            elif deletion.deletion_generation != state.generation:
-                deletion.deletion_generation = state.generation
-                deletion.state = "pending"
-                deletion.attempts = 0
-                deletion.lease_owner = None
-                deletion.lease_expires_at = None
-                deletion.last_error = None
-                deletion.requested_at = state.deleted_at
-                deletion.completed_at = None
-            return state.generation
+                elif deletion.deletion_generation != state.generation:
+                    deletion.deletion_generation = state.generation
+                    deletion.state = "pending"
+                    deletion.attempts = 0
+                    deletion.lease_owner = None
+                    deletion.lease_expires_at = None
+                    deletion.last_error = None
+                    deletion.requested_at = state.deleted_at
+                    deletion.completed_at = None
+                generation = state.generation
+        if blocked_holds:
+            raise DeletionHeldError(blocked_holds)
+        return generation
