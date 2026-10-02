@@ -165,8 +165,25 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(detail.json()["workflow_execution_id"], "workflow-1")
         self.assertEqual(detail.json()["scheduler_state"], "unknown")
         self.assertEqual(detail.json()["telemetry_status"], "available")
+        self.assertEqual(detail.json()["retention_status"], "none")
+        self.assertEqual(detail.json()["active_retention_holds"], 0)
         self.assertEqual(detail.json()["segment_count"], 1)
         self.assertEqual(denied.status_code, 404)
+
+        self.client.app.state.ingestion.place_attempt_hold(
+            "tenant-a",
+            "cluster-a",
+            "attempt-a",
+            "00000000-0000-0000-0000-000000000071",
+            "legal review details must not be exposed",
+        )
+        held = self.client.get(
+            "/v1/attempts/attempt-a", params={"cluster_id": "cluster-a"}, headers=headers
+        )
+        self.assertEqual(held.status_code, 200)
+        self.assertEqual(held.json()["retention_status"], "held")
+        self.assertEqual(held.json()["active_retention_holds"], 1)
+        self.assertNotIn("legal review details", held.text)
 
     def test_production_schema_check_requires_migration_marker(self) -> None:
         engine = build_engine("sqlite:///:memory:")

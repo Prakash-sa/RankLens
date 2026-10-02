@@ -186,6 +186,8 @@ class AttemptView(BaseModel):
     scheduler_state: str
     scheduler_observed_at: Optional[datetime] = None
     telemetry_status: Literal["available", "deleted"]
+    retention_status: Literal["none", "held"]
+    active_retention_holds: int
     first_admitted_at: datetime
     last_admitted_at: datetime
     segment_count: int

@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy import text
 
 from ranklens import __version__
@@ -31,6 +31,7 @@ from .contracts import (
 )
 from .database import (
     AttemptGeneration,
+    AttemptHold,
     AttemptRecord,
     ReportHead,
     ReportRevision,
@@ -150,6 +151,7 @@ def create_app(settings: Settings) -> FastAPI:
         record: AttemptRecord,
         generation: Optional[AttemptGeneration],
         head: Optional[ReportHead],
+        active_hold_count: int,
     ) -> AttemptView:
         deleted = generation is not None and generation.deleted_at is not None
         current_revision = None
@@ -170,6 +172,8 @@ def create_app(settings: Settings) -> FastAPI:
             scheduler_state=record.scheduler_state,
             scheduler_observed_at=record.scheduler_observed_at,
             telemetry_status="deleted" if deleted else "available",
+            retention_status="held" if active_hold_count > 0 else "none",
+            active_retention_holds=active_hold_count,
             first_admitted_at=record.first_admitted_at,
             last_admitted_at=record.last_admitted_at,
             segment_count=record.segment_count,
@@ -178,8 +182,28 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
     def attempt_statement(tenant_id: str, cluster_id: str):
+        active_holds = (
+            select(
+                AttemptHold.tenant_id.label("tenant_id"),
+                AttemptHold.cluster_id.label("cluster_id"),
+                AttemptHold.attempt_id.label("attempt_id"),
+                func.count().label("active_hold_count"),
+            )
+            .where(AttemptHold.state == "active")
+            .group_by(
+                AttemptHold.tenant_id,
+                AttemptHold.cluster_id,
+                AttemptHold.attempt_id,
+            )
+            .subquery()
+        )
         return (
-            select(AttemptRecord, AttemptGeneration, ReportHead)
+            select(
+                AttemptRecord,
+                AttemptGeneration,
+                ReportHead,
+                func.coalesce(active_holds.c.active_hold_count, 0),
+            )
             .outerjoin(
                 AttemptGeneration,
                 (AttemptGeneration.tenant_id == AttemptRecord.tenant_id)
@@ -191,6 +215,12 @@ def create_app(settings: Settings) -> FastAPI:
                 (ReportHead.tenant_id == AttemptRecord.tenant_id)
                 & (ReportHead.cluster_id == AttemptRecord.cluster_id)
                 & (ReportHead.attempt_id == AttemptRecord.attempt_id),
+            )
+            .outerjoin(
+                active_holds,
+                (active_holds.c.tenant_id == AttemptRecord.tenant_id)
+                & (active_holds.c.cluster_id == AttemptRecord.cluster_id)
+                & (active_holds.c.attempt_id == AttemptRecord.attempt_id),
             )
             .where(
                 AttemptRecord.tenant_id == tenant_id,
