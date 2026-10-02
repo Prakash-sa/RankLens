@@ -18,6 +18,7 @@ from .database import (
     AdmissionReservation,
     AttemptDeletion,
     AttemptGeneration,
+    AttemptHold,
     AttemptRecord,
     NormalizedSegment,
     ObjectGcCandidate,
@@ -125,6 +126,25 @@ class AttemptDeletionWorker:
                     session,
                     f"attempt:{lease.tenant_id}:{lease.cluster_id}:{lease.attempt_id}",
                 )
+                session.refresh(request)
+                if not self._matches(lease, request):
+                    return False
+                active_hold = session.scalar(
+                    select(AttemptHold.hold_id)
+                    .where(
+                        AttemptHold.tenant_id == lease.tenant_id,
+                        AttemptHold.cluster_id == lease.cluster_id,
+                        AttemptHold.attempt_id == lease.attempt_id,
+                        AttemptHold.state == "active",
+                    )
+                    .limit(1)
+                )
+                if active_hold is not None:
+                    request.state = "held"
+                    request.lease_owner = None
+                    request.lease_expires_at = None
+                    request.last_error = "physical erasure blocked by retention hold"
+                    return False
                 generation = session.get(AttemptGeneration, identity)
                 if (
                     generation is None

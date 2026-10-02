@@ -939,6 +939,42 @@ class EnterpriseIngestionTests(unittest.TestCase):
         self.assertTrue(worker.run_once())
         self.assertFalse(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
 
+    def test_attempt_deletion_worker_rechecks_holds_after_claim(self) -> None:
+        receipt = self.service.admit(self.principal, self.segment())
+        self.service.delete_attempt("tenant-a", "cluster-a", "attempt-1")
+        worker = AttemptDeletionWorker(self.sessions, self.objects, owner="deletion-a")
+        lease = worker.claim()
+        assert lease is not None
+        hold_id = "00000000-0000-0000-0000-000000000063"
+        now = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+        with self.sessions.begin() as session:
+            session.add(
+                AttemptHold(
+                    hold_id=hold_id,
+                    tenant_id="tenant-a",
+                    cluster_id="cluster-a",
+                    attempt_id="attempt-1",
+                    reason="late compliance hold",
+                    state="active",
+                    placed_at=now,
+                    released_at=None,
+                )
+            )
+
+        self.assertFalse(worker.execute(lease))
+        self.assertTrue(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
+        with self.sessions() as session:
+            deletion = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
+            )
+            assert deletion is not None
+            self.assertEqual(deletion.state, "held")
+            self.assertIn("retention hold", deletion.last_error or "")
+
+        self.assertTrue(self.service.release_attempt_hold(hold_id))
+        self.assertTrue(worker.run_once())
+        self.assertFalse(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
+
 
 if __name__ == "__main__":
     unittest.main()
