@@ -28,6 +28,7 @@ class Settings:
     object_gc_audit_interval_seconds: int = 86400
     object_gc_audit_sweep_seconds: int = 300
     object_gc_audit_batch_size: int = 100
+    default_retention_seconds: int = 0
     bootstrap_schema: bool = False
 
     @classmethod
@@ -72,6 +73,9 @@ class Settings:
             object_gc_audit_batch = int(
                 os.environ.get("RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE", "100")
             )
+            default_retention = int(
+                os.environ.get("RANKLENS_DEFAULT_RETENTION_SECONDS", "0")
+            )
         except ValueError as exc:
             raise RuntimeError("lifecycle timing settings must be integers") from exc
         if reservation_ttl < 60 or reservation_ttl > 86400:
@@ -94,6 +98,10 @@ class Settings:
             raise RuntimeError(
                 "RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE must be within [1, 10000]"
             )
+        if default_retention != 0 and not 3600 <= default_retention <= 315360000:
+            raise RuntimeError(
+                "RANKLENS_DEFAULT_RETENTION_SECONDS must be 0 or within [3600, 315360000]"
+            )
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
@@ -105,6 +113,7 @@ class Settings:
             object_gc_audit_interval_seconds=object_gc_audit_interval,
             object_gc_audit_sweep_seconds=object_gc_audit_sweep,
             object_gc_audit_batch_size=object_gc_audit_batch,
+            default_retention_seconds=default_retention,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},
         )

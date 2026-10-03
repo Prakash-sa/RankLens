@@ -34,6 +34,7 @@ class EnterpriseSettingsTests(unittest.TestCase):
                 "RANKLENS_OBJECT_GC_AUDIT_INTERVAL_SECONDS": "43200",
                 "RANKLENS_OBJECT_GC_AUDIT_SWEEP_SECONDS": "180",
                 "RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE": "250",
+                "RANKLENS_DEFAULT_RETENTION_SECONDS": "2592000",
             }
         )
         with patch.dict("os.environ", environment, clear=True):
@@ -46,6 +47,7 @@ class EnterpriseSettingsTests(unittest.TestCase):
         self.assertEqual(settings.object_gc_audit_interval_seconds, 43200)
         self.assertEqual(settings.object_gc_audit_sweep_seconds, 180)
         self.assertEqual(settings.object_gc_audit_batch_size, 250)
+        self.assertEqual(settings.default_retention_seconds, 2592000)
 
     def test_rejects_unsafe_reservation_timing(self) -> None:
         environment = self.environment()
@@ -59,6 +61,13 @@ class EnterpriseSettingsTests(unittest.TestCase):
         environment["RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE"] = "0"
         with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, "AUDIT_BATCH_SIZE"):
+                Settings.from_environment()
+
+    def test_rejects_unsafe_default_retention(self) -> None:
+        environment = self.environment()
+        environment["RANKLENS_DEFAULT_RETENTION_SECONDS"] = "300"
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "DEFAULT_RETENTION_SECONDS"):
                 Settings.from_environment()
 
 

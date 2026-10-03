@@ -147,6 +147,44 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(record.segment_count, 2)
             self.assertEqual(record.record_count, 2)
 
+    def test_first_admission_persists_a_fixed_default_retention_deadline(self) -> None:
+        service = IngestionService(
+            self.sessions,
+            self.objects,
+            default_retention_seconds=3600,
+        )
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="attempt-retained"),
+        )
+        with self.sessions() as session:
+            attempt = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "attempt-retained")
+            )
+            assert attempt is not None
+            assert attempt.retention_expires_at is not None
+            first_deadline = attempt.retention_expires_at
+            self.assertEqual(
+                attempt.retention_expires_at - attempt.first_admitted_at,
+                timedelta(seconds=3600),
+            )
+
+        service.admit(
+            self.principal,
+            self.segment(
+                b'{"record":"two"}\n',
+                first=1,
+                last=1,
+                attempt_id="attempt-retained",
+            ),
+        )
+        with self.sessions() as session:
+            attempt = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "attempt-retained")
+            )
+            assert attempt is not None
+            self.assertEqual(attempt.retention_expires_at, first_deadline)
+
     def test_admission_rejects_conflicting_attempt_binding(self) -> None:
         self.service.admit(
             self.principal,

@@ -8,7 +8,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import and_, select
@@ -62,10 +62,16 @@ class IngestionService:
         objects: ImmutableObjectStore,
         *,
         max_expanded_segment_bytes: int = 8 * 1024 * 1024,
+        default_retention_seconds: int = 0,
     ):
+        if default_retention_seconds != 0 and not 3600 <= default_retention_seconds <= 315360000:
+            raise ValueError(
+                "default_retention_seconds must be 0 or within [3600, 315360000]"
+            )
         self._sessions = sessions
         self._objects = objects
         self._max_expanded = max_expanded_segment_bytes
+        self._default_retention_seconds = default_retention_seconds
 
     @staticmethod
     def _stream_identity(tenant_id: str, segment: SegmentUpload) -> str:
@@ -175,8 +181,8 @@ class IngestionService:
             committed_at=manifest.committed_at,
         )
 
-    @staticmethod
     def _record_admission(
+        self,
         session: Session,
         tenant_id: str,
         segment: SegmentUpload,
@@ -200,6 +206,11 @@ class IngestionService:
                     scheduler_observed_at=None,
                     first_admitted_at=committed_at,
                     last_admitted_at=committed_at,
+                    retention_expires_at=(
+                        committed_at + timedelta(seconds=self._default_retention_seconds)
+                        if self._default_retention_seconds > 0
+                        else None
+                    ),
                     segment_count=1,
                     record_count=segment.record_count,
                 )

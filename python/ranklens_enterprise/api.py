@@ -52,7 +52,10 @@ def create_app(settings: Settings) -> FastAPI:
     sessions = build_session_factory(engine)
     objects = LocalObjectStore(settings.object_root)
     service = IngestionService(
-        sessions, objects, max_expanded_segment_bytes=settings.max_expanded_segment_bytes
+        sessions,
+        objects,
+        max_expanded_segment_bytes=settings.max_expanded_segment_bytes,
+        default_retention_seconds=settings.default_retention_seconds,
     )
     authenticator = MachineAuthenticator(settings)
 

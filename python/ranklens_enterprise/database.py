@@ -97,6 +97,10 @@ class AttemptRecord(Base):
             "ix_attempt_record_scheduler",
             "tenant_id", "cluster_id", "scheduler_source_identity",
         ),
+        Index(
+            "ix_attempt_record_retention",
+            "retention_expires_at", "tenant_id", "cluster_id", "attempt_id",
+        ),
     )
 
     tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -111,6 +115,9 @@ class AttemptRecord(Base):
     )
     first_admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retention_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     segment_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     record_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
