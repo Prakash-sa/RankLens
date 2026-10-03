@@ -44,6 +44,7 @@ from ranklens_enterprise.worker import (
     OutboxWorker,
     ReportRevisionWorker,
     ReservationSweeper,
+    RetentionSweeper,
 )
 
 
@@ -657,6 +658,82 @@ class EnterpriseIngestionTests(unittest.TestCase):
         worker = AttemptDeletionWorker(self.sessions, self.objects, owner="deletion-a")
         self.assertTrue(worker.run_once())
         self.assertFalse(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
+
+    def test_retention_sweeper_queues_due_attempts_and_preserves_holds(self) -> None:
+        now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+        self.service.admit(
+            self.principal,
+            self.segment(
+                b'{"attempt":"due"}\n', attempt_id="attempt-due"
+            ).model_copy(update={"producer_id": "node-agent-due"}),
+        )
+        self.service.admit(
+            self.principal,
+            self.segment(
+                b'{"attempt":"held"}\n', attempt_id="attempt-held"
+            ).model_copy(update={"producer_id": "node-agent-held"}),
+        )
+        self.service.admit(
+            self.principal,
+            self.segment(
+                b'{"attempt":"future"}\n', attempt_id="attempt-future"
+            ).model_copy(update={"producer_id": "node-agent-future"}),
+        )
+        hold_id = "00000000-0000-0000-0000-000000000081"
+        self.service.place_attempt_hold(
+            "tenant-a", "cluster-a", "attempt-held", hold_id, "retention exception"
+        )
+        with self.sessions.begin() as session:
+            for attempt_id in ("attempt-due", "attempt-held"):
+                record = session.get(
+                    AttemptRecord, ("tenant-a", "cluster-a", attempt_id)
+                )
+                assert record is not None
+                record.retention_expires_at = now - timedelta(seconds=1)
+            future = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "attempt-future")
+            )
+            assert future is not None
+            future.retention_expires_at = now + timedelta(hours=1)
+
+        sweeper = RetentionSweeper(
+            self.sessions,
+            self.service,
+            batch_size=10,
+            clock=lambda: now,
+        )
+        self.assertEqual(sweeper.run_once(), {"queued": 1, "held": 1})
+        self.assertEqual(sweeper.run_once(), {})
+        with self.sessions() as session:
+            due = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-due")
+            )
+            held = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-held")
+            )
+            future = session.get(
+                AttemptDeletion, ("tenant-a", "cluster-a", "attempt-future")
+            )
+            assert due is not None
+            assert held is not None
+            self.assertEqual(due.state, "pending")
+            self.assertEqual(held.state, "held")
+            self.assertIsNone(future)
+
+        deletions = AttemptDeletionWorker(self.sessions, self.objects, owner="deletion-a")
+        self.assertTrue(deletions.run_once())
+        self.assertTrue(self.service.release_attempt_hold(hold_id))
+        self.assertTrue(deletions.run_once())
+        with self.sessions() as session:
+            self.assertIsNone(
+                session.get(AttemptRecord, ("tenant-a", "cluster-a", "attempt-due"))
+            )
+            self.assertIsNone(
+                session.get(AttemptRecord, ("tenant-a", "cluster-a", "attempt-held"))
+            )
+            self.assertIsNotNone(
+                session.get(AttemptRecord, ("tenant-a", "cluster-a", "attempt-future"))
+            )
 
     def test_receipt_lookup_is_tenant_scoped(self) -> None:
         receipt = self.service.admit(self.principal, self.segment())

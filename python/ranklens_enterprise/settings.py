@@ -29,6 +29,8 @@ class Settings:
     object_gc_audit_sweep_seconds: int = 300
     object_gc_audit_batch_size: int = 100
     default_retention_seconds: int = 0
+    retention_sweep_seconds: int = 300
+    retention_sweep_batch_size: int = 100
     bootstrap_schema: bool = False
 
     @classmethod
@@ -76,6 +78,12 @@ class Settings:
             default_retention = int(
                 os.environ.get("RANKLENS_DEFAULT_RETENTION_SECONDS", "0")
             )
+            retention_sweep = int(
+                os.environ.get("RANKLENS_RETENTION_SWEEP_SECONDS", "300")
+            )
+            retention_sweep_batch = int(
+                os.environ.get("RANKLENS_RETENTION_SWEEP_BATCH_SIZE", "100")
+            )
         except ValueError as exc:
             raise RuntimeError("lifecycle timing settings must be integers") from exc
         if reservation_ttl < 60 or reservation_ttl > 86400:
@@ -102,6 +110,14 @@ class Settings:
             raise RuntimeError(
                 "RANKLENS_DEFAULT_RETENTION_SECONDS must be 0 or within [3600, 315360000]"
             )
+        if retention_sweep < 1 or retention_sweep > 3600:
+            raise RuntimeError(
+                "RANKLENS_RETENTION_SWEEP_SECONDS must be within [1, 3600]"
+            )
+        if retention_sweep_batch < 1 or retention_sweep_batch > 10000:
+            raise RuntimeError(
+                "RANKLENS_RETENTION_SWEEP_BATCH_SIZE must be within [1, 10000]"
+            )
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
@@ -114,6 +130,8 @@ class Settings:
             object_gc_audit_sweep_seconds=object_gc_audit_sweep,
             object_gc_audit_batch_size=object_gc_audit_batch,
             default_retention_seconds=default_retention,
+            retention_sweep_seconds=retention_sweep,
+            retention_sweep_batch_size=retention_sweep_batch,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},
         )

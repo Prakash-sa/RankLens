@@ -30,6 +30,7 @@ from .database import (
     lock_stream,
     utc_now,
 )
+from .ingestion import DeletionHeldError, IngestionService
 from .parquet import ParquetSegment, build_normalized_parquet
 from .storage import ImmutableObjectStore, ObjectIntegrityError
 
@@ -422,6 +423,69 @@ class ReservationSweeper:
                         )
                     )
             return len(reservations)
+
+
+class RetentionSweeper:
+    """Turns due fixed-retention deadlines into idempotent deletion requests."""
+
+    def __init__(
+        self,
+        sessions: sessionmaker[Session],
+        lifecycle: IngestionService,
+        *,
+        batch_size: int = 100,
+        clock=utc_now,
+    ):
+        if not 1 <= batch_size <= 10_000:
+            raise ValueError("batch_size must be within [1, 10000]")
+        self._sessions = sessions
+        self._lifecycle = lifecycle
+        self._batch_size = batch_size
+        self._clock = clock
+
+    def run_once(self) -> dict[str, int]:
+        now = self._clock()
+        deletion_exists = (
+            select(AttemptDeletion.tenant_id)
+            .where(
+                AttemptDeletion.tenant_id == AttemptRecord.tenant_id,
+                AttemptDeletion.cluster_id == AttemptRecord.cluster_id,
+                AttemptDeletion.attempt_id == AttemptRecord.attempt_id,
+            )
+            .exists()
+        )
+        with self._sessions() as session:
+            due = list(
+                session.execute(
+                    select(
+                        AttemptRecord.tenant_id,
+                        AttemptRecord.cluster_id,
+                        AttemptRecord.attempt_id,
+                    )
+                    .where(
+                        AttemptRecord.retention_expires_at.is_not(None),
+                        AttemptRecord.retention_expires_at <= now,
+                        ~deletion_exists,
+                    )
+                    .order_by(
+                        AttemptRecord.retention_expires_at,
+                        AttemptRecord.tenant_id,
+                        AttemptRecord.cluster_id,
+                        AttemptRecord.attempt_id,
+                    )
+                    .limit(self._batch_size)
+                ).all()
+            )
+        outcomes: dict[str, int] = {}
+        for tenant_id, cluster_id, attempt_id in due:
+            try:
+                self._lifecycle.delete_attempt(tenant_id, cluster_id, attempt_id)
+            except DeletionHeldError:
+                outcome = "held"
+            else:
+                outcome = "queued"
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        return outcomes
 
 
 class ObjectGcWorker:
@@ -1276,6 +1340,11 @@ def main() -> int:
         assert_schema_ready(engine)
     sessions = build_session_factory(engine)
     objects = LocalObjectStore(settings.object_root)
+    lifecycle = IngestionService(
+        sessions,
+        objects,
+        default_retention_seconds=settings.default_retention_seconds,
+    )
     deletion_worker = AttemptDeletionWorker(sessions, objects)
     worker = OutboxWorker(sessions, objects)
     report_worker = ReportRevisionWorker(
@@ -1288,6 +1357,11 @@ def main() -> int:
         ttl_seconds=settings.reservation_ttl_seconds,
         gc_grace_seconds=settings.object_gc_grace_seconds,
     )
+    retention_sweeper = RetentionSweeper(
+        sessions,
+        lifecycle,
+        batch_size=settings.retention_sweep_batch_size,
+    )
     object_gc = ObjectGcWorker(sessions, objects)
     object_gc_audit = ObjectGcAuditWorker(
         sessions,
@@ -1297,6 +1371,7 @@ def main() -> int:
         batch_size=settings.object_gc_audit_batch_size,
     )
     next_reservation_sweep = 0.0
+    next_retention_sweep = 0.0
     next_object_gc_sweep = 0.0
     next_object_gc_audit_sweep = 0.0
     stopping = False
@@ -1316,6 +1391,9 @@ def main() -> int:
             if monotonic_now >= next_reservation_sweep:
                 worked = reservation_sweeper.run_once() > 0 or worked
                 next_reservation_sweep = monotonic_now + settings.reservation_sweep_seconds
+            if monotonic_now >= next_retention_sweep:
+                worked = bool(retention_sweeper.run_once()) or worked
+                next_retention_sweep = monotonic_now + settings.retention_sweep_seconds
             if monotonic_now >= next_object_gc_sweep:
                 worked = object_gc.run_once() is not None or worked
                 next_object_gc_sweep = monotonic_now + settings.object_gc_sweep_seconds

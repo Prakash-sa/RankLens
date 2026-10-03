@@ -35,6 +35,8 @@ class EnterpriseSettingsTests(unittest.TestCase):
                 "RANKLENS_OBJECT_GC_AUDIT_SWEEP_SECONDS": "180",
                 "RANKLENS_OBJECT_GC_AUDIT_BATCH_SIZE": "250",
                 "RANKLENS_DEFAULT_RETENTION_SECONDS": "2592000",
+                "RANKLENS_RETENTION_SWEEP_SECONDS": "120",
+                "RANKLENS_RETENTION_SWEEP_BATCH_SIZE": "50",
             }
         )
         with patch.dict("os.environ", environment, clear=True):
@@ -48,6 +50,8 @@ class EnterpriseSettingsTests(unittest.TestCase):
         self.assertEqual(settings.object_gc_audit_sweep_seconds, 180)
         self.assertEqual(settings.object_gc_audit_batch_size, 250)
         self.assertEqual(settings.default_retention_seconds, 2592000)
+        self.assertEqual(settings.retention_sweep_seconds, 120)
+        self.assertEqual(settings.retention_sweep_batch_size, 50)
 
     def test_rejects_unsafe_reservation_timing(self) -> None:
         environment = self.environment()
