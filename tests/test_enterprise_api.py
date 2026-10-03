@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from ranklens_enterprise.api import create_app
 from ranklens_enterprise.database import (
     AttemptGeneration,
+    AttemptRecord,
     ReportHead,
     ReportRevision,
     SchedulerObservation,
@@ -167,8 +168,26 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(detail.json()["telemetry_status"], "available")
         self.assertEqual(detail.json()["retention_status"], "none")
         self.assertEqual(detail.json()["active_retention_holds"], 0)
+        self.assertIsNone(detail.json()["retention_expires_at"])
         self.assertEqual(detail.json()["segment_count"], 1)
         self.assertEqual(denied.status_code, 404)
+
+        retention_deadline = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions.begin() as session:
+            record = session.get(AttemptRecord, ("tenant-a", "cluster-a", "attempt-a"))
+            self.assertIsNotNone(record)
+            record.retention_expires_at = retention_deadline
+        engine.dispose()
+
+        retained = self.client.get(
+            "/v1/attempts/attempt-a", params={"cluster_id": "cluster-a"}, headers=headers
+        )
+        self.assertEqual(retained.status_code, 200)
+        self.assertTrue(
+            retained.json()["retention_expires_at"].startswith("2026-10-04T12:00:00")
+        )
 
         self.client.app.state.ingestion.place_attempt_hold(
             "tenant-a",
