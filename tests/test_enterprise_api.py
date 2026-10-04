@@ -111,6 +111,7 @@ class EnterpriseApiTests(unittest.TestCase):
         )
         self.assertEqual(receipt.status_code, 200)
         self.assertEqual(receipt.json()["tenant_id"], "tenant-a")
+        self.assertEqual(receipt.json()["admitted_by_credential_id"], "test-full")
         self.assertEqual(first.headers["x-request-id"], "request-1")
 
     def test_payload_cannot_select_a_tenant(self) -> None:

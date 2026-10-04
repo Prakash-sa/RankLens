@@ -71,6 +71,7 @@ class ReceiptView(DurableReceipt):
     tenant_id: str
     cluster_id: str
     attempt_id: str
+    admitted_by_credential_id: str
     producer_id: str
     transport_epoch: str
     stream_id: str

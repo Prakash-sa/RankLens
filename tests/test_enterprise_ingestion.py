@@ -57,7 +57,9 @@ class EnterpriseIngestionTests(unittest.TestCase):
         self.sessions = build_session_factory(self.engine)
         self.objects = LocalObjectStore(root / "objects")
         self.service = IngestionService(self.sessions, self.objects)
-        self.principal = MachinePrincipal("tenant-a", frozenset({"cluster-a"}))
+        self.principal = MachinePrincipal(
+            "tenant-a", frozenset({"cluster-a"}), "agent-test"
+        )
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -108,6 +110,15 @@ class EnterpriseIngestionTests(unittest.TestCase):
         with self.sessions() as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(SegmentManifest)), 1)
             self.assertEqual(session.scalar(select(func.count()).select_from(OutboxRecord)), 1)
+            manifest = session.scalar(select(SegmentManifest))
+            reservation = session.scalar(select(AdmissionReservation))
+            assert manifest is not None
+            assert reservation is not None
+            self.assertEqual(manifest.credential_id, "agent-test")
+            self.assertEqual(reservation.credential_id, "agent-test")
+        receipt = self.service.get_receipt("tenant-a", first.receipt_id)
+        assert receipt is not None
+        self.assertEqual(receipt.admitted_by_credential_id, "agent-test")
 
     def test_same_range_with_different_content_is_a_conflict(self) -> None:
         self.service.admit(self.principal, self.segment())
