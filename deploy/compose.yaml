@@ -35,7 +35,7 @@ services:
     environment:
       RANKLENS_DATABASE_URL: postgresql+psycopg://ranklens:${RANKLENS_POSTGRES_PASSWORD:?required}@postgres/ranklens
       RANKLENS_OBJECT_ROOT: /var/lib/ranklens/objects
-      RANKLENS_MACHINE_TOKENS_JSON: ${RANKLENS_MACHINE_TOKENS_JSON:?required}
+      RANKLENS_MACHINE_CREDENTIALS_JSON: ${RANKLENS_MACHINE_CREDENTIALS_JSON:?required}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -58,7 +58,7 @@ services:
     environment:
       RANKLENS_DATABASE_URL: postgresql+psycopg://ranklens:${RANKLENS_POSTGRES_PASSWORD:?required}@postgres/ranklens
       RANKLENS_OBJECT_ROOT: /var/lib/ranklens/objects
-      RANKLENS_MACHINE_TOKENS_JSON: ${RANKLENS_MACHINE_TOKENS_JSON:?required}
+      RANKLENS_MACHINE_CREDENTIALS_JSON: ${RANKLENS_MACHINE_CREDENTIALS_JSON:?required}
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -22,7 +22,7 @@ from ranklens_enterprise.database import (
     initialize_schema,
 )
 from ranklens_enterprise.parquet import ParquetSegment, build_normalized_parquet
-from ranklens_enterprise.settings import MachinePrincipal, Settings
+from ranklens_enterprise.settings import MachineCredential, MachinePrincipal, Settings
 from ranklens_enterprise.storage import LocalObjectStore
 
 
@@ -33,16 +33,32 @@ class EnterpriseApiTests(unittest.TestCase):
         self.object_root = root / "objects"
         self.database_url = f"sqlite:///{root / 'catalog.sqlite3'}"
         self.token = "test-token-with-at-least-24-characters"
+        self.ingest_token = "ingest-only-token-with-at-least-24-characters"
+        self.read_token = "read-only-token-with-at-least-24-characters"
         settings = Settings(
             database_url=self.database_url,
             object_root=self.object_root,
-            machine_tokens={
-                self.token: MachinePrincipal("tenant-a", frozenset({"cluster-a"}))
-            },
+            machine_credentials=(
+                self.credential(self.token, "test-full", {"segments:write", "telemetry:read"}),
+                self.credential(self.ingest_token, "test-ingest", {"segments:write"}),
+                self.credential(self.read_token, "test-read", {"telemetry:read"}),
+            ),
             bootstrap_schema=True,
         )
         self.client_context = TestClient(create_app(settings))
         self.client = self.client_context.__enter__()
+
+    @staticmethod
+    def credential(token: str, credential_id: str, permissions: set[str]) -> MachineCredential:
+        return MachineCredential(
+            token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            principal=MachinePrincipal(
+                "tenant-a",
+                frozenset({"cluster-a"}),
+                credential_id,
+                frozenset(permissions),
+            ),
+        )
 
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
@@ -108,6 +124,35 @@ class EnterpriseApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_machine_permissions_separate_ingestion_from_telemetry_reads(self) -> None:
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        read_headers = {"authorization": f"Bearer {self.read_token}"}
+
+        admitted = self.client.post(
+            "/v1/segments", json=self.request_body(), headers=ingest_headers
+        )
+        ingest_read = self.client.get(
+            "/v1/attempts", params={"cluster_id": "cluster-a"}, headers=ingest_headers
+        )
+        ingest_receipt = self.client.get(
+            f"/v1/receipts/{admitted.json()['receipt_id']}", headers=ingest_headers
+        )
+        read_ingest = self.client.post(
+            "/v1/segments", json=self.request_body(), headers=read_headers
+        )
+        readable = self.client.get(
+            "/v1/attempts", params={"cluster_id": "cluster-a"}, headers=read_headers
+        )
+
+        self.assertEqual(admitted.status_code, 201)
+        self.assertEqual(ingest_receipt.status_code, 200)
+        self.assertEqual(ingest_read.status_code, 403)
+        self.assertEqual(ingest_read.json()["detail"]["code"], "machine_auth_forbidden")
+        self.assertEqual(read_ingest.status_code, 403)
+        self.assertEqual(read_ingest.json()["detail"]["code"], "machine_auth_forbidden")
+        self.assertEqual(readable.status_code, 200)
+        self.assertEqual(len(readable.json()["items"]), 1)
 
     def test_segment_endpoint_requires_json_and_a_bounded_body(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}

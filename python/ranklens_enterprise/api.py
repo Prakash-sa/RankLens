@@ -136,14 +136,14 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/v1/segments", response_model=DurableReceipt, status_code=201)
     def admit_segment(
         segment: SegmentUpload,
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_ingest),
     ) -> DurableReceipt:
         return service.admit(principal, segment)
 
     @app.get("/v1/receipts/{receipt_id}", response_model=ReceiptView)
     def receipt(
         receipt_id: str,
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_ingest),
     ) -> ReceiptView:
         result = service.get_receipt(principal.tenant_id, receipt_id)
         if result is None or result.cluster_id not in principal.clusters:
@@ -239,7 +239,7 @@ def create_app(settings: Settings) -> FastAPI:
             default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
         ),
         limit: int = Query(default=100, ge=1, le=500),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_read),
     ) -> AttemptPage:
         if cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
@@ -262,7 +262,7 @@ def create_app(settings: Settings) -> FastAPI:
             min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
         ),
         cluster_id: str = Query(min_length=1, max_length=128),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_read),
     ) -> AttemptView:
         if cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
@@ -280,7 +280,7 @@ def create_app(settings: Settings) -> FastAPI:
         cluster_id: str = Query(min_length=1, max_length=128),
         job_id: Optional[str] = Query(default=None, min_length=1, max_length=128),
         limit: int = Query(default=100, ge=1, le=500),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_read),
     ) -> List[SchedulerObservationView]:
         if cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
@@ -326,7 +326,7 @@ def create_app(settings: Settings) -> FastAPI:
     def scheduler_allocation(
         cluster_id: str = Query(min_length=1, max_length=128),
         source_identity: str = Query(min_length=1, max_length=256),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_read),
     ) -> AllocationTimelineView:
         if cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
@@ -398,7 +398,7 @@ def create_app(settings: Settings) -> FastAPI:
         ),
         cluster_id: str = Query(min_length=1, max_length=128),
         revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_read),
     ) -> ReportRevisionView:
         if cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
@@ -439,7 +439,7 @@ def create_app(settings: Settings) -> FastAPI:
         ),
         cluster_id: str = Query(min_length=1, max_length=128),
         revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
-        principal: MachinePrincipal = Depends(authenticator.authenticate),
+        principal: MachinePrincipal = Depends(authenticator.authenticate_read),
     ) -> RankAggregateView:
         if cluster_id not in principal.clusters:
             raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})

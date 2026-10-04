@@ -4,16 +4,23 @@ This Compose profile exercises the implemented admission foundation: PostgreSQL 
 authenticated API, immutable local object adapter, and leased worker. It is a development/pilot
 profile, not an HA, mTLS, managed-object-storage, backup, RLS, or fleet-scale certification.
 
-Set two secrets in the invoking environment:
+Set the database secret and a machine credential in the invoking environment. The API configuration
+contains only the token digest, while the agent receives the original token:
 
 ```bash
 export RANKLENS_POSTGRES_PASSWORD='replace-with-a-random-secret'
-export RANKLENS_MACHINE_TOKENS_JSON='{"replace-with-a-24-character-token":{"tenant_id":"tenant-a","clusters":["cluster-a"]}}'
+export RANKLENS_AGENT_TOKEN="$(openssl rand -hex 32)"
+export RANKLENS_AGENT_TOKEN_SHA256="$(printf %s "$RANKLENS_AGENT_TOKEN" | shasum -a 256 | cut -d ' ' -f 1)"
+export RANKLENS_MACHINE_CREDENTIALS_JSON="{\"agent-primary\":{\"token_sha256\":\"$RANKLENS_AGENT_TOKEN_SHA256\",\"tenant_id\":\"tenant-a\",\"clusters\":[\"cluster-a\"],\"permissions\":[\"segments:write\"],\"expires_at\":\"2027-01-01T00:00:00Z\"}}"
 docker compose -f deploy/compose.yaml up --build
 ```
 
+Use a separate credential with `telemetry:read` for read-only API clients. Validity windows use
+offset-aware ISO-8601 timestamps; overlapping old and new credentials support a controlled rotation.
+Removing a credential from the configuration revokes it after the API is restarted.
+
 The API binds only to loopback on port 8080. Put a site-approved TLS/mTLS reverse proxy in front of
-it before an agent connects from another host. Do not put the password/token JSON in this repository
+it before an agent connects from another host. Do not put the password, token, or credential JSON in this repository
 or the Compose file. Production deployments must pin image digests, use a KMS/secrets manager,
 replace the local object adapter with a verified storage adapter, configure PostgreSQL backup/HA and
 RLS roles, enforce resource limits, and pass the release gates.
