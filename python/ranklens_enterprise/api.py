@@ -26,6 +26,8 @@ from .contracts import (
     ReceiptView,
     RankAggregateView,
     ReportRevisionView,
+    RetentionHoldCreate,
+    RetentionHoldView,
     SchedulerObservationView,
     SegmentUpload,
 )
@@ -232,6 +234,136 @@ def create_app(settings: Settings) -> FastAPI:
             )
         )
 
+    def retention_hold_view(hold: AttemptHold) -> RetentionHoldView:
+        return RetentionHoldView(
+            hold_id=hold.hold_id,
+            tenant_id=hold.tenant_id,
+            cluster_id=hold.cluster_id,
+            attempt_id=hold.attempt_id,
+            reason=hold.reason,
+            state=hold.state,
+            placed_by_credential_id=hold.placed_by_credential_id,
+            released_by_credential_id=hold.released_by_credential_id,
+            placed_at=hold.placed_at,
+            released_at=hold.released_at,
+        )
+
+    def retention_hold_error(error: ValueError) -> HTTPException:
+        message = str(error)
+        if message in {"cannot hold an unknown attempt", "retention hold does not exist"}:
+            return HTTPException(
+                status_code=404, detail={"code": "retention_hold_target_not_found"}
+            )
+        return HTTPException(
+            status_code=409,
+            detail={"code": "retention_hold_conflict", "message": message},
+        )
+
+    @app.post(
+        "/v1/attempts/{attempt_id}/retention-holds",
+        response_model=RetentionHoldView,
+        status_code=201,
+    )
+    def place_retention_hold(
+        request: RetentionHoldCreate,
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> RetentionHoldView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        hold_id = str(request.hold_id)
+        try:
+            service.place_attempt_hold(
+                principal.tenant_id,
+                cluster_id,
+                attempt_id,
+                hold_id,
+                request.reason,
+                placed_by_credential_id=principal.credential_id,
+            )
+        except ValueError as error:
+            raise retention_hold_error(error) from error
+        with sessions() as session:
+            hold = session.get(AttemptHold, hold_id)
+            if hold is None:
+                raise HTTPException(
+                    status_code=503, detail={"code": "retention_hold_unavailable"}
+                )
+            return retention_hold_view(hold)
+
+    @app.get(
+        "/v1/attempts/{attempt_id}/retention-holds",
+        response_model=List[RetentionHoldView],
+    )
+    def retention_holds(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        state: Optional[str] = Query(default=None, pattern=r"^(active|released)$"),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> List[RetentionHoldView]:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = select(AttemptHold).where(
+            AttemptHold.tenant_id == principal.tenant_id,
+            AttemptHold.cluster_id == cluster_id,
+            AttemptHold.attempt_id == attempt_id,
+        )
+        if state is not None:
+            statement = statement.where(AttemptHold.state == state)
+        statement = statement.order_by(AttemptHold.hold_id).limit(limit)
+        with sessions() as session:
+            return [
+                retention_hold_view(hold)
+                for hold in session.scalars(statement).all()
+            ]
+
+    @app.delete(
+        "/v1/attempts/{attempt_id}/retention-holds/{hold_id}",
+        response_model=RetentionHoldView,
+    )
+    def release_retention_hold(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        hold_id: str = Path(
+            min_length=36,
+            max_length=36,
+            pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> RetentionHoldView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        try:
+            service.release_attempt_hold(
+                hold_id,
+                released_by_credential_id=principal.credential_id,
+                expected_tenant_id=principal.tenant_id,
+                expected_cluster_id=cluster_id,
+                expected_attempt_id=attempt_id,
+            )
+        except ValueError as error:
+            raise retention_hold_error(error) from error
+        with sessions() as session:
+            hold = session.get(AttemptHold, hold_id)
+            if hold is None:
+                raise HTTPException(
+                    status_code=503, detail={"code": "retention_hold_unavailable"}
+                )
+            return retention_hold_view(hold)
     @app.get("/v1/attempts", response_model=AttemptPage)
     def attempts(
         cluster_id: str = Query(min_length=1, max_length=128),

@@ -514,12 +514,22 @@ class IngestionService:
         hold_id: str,
         *,
         released_by_credential_id: str = "internal",
+        expected_tenant_id: Optional[str] = None,
+        expected_cluster_id: Optional[str] = None,
+        expected_attempt_id: Optional[str] = None,
     ) -> bool:
         if self._ACTOR_CREDENTIAL_ID.fullmatch(released_by_credential_id) is None:
             raise ValueError("releasing credential ID is invalid")
         with self._sessions.begin() as session:
             hold = session.get(AttemptHold, hold_id)
-            if hold is None:
+            if hold is None or (
+                expected_tenant_id is not None
+                and (
+                    hold.tenant_id != expected_tenant_id
+                    or hold.cluster_id != expected_cluster_id
+                    or hold.attempt_id != expected_attempt_id
+                )
+            ):
                 raise ValueError("retention hold does not exist")
             identity = (hold.tenant_id, hold.cluster_id, hold.attempt_id)
             lock_stream(session, f"attempt:{':'.join(identity)}")

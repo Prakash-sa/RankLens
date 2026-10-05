@@ -15,7 +15,8 @@ export RANKLENS_MACHINE_CREDENTIALS_JSON="{\"agent-primary\":{\"token_sha256\":\
 docker compose -f deploy/compose.yaml up --build
 ```
 
-Use a separate credential with `telemetry:read` for read-only API clients. Validity windows use
+Use a separate credential with `telemetry:read` for read-only API clients, and grant
+`retention:admin` only to identities allowed to view, place, and release retention holds. Validity windows use
 offset-aware ISO-8601 timestamps; overlapping old and new credentials support a controlled rotation.
 Removing a credential from the configuration revokes it after the API is restarted.
 

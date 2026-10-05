@@ -65,3 +65,8 @@ class MachineAuthenticator:
 
     def authenticate_read(self, authorization: str = Header(default="")) -> MachinePrincipal:
         return self._authenticate(authorization, "telemetry:read")
+
+    def authenticate_retention_admin(
+        self, authorization: str = Header(default="")
+    ) -> MachinePrincipal:
+        return self._authenticate(authorization, "retention:admin")

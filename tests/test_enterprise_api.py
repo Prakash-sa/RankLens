@@ -35,6 +35,7 @@ class EnterpriseApiTests(unittest.TestCase):
         self.token = "test-token-with-at-least-24-characters"
         self.ingest_token = "ingest-only-token-with-at-least-24-characters"
         self.read_token = "read-only-token-with-at-least-24-characters"
+        self.retention_token = "retention-admin-token-with-at-least-24-characters"
         settings = Settings(
             database_url=self.database_url,
             object_root=self.object_root,
@@ -42,6 +43,9 @@ class EnterpriseApiTests(unittest.TestCase):
                 self.credential(self.token, "test-full", {"segments:write", "telemetry:read"}),
                 self.credential(self.ingest_token, "test-ingest", {"segments:write"}),
                 self.credential(self.read_token, "test-read", {"telemetry:read"}),
+                self.credential(
+                    self.retention_token, "test-retention", {"retention:admin"}
+                ),
             ),
             bootstrap_schema=True,
         )
@@ -161,6 +165,78 @@ class EnterpriseApiTests(unittest.TestCase):
 
         self.assertEqual(wrong_type.status_code, 415)
         self.assertEqual(wrong_type.json()["code"], "unsupported_content_type")
+
+    def test_retention_admin_can_place_list_and_release_scoped_holds(self) -> None:
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        read_headers = {"authorization": f"Bearer {self.read_token}"}
+        admin_headers = {"authorization": f"Bearer {self.retention_token}"}
+        self.assertEqual(
+            self.client.post(
+                "/v1/segments", json=self.request_body(), headers=ingest_headers
+            ).status_code,
+            201,
+        )
+        hold_id = "00000000-0000-0000-0000-000000000101"
+        path = "/v1/attempts/attempt-1/retention-holds"
+
+        forbidden = self.client.post(
+            path,
+            params={"cluster_id": "cluster-a"},
+            json={"hold_id": hold_id, "reason": "customer legal request"},
+            headers=read_headers,
+        )
+        placed = self.client.post(
+            path,
+            params={"cluster_id": "cluster-a"},
+            json={"hold_id": hold_id, "reason": "customer legal request"},
+            headers=admin_headers,
+        )
+        replayed = self.client.post(
+            path,
+            params={"cluster_id": "cluster-a"},
+            json={"hold_id": hold_id, "reason": "customer legal request"},
+            headers=admin_headers,
+        )
+        listed = self.client.get(
+            path,
+            params={"cluster_id": "cluster-a", "state": "active"},
+            headers=admin_headers,
+        )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(placed.status_code, 201)
+        self.assertEqual(replayed.status_code, 201)
+        self.assertEqual(placed.json()["placed_by_credential_id"], "test-retention")
+        self.assertEqual(placed.json()["reason"], "customer legal request")
+        self.assertEqual(len(listed.json()), 1)
+
+        wrong_attempt = self.client.delete(
+            f"/v1/attempts/different-attempt/retention-holds/{hold_id}",
+            params={"cluster_id": "cluster-a"},
+            headers=admin_headers,
+        )
+        released = self.client.delete(
+            f"{path}/{hold_id}",
+            params={"cluster_id": "cluster-a"},
+            headers=admin_headers,
+        )
+        released_again = self.client.delete(
+            f"{path}/{hold_id}",
+            params={"cluster_id": "cluster-a"},
+            headers=admin_headers,
+        )
+        released_list = self.client.get(
+            path,
+            params={"cluster_id": "cluster-a", "state": "released"},
+            headers=admin_headers,
+        )
+
+        self.assertEqual(wrong_attempt.status_code, 404)
+        self.assertEqual(released.status_code, 200)
+        self.assertEqual(released.json()["state"], "released")
+        self.assertEqual(released.json()["released_by_credential_id"], "test-retention")
+        self.assertEqual(released_again.status_code, 200)
+        self.assertEqual(len(released_list.json()), 1)
 
     def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}

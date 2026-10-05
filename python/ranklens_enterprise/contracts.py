@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -202,6 +203,28 @@ class AttemptPage(BaseModel):
 
     items: List[AttemptView]
     next_cursor: Optional[str] = None
+
+
+class RetentionHoldCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    hold_id: UUID
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class RetentionHoldView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hold_id: UUID
+    tenant_id: str
+    cluster_id: str
+    attempt_id: str
+    reason: str
+    state: Literal["active", "released"]
+    placed_by_credential_id: str
+    released_by_credential_id: Optional[str] = None
+    placed_at: datetime
+    released_at: Optional[datetime] = None
 
 
 class HealthStatus(BaseModel):
