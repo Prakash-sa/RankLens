@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -56,6 +57,8 @@ class PreparedPayload:
 
 
 class IngestionService:
+    _ACTOR_CREDENTIAL_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
     def __init__(
         self,
         sessions: sessionmaker[Session],
@@ -449,6 +452,8 @@ class IngestionService:
         attempt_id: str,
         hold_id: str,
         reason: str,
+        *,
+        placed_by_credential_id: str = "internal",
     ) -> None:
         try:
             normalized_hold_id = str(uuid.UUID(hold_id))
@@ -459,6 +464,8 @@ class IngestionService:
         reason = reason.strip()
         if not reason or len(reason) > 512:
             raise ValueError("hold reason must contain between 1 and 512 characters")
+        if self._ACTOR_CREDENTIAL_ID.fullmatch(placed_by_credential_id) is None:
+            raise ValueError("placing credential ID is invalid")
         identity = (tenant_id, cluster_id, attempt_id)
         with self._sessions.begin() as session:
             lock_stream(session, f"attempt:{':'.join(identity)}")
@@ -488,6 +495,8 @@ class IngestionService:
                     cluster_id=cluster_id,
                     attempt_id=attempt_id,
                     reason=reason,
+                    placed_by_credential_id=placed_by_credential_id,
+                    released_by_credential_id=None,
                     state="active",
                     placed_at=utc_now(),
                     released_at=None,
@@ -500,7 +509,14 @@ class IngestionService:
                 deletion.last_error = "physical erasure blocked by retention hold"
                 deletion.completed_at = None
 
-    def release_attempt_hold(self, hold_id: str) -> bool:
+    def release_attempt_hold(
+        self,
+        hold_id: str,
+        *,
+        released_by_credential_id: str = "internal",
+    ) -> bool:
+        if self._ACTOR_CREDENTIAL_ID.fullmatch(released_by_credential_id) is None:
+            raise ValueError("releasing credential ID is invalid")
         with self._sessions.begin() as session:
             hold = session.get(AttemptHold, hold_id)
             if hold is None:
@@ -511,6 +527,7 @@ class IngestionService:
                 return False
             hold.state = "released"
             hold.released_at = utc_now()
+            hold.released_by_credential_id = released_by_credential_id
             session.flush()
             if self._active_hold_ids(session, *identity):
                 return True

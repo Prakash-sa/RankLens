@@ -613,10 +613,20 @@ class EnterpriseIngestionTests(unittest.TestCase):
         first_hold = "00000000-0000-0000-0000-000000000061"
         second_hold = "00000000-0000-0000-0000-000000000062"
         self.service.place_attempt_hold(
-            "tenant-a", "cluster-a", "attempt-1", first_hold, "legal review"
+            "tenant-a",
+            "cluster-a",
+            "attempt-1",
+            first_hold,
+            "legal review",
+            placed_by_credential_id="retention-admin-a",
         )
         self.service.place_attempt_hold(
-            "tenant-a", "cluster-a", "attempt-1", first_hold, "legal review"
+            "tenant-a",
+            "cluster-a",
+            "attempt-1",
+            first_hold,
+            "legal review",
+            placed_by_credential_id="retention-admin-b",
         )
         self.service.place_attempt_hold(
             "tenant-a", "cluster-a", "attempt-1", second_hold, "customer request"
@@ -640,15 +650,26 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(
                 session.scalar(select(func.count()).select_from(AttemptHold)), 2
             )
+            first = session.get(AttemptHold, first_hold)
+            assert first is not None
+            self.assertEqual(first.placed_by_credential_id, "retention-admin-a")
+            self.assertIsNone(first.released_by_credential_id)
         self.assertTrue(self.objects.exists_verified(receipt.object_key, receipt.payload_sha256))
 
-        self.assertTrue(self.service.release_attempt_hold(first_hold))
+        self.assertTrue(
+            self.service.release_attempt_hold(
+                first_hold, released_by_credential_id="retention-admin-b"
+            )
+        )
         with self.sessions() as session:
             deletion = session.get(
                 AttemptDeletion, ("tenant-a", "cluster-a", "attempt-1")
             )
             assert deletion is not None
             self.assertEqual(deletion.state, "held")
+            first = session.get(AttemptHold, first_hold)
+            assert first is not None
+            self.assertEqual(first.released_by_credential_id, "retention-admin-b")
 
         self.assertTrue(self.service.release_attempt_hold(second_hold))
         self.assertFalse(self.service.release_attempt_hold(second_hold))

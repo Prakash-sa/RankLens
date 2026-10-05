@@ -47,6 +47,12 @@ class AttemptHold(Base):
     cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
     attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    placed_by_credential_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="internal"
+    )
+    released_by_credential_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     state: Mapped[str] = mapped_column(String(24), nullable=False)
     placed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     released_at: Mapped[Optional[datetime]] = mapped_column(
