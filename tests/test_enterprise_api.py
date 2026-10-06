@@ -238,6 +238,92 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(released_again.status_code, 200)
         self.assertEqual(len(released_list.json()), 1)
 
+    def test_retention_admin_versions_cluster_policy_for_new_attempts(self) -> None:
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        read_headers = {"authorization": f"Bearer {self.read_token}"}
+        admin_headers = {"authorization": f"Bearer {self.retention_token}"}
+        policy_path = "/v1/retention-policies/cluster-a"
+
+        forbidden = self.client.put(
+            policy_path,
+            json={"retention_seconds": 3600},
+            headers=read_headers,
+        )
+        invalid = self.client.put(
+            policy_path,
+            json={"retention_seconds": 300},
+            headers=admin_headers,
+        )
+        first_policy = self.client.put(
+            policy_path,
+            json={"retention_seconds": 3600},
+            headers=admin_headers,
+        )
+        first_body = self.request_body()
+        first_body.update(
+            {
+                "attempt_id": "attempt-policy-api-one",
+                "producer_id": "node-agent-policy-api-one",
+            }
+        )
+        first_admission = self.client.post(
+            "/v1/segments", json=first_body, headers=ingest_headers
+        )
+
+        second_policy = self.client.put(
+            policy_path,
+            json={"retention_seconds": 7200},
+            headers=admin_headers,
+        )
+        second_body = self.request_body()
+        second_body.update(
+            {
+                "attempt_id": "attempt-policy-api-two",
+                "producer_id": "node-agent-policy-api-two",
+            }
+        )
+        second_admission = self.client.post(
+            "/v1/segments", json=second_body, headers=ingest_headers
+        )
+        history = self.client.get(policy_path, headers=admin_headers)
+        hidden = self.client.get(policy_path, headers=read_headers)
+        wrong_cluster = self.client.put(
+            "/v1/retention-policies/cluster-b",
+            json={"retention_seconds": 3600},
+            headers=admin_headers,
+        )
+        first_attempt = self.client.get(
+            "/v1/attempts/attempt-policy-api-one",
+            params={"cluster_id": "cluster-a"},
+            headers=read_headers,
+        )
+        second_attempt = self.client.get(
+            "/v1/attempts/attempt-policy-api-two",
+            params={"cluster_id": "cluster-a"},
+            headers=read_headers,
+        )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(first_policy.status_code, 201)
+        self.assertEqual(first_policy.json()["version"], 1)
+        self.assertTrue(first_policy.json()["automatic_expiry_enabled"])
+        self.assertEqual(first_admission.status_code, 201)
+        self.assertEqual(second_policy.status_code, 201)
+        self.assertEqual(second_policy.json()["version"], 2)
+        self.assertEqual(second_admission.status_code, 201)
+        self.assertEqual([item["version"] for item in history.json()], [2, 1])
+        self.assertEqual(
+            {item["created_by_credential_id"] for item in history.json()},
+            {"test-retention"},
+        )
+        self.assertEqual(hidden.status_code, 403)
+        self.assertEqual(wrong_cluster.status_code, 404)
+        self.assertEqual(first_attempt.json()["retention_policy_version"], 1)
+        self.assertIsNotNone(first_attempt.json()["retention_expires_at"])
+        self.assertEqual(second_attempt.json()["retention_policy_version"], 2)
+        self.assertIsNotNone(second_attempt.json()["retention_expires_at"])
+
     def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}
         first_body = self.request_body()

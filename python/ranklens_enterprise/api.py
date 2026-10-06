@@ -28,6 +28,8 @@ from .contracts import (
     ReportRevisionView,
     RetentionHoldCreate,
     RetentionHoldView,
+    RetentionPolicyUpdate,
+    RetentionPolicyView,
     SchedulerObservationView,
     SegmentUpload,
 )
@@ -37,6 +39,7 @@ from .database import (
     AttemptRecord,
     ReportHead,
     ReportRevision,
+    RetentionPolicyRevision,
     SchedulerObservation,
     assert_schema_ready,
     build_engine,
@@ -259,6 +262,93 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=409,
             detail={"code": "retention_hold_conflict", "message": message},
         )
+
+    def retention_policy_view(
+        policy: RetentionPolicyRevision,
+    ) -> RetentionPolicyView:
+        return RetentionPolicyView(
+            tenant_id=policy.tenant_id,
+            cluster_id=policy.cluster_id,
+            version=policy.version,
+            retention_seconds=policy.retention_seconds,
+            automatic_expiry_enabled=policy.retention_seconds > 0,
+            created_by_credential_id=policy.created_by_credential_id,
+            created_at=policy.created_at,
+        )
+
+    @app.put(
+        "/v1/retention-policies/{cluster_id}",
+        response_model=RetentionPolicyView,
+        status_code=201,
+    )
+    def create_retention_policy(
+        request: RetentionPolicyUpdate,
+        cluster_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> RetentionPolicyView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        try:
+            service.create_retention_policy_revision(
+                principal.tenant_id,
+                cluster_id,
+                request.retention_seconds,
+                principal.credential_id,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "retention_policy_rejected", "message": str(error)},
+            ) from error
+        with sessions() as session:
+            policy = session.scalar(
+                select(RetentionPolicyRevision)
+                .where(
+                    RetentionPolicyRevision.tenant_id == principal.tenant_id,
+                    RetentionPolicyRevision.cluster_id == cluster_id,
+                )
+                .order_by(RetentionPolicyRevision.version.desc())
+                .limit(1)
+            )
+            if policy is None:
+                raise HTTPException(
+                    status_code=503, detail={"code": "retention_policy_unavailable"}
+                )
+            return retention_policy_view(policy)
+
+    @app.get(
+        "/v1/retention-policies/{cluster_id}",
+        response_model=List[RetentionPolicyView],
+    )
+    def retention_policy_history(
+        cluster_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        limit: int = Query(default=50, ge=1, le=500),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> List[RetentionPolicyView]:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = (
+            select(RetentionPolicyRevision)
+            .where(
+                RetentionPolicyRevision.tenant_id == principal.tenant_id,
+                RetentionPolicyRevision.cluster_id == cluster_id,
+            )
+            .order_by(RetentionPolicyRevision.version.desc())
+            .limit(limit)
+        )
+        with sessions() as session:
+            return [
+                retention_policy_view(policy)
+                for policy in session.scalars(statement).all()
+            ]
 
     @app.post(
         "/v1/attempts/{attempt_id}/retention-holds",

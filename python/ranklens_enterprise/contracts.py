@@ -228,6 +228,30 @@ class RetentionHoldView(BaseModel):
     released_at: Optional[datetime] = None
 
 
+class RetentionPolicyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    retention_seconds: int = Field(ge=0, le=315360000)
+
+    @model_validator(mode="after")
+    def validate_retention_seconds(self) -> "RetentionPolicyUpdate":
+        if self.retention_seconds != 0 and self.retention_seconds < 3600:
+            raise ValueError("retention_seconds must be 0 or at least 3600")
+        return self
+
+
+class RetentionPolicyView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    cluster_id: str
+    version: int
+    retention_seconds: int
+    automatic_expiry_enabled: bool
+    created_by_credential_id: str
+    created_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"] = "ok"
     service: Literal["ranklens-enterprise-api"] = "ranklens-enterprise-api"

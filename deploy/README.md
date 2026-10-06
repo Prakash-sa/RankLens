@@ -20,6 +20,10 @@ Use a separate credential with `telemetry:read` for read-only API clients, and g
 offset-aware ISO-8601 timestamps; overlapping old and new credentials support a controlled rotation.
 Removing a credential from the configuration revokes it after the API is restarted.
 
+Retention administrators can also create append-only cluster policy revisions. A policy applies to
+new attempts only, so later edits never silently rewrite an existing attempt's fixed expiry. Use a
+retention value of zero to disable automatic expiry for new attempts in that cluster.
+
 The API binds only to loopback on port 8080. Put a site-approved TLS/mTLS reverse proxy in front of
 it before an agent connects from another host. Do not put the password, token, or credential JSON in this repository
 or the Compose file. Production deployments must pin image digests, use a KMS/secrets manager,
