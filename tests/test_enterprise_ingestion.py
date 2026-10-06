@@ -23,6 +23,7 @@ from ranklens_enterprise.database import (
     OutboxRecord,
     ReportHead,
     ReportRevision,
+    RetentionPolicyRevision,
     SegmentManifest,
     build_engine,
     build_session_factory,
@@ -196,6 +197,88 @@ class EnterpriseIngestionTests(unittest.TestCase):
             )
             assert attempt is not None
             self.assertEqual(attempt.retention_expires_at, first_deadline)
+            self.assertIsNone(attempt.retention_policy_version)
+
+    def test_append_only_cluster_policy_is_fixed_at_first_admission(self) -> None:
+        first_policy = self.service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 3600, "retention-admin-a"
+        )
+        self.assertEqual(first_policy.version, 1)
+        first_segment = self.segment(attempt_id="attempt-policy-one").model_copy(
+            update={"producer_id": "node-agent-policy-one"}
+        )
+        self.service.admit(self.principal, first_segment)
+
+        second_policy = self.service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 7200, "retention-admin-b"
+        )
+        self.assertEqual(second_policy.version, 2)
+        self.service.admit(
+            self.principal,
+            self.segment(
+                b'{"record":"later"}\n',
+                first=1,
+                last=1,
+                attempt_id="attempt-policy-one",
+            ).model_copy(update={"producer_id": "node-agent-policy-one"}),
+        )
+        self.service.admit(
+            self.principal,
+            self.segment(attempt_id="attempt-policy-two").model_copy(
+                update={"producer_id": "node-agent-policy-two"}
+            ),
+        )
+        disabled_policy = self.service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 0, "retention-admin-c"
+        )
+        self.assertEqual(disabled_policy.version, 3)
+        self.service.admit(
+            self.principal,
+            self.segment(attempt_id="attempt-policy-disabled").model_copy(
+                update={"producer_id": "node-agent-policy-disabled"}
+            ),
+        )
+
+        with self.sessions() as session:
+            first = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "attempt-policy-one")
+            )
+            second = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "attempt-policy-two")
+            )
+            disabled = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "attempt-policy-disabled"),
+            )
+            assert first is not None
+            assert second is not None
+            assert disabled is not None
+            assert first.retention_expires_at is not None
+            assert second.retention_expires_at is not None
+            self.assertEqual(first.retention_policy_version, 1)
+            self.assertEqual(
+                first.retention_expires_at - first.first_admitted_at,
+                timedelta(seconds=3600),
+            )
+            self.assertEqual(second.retention_policy_version, 2)
+            self.assertEqual(
+                second.retention_expires_at - second.first_admitted_at,
+                timedelta(seconds=7200),
+            )
+            self.assertEqual(disabled.retention_policy_version, 3)
+            self.assertIsNone(disabled.retention_expires_at)
+            revisions = list(
+                session.scalars(
+                    select(RetentionPolicyRevision).order_by(
+                        RetentionPolicyRevision.version
+                    )
+                )
+            )
+            self.assertEqual([item.version for item in revisions], [1, 2, 3])
+            self.assertEqual(
+                [item.created_by_credential_id for item in revisions],
+                ["retention-admin-a", "retention-admin-b", "retention-admin-c"],
+            )
 
     def test_admission_rejects_conflicting_attempt_binding(self) -> None:
         self.service.admit(

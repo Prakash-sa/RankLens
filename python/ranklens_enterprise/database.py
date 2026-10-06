@@ -124,8 +124,32 @@ class AttemptRecord(Base):
     retention_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    retention_policy_version: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
     segment_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     record_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
+class RetentionPolicyRevision(Base):
+    """Append-only cluster retention policy used for new attempt admissions."""
+
+    __tablename__ = "retention_policy_revisions"
+    __table_args__ = (
+        Index(
+            "ix_retention_policy_latest",
+            "tenant_id",
+            "cluster_id",
+            "version",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    retention_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AdmissionReservation(Base):

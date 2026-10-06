@@ -23,6 +23,7 @@ from .database import (
     AttemptHold,
     AttemptRecord,
     OutboxRecord,
+    RetentionPolicyRevision,
     SegmentManifest,
     lock_stream,
     utc_now,
@@ -54,6 +55,16 @@ class DeletionHeldError(RuntimeError):
 class PreparedPayload:
     content: bytes
     object_key: str
+
+
+@dataclass(frozen=True)
+class RetentionPolicyDecision:
+    tenant_id: str
+    cluster_id: str
+    version: int
+    retention_seconds: int
+    created_by_credential_id: str
+    created_at: datetime
 
 
 class IngestionService:
@@ -199,6 +210,20 @@ class IngestionService:
             "scheduler_source_identity": segment.scheduler_source_identity,
         }
         if record is None:
+            policy = session.scalar(
+                select(RetentionPolicyRevision)
+                .where(
+                    RetentionPolicyRevision.tenant_id == tenant_id,
+                    RetentionPolicyRevision.cluster_id == segment.cluster_id,
+                )
+                .order_by(RetentionPolicyRevision.version.desc())
+                .limit(1)
+            )
+            retention_seconds = (
+                policy.retention_seconds
+                if policy is not None
+                else self._default_retention_seconds
+            )
             session.add(
                 AttemptRecord(
                     tenant_id=tenant_id,
@@ -210,9 +235,12 @@ class IngestionService:
                     first_admitted_at=committed_at,
                     last_admitted_at=committed_at,
                     retention_expires_at=(
-                        committed_at + timedelta(seconds=self._default_retention_seconds)
-                        if self._default_retention_seconds > 0
+                        committed_at + timedelta(seconds=retention_seconds)
+                        if retention_seconds > 0
                         else None
+                    ),
+                    retention_policy_version=(
+                        policy.version if policy is not None else None
                     ),
                     segment_count=1,
                     record_count=segment.record_count,
@@ -231,6 +259,53 @@ class IngestionService:
         record.last_admitted_at = committed_at
         record.segment_count += 1
         record.record_count += segment.record_count
+
+    def create_retention_policy_revision(
+        self,
+        tenant_id: str,
+        cluster_id: str,
+        retention_seconds: int,
+        created_by_credential_id: str,
+    ) -> RetentionPolicyDecision:
+        if retention_seconds != 0 and not 3600 <= retention_seconds <= 315360000:
+            raise ValueError(
+                "retention_seconds must be 0 or within [3600, 315360000]"
+            )
+        if self._ACTOR_CREDENTIAL_ID.fullmatch(created_by_credential_id) is None:
+            raise ValueError("retention policy credential ID is invalid")
+        if not cluster_id or len(cluster_id) > 128:
+            raise ValueError("cluster ID is invalid")
+        now = utc_now()
+        with self._sessions.begin() as session:
+            lock_stream(session, f"retention-policy:{tenant_id}:{cluster_id}")
+            latest = session.scalar(
+                select(RetentionPolicyRevision)
+                .where(
+                    RetentionPolicyRevision.tenant_id == tenant_id,
+                    RetentionPolicyRevision.cluster_id == cluster_id,
+                )
+                .order_by(RetentionPolicyRevision.version.desc())
+                .limit(1)
+            )
+            version = 1 if latest is None else latest.version + 1
+            policy = RetentionPolicyRevision(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                version=version,
+                retention_seconds=retention_seconds,
+                created_by_credential_id=created_by_credential_id,
+                created_at=now,
+            )
+            session.add(policy)
+            session.flush()
+            return RetentionPolicyDecision(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                version=version,
+                retention_seconds=retention_seconds,
+                created_by_credential_id=created_by_credential_id,
+                created_at=now,
+            )
 
     def admit(self, principal: MachinePrincipal, segment: SegmentUpload) -> DurableReceipt:
         self._assert_scope(principal, segment)

@@ -191,6 +191,7 @@ class AttemptView(BaseModel):
     retention_status: Literal["none", "held"]
     active_retention_holds: int
     retention_expires_at: Optional[datetime] = None
+    retention_policy_version: Optional[int] = None
     first_admitted_at: datetime
     last_admitted_at: datetime
     segment_count: int

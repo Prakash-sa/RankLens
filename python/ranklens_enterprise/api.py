@@ -180,6 +180,7 @@ def create_app(settings: Settings) -> FastAPI:
             retention_status="held" if active_hold_count > 0 else "none",
             active_retention_holds=active_hold_count,
             retention_expires_at=record.retention_expires_at,
+            retention_policy_version=record.retention_policy_version,
             first_admitted_at=record.first_admitted_at,
             last_admitted_at=record.last_admitted_at,
             segment_count=record.segment_count,
