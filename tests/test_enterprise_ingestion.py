@@ -23,6 +23,7 @@ from ranklens_enterprise.database import (
     OutboxRecord,
     ReportHead,
     ReportRevision,
+    RetentionPolicyBackfill,
     RetentionPolicyRevision,
     SegmentManifest,
     build_engine,
@@ -278,6 +279,134 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(
                 [item.created_by_credential_id for item in revisions],
                 ["retention-admin-a", "retention-admin-b", "retention-admin-c"],
+            )
+
+    def test_reviewed_retention_backfill_is_bounded_audited_and_hold_aware(self) -> None:
+        now = datetime.now(timezone.utc)
+        for attempt_id in ("legacy-due", "legacy-held", "legacy-future", "legacy-deleting"):
+            self.service.admit(
+                self.principal,
+                self.segment(attempt_id=attempt_id).model_copy(
+                    update={"producer_id": f"node-{attempt_id}"}
+                ),
+            )
+        hold_id = "00000000-0000-0000-0000-000000000091"
+        self.service.place_attempt_hold(
+            "tenant-a",
+            "cluster-a",
+            "legacy-held",
+            hold_id,
+            "preserve investigation evidence",
+        )
+        self.service.delete_attempt("tenant-a", "cluster-a", "legacy-deleting")
+        with self.sessions.begin() as session:
+            for attempt_id in ("legacy-due", "legacy-held", "legacy-deleting"):
+                attempt = session.get(
+                    AttemptRecord, ("tenant-a", "cluster-a", attempt_id)
+                )
+                assert attempt is not None
+                attempt.first_admitted_at = now - timedelta(hours=2)
+            future = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "legacy-future")
+            )
+            assert future is not None
+            future.first_admitted_at = now
+
+        policy = self.service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 3600, "retention-admin-a"
+        )
+        with self.assertRaisesRegex(ValueError, "exceed max_attempts"):
+            self.service.preview_retention_policy_backfill(
+                "tenant-a", "cluster-a", policy.version, 2
+            )
+        preview = self.service.preview_retention_policy_backfill(
+            "tenant-a", "cluster-a", policy.version, 10
+        )
+        self.assertEqual(preview.eligible_attempts, 3)
+        self.assertEqual(preview.due_attempts, 2)
+        self.assertEqual(preview.updated_attempts, 0)
+        self.assertIsNone(preview.backfill_id)
+
+        with self.assertRaisesRegex(ValueError, "preview is stale"):
+            self.service.apply_retention_policy_backfill(
+                "tenant-a",
+                "cluster-a",
+                policy.version,
+                10,
+                expected_eligible_attempts=4,
+                expected_due_attempts=2,
+                requested_by_credential_id="retention-admin-a",
+            )
+        with self.sessions() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(RetentionPolicyBackfill)),
+                0,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count())
+                    .select_from(AttemptRecord)
+                    .where(AttemptRecord.retention_policy_version.is_not(None))
+                ),
+                0,
+            )
+
+        applied = self.service.apply_retention_policy_backfill(
+            "tenant-a",
+            "cluster-a",
+            policy.version,
+            10,
+            expected_eligible_attempts=preview.eligible_attempts,
+            expected_due_attempts=preview.due_attempts,
+            requested_by_credential_id="retention-admin-a",
+        )
+        self.assertEqual(applied.updated_attempts, 3)
+        self.assertIsNotNone(applied.backfill_id)
+        self.assertEqual(
+            self.service.preview_retention_policy_backfill(
+                "tenant-a", "cluster-a", policy.version, 10
+            ).eligible_attempts,
+            0,
+        )
+        with self.sessions() as session:
+            audit = session.get(RetentionPolicyBackfill, applied.backfill_id)
+            assert audit is not None
+            self.assertEqual(audit.requested_by_credential_id, "retention-admin-a")
+            self.assertEqual(audit.updated_attempts, 3)
+            deleting = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "legacy-deleting")
+            )
+            assert deleting is not None
+            self.assertIsNone(deleting.retention_policy_version)
+            future = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "legacy-future")
+            )
+            assert future is not None
+            self.assertEqual(future.retention_policy_version, policy.version)
+            self.assertEqual(
+                future.retention_expires_at - future.first_admitted_at,
+                timedelta(seconds=3600),
+            )
+
+        sweeper = RetentionSweeper(
+            self.sessions,
+            self.service,
+            batch_size=10,
+            clock=lambda: now,
+        )
+        self.assertEqual(sweeper.run_once(), {"queued": 1, "held": 1})
+        with self.sessions() as session:
+            self.assertEqual(
+                session.get(
+                    AttemptDeletion, ("tenant-a", "cluster-a", "legacy-due")
+                ).state,
+                "pending",
+            )
+            self.assertEqual(
+                session.get(
+                    AttemptDeletion, ("tenant-a", "cluster-a", "legacy-held")
+                ).state,
+                "held",
             )
 
     def test_admission_rejects_conflicting_attempt_binding(self) -> None:

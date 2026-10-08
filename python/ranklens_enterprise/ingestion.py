@@ -23,6 +23,7 @@ from .database import (
     AttemptHold,
     AttemptRecord,
     OutboxRecord,
+    RetentionPolicyBackfill,
     RetentionPolicyRevision,
     SegmentManifest,
     lock_stream,
@@ -65,6 +66,19 @@ class RetentionPolicyDecision:
     retention_seconds: int
     created_by_credential_id: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class RetentionPolicyBackfillDecision:
+    tenant_id: str
+    cluster_id: str
+    policy_version: int
+    eligible_attempts: int
+    due_attempts: int
+    updated_attempts: int
+    backfill_id: Optional[str] = None
+    requested_by_credential_id: Optional[str] = None
+    requested_at: Optional[datetime] = None
 
 
 class IngestionService:
@@ -305,6 +319,183 @@ class IngestionService:
                 retention_seconds=retention_seconds,
                 created_by_credential_id=created_by_credential_id,
                 created_at=now,
+            )
+
+    @staticmethod
+    def _retention_deadline_is_due(deadline: datetime, now: datetime) -> bool:
+        if deadline.tzinfo is None and now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        elif deadline.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=deadline.tzinfo)
+        return deadline <= now
+
+    @staticmethod
+    def _retention_backfill_policy(
+        session: Session,
+        tenant_id: str,
+        cluster_id: str,
+        policy_version: int,
+    ) -> RetentionPolicyRevision:
+        policy = session.get(
+            RetentionPolicyRevision,
+            (tenant_id, cluster_id, policy_version),
+        )
+        if policy is None:
+            raise ValueError("retention policy revision does not exist")
+        return policy
+
+    @staticmethod
+    def _retention_backfill_candidates(
+        session: Session,
+        tenant_id: str,
+        cluster_id: str,
+        max_attempts: int,
+    ) -> list[AttemptRecord]:
+        deletion_exists = (
+            select(AttemptDeletion.attempt_id)
+            .where(
+                AttemptDeletion.tenant_id == AttemptRecord.tenant_id,
+                AttemptDeletion.cluster_id == AttemptRecord.cluster_id,
+                AttemptDeletion.attempt_id == AttemptRecord.attempt_id,
+            )
+            .exists()
+        )
+        attempts = list(
+            session.scalars(
+                select(AttemptRecord)
+                .where(
+                    AttemptRecord.tenant_id == tenant_id,
+                    AttemptRecord.cluster_id == cluster_id,
+                    AttemptRecord.retention_policy_version.is_(None),
+                    ~deletion_exists,
+                )
+                .order_by(AttemptRecord.attempt_id)
+                .limit(max_attempts + 1)
+            )
+        )
+        if len(attempts) > max_attempts:
+            raise ValueError(
+                "eligible attempts exceed max_attempts; increase the explicit bound"
+            )
+        return attempts
+
+    def _retention_backfill_decision(
+        self,
+        session: Session,
+        tenant_id: str,
+        cluster_id: str,
+        policy_version: int,
+        max_attempts: int,
+        now: datetime,
+    ) -> tuple[RetentionPolicyRevision, list[AttemptRecord], int]:
+        if not 1 <= max_attempts <= 1000:
+            raise ValueError("max_attempts must be within [1, 1000]")
+        policy = self._retention_backfill_policy(
+            session, tenant_id, cluster_id, policy_version
+        )
+        attempts = self._retention_backfill_candidates(
+            session, tenant_id, cluster_id, max_attempts
+        )
+        due_attempts = 0
+        if policy.retention_seconds > 0:
+            for attempt in attempts:
+                deadline = attempt.first_admitted_at + timedelta(
+                    seconds=policy.retention_seconds
+                )
+                if self._retention_deadline_is_due(deadline, now):
+                    due_attempts += 1
+        return policy, attempts, due_attempts
+
+    def preview_retention_policy_backfill(
+        self,
+        tenant_id: str,
+        cluster_id: str,
+        policy_version: int,
+        max_attempts: int,
+    ) -> RetentionPolicyBackfillDecision:
+        now = utc_now()
+        with self._sessions() as session:
+            _, attempts, due_attempts = self._retention_backfill_decision(
+                session,
+                tenant_id,
+                cluster_id,
+                policy_version,
+                max_attempts,
+                now,
+            )
+            return RetentionPolicyBackfillDecision(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                policy_version=policy_version,
+                eligible_attempts=len(attempts),
+                due_attempts=due_attempts,
+                updated_attempts=0,
+            )
+
+    def apply_retention_policy_backfill(
+        self,
+        tenant_id: str,
+        cluster_id: str,
+        policy_version: int,
+        max_attempts: int,
+        expected_eligible_attempts: int,
+        expected_due_attempts: int,
+        requested_by_credential_id: str,
+    ) -> RetentionPolicyBackfillDecision:
+        if self._ACTOR_CREDENTIAL_ID.fullmatch(requested_by_credential_id) is None:
+            raise ValueError("retention policy credential ID is invalid")
+        if expected_eligible_attempts < 0 or expected_due_attempts < 0:
+            raise ValueError("expected attempt counts cannot be negative")
+        now = utc_now()
+        with self._sessions.begin() as session:
+            lock_stream(session, f"retention-policy-backfill:{tenant_id}:{cluster_id}")
+            policy, attempts, due_attempts = self._retention_backfill_decision(
+                session,
+                tenant_id,
+                cluster_id,
+                policy_version,
+                max_attempts,
+                now,
+            )
+            if (
+                len(attempts) != expected_eligible_attempts
+                or due_attempts != expected_due_attempts
+            ):
+                raise ValueError(
+                    "retention policy backfill preview is stale; preview again"
+                )
+            for attempt in attempts:
+                attempt.retention_policy_version = policy.version
+                attempt.retention_expires_at = (
+                    attempt.first_admitted_at
+                    + timedelta(seconds=policy.retention_seconds)
+                    if policy.retention_seconds > 0
+                    else None
+                )
+            backfill_id = str(uuid.uuid4())
+            session.add(
+                RetentionPolicyBackfill(
+                    backfill_id=backfill_id,
+                    tenant_id=tenant_id,
+                    cluster_id=cluster_id,
+                    policy_version=policy.version,
+                    eligible_attempts=len(attempts),
+                    due_attempts=due_attempts,
+                    updated_attempts=len(attempts),
+                    requested_by_credential_id=requested_by_credential_id,
+                    requested_at=now,
+                )
+            )
+            return RetentionPolicyBackfillDecision(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                policy_version=policy.version,
+                eligible_attempts=len(attempts),
+                due_attempts=due_attempts,
+                updated_attempts=len(attempts),
+                backfill_id=backfill_id,
+                requested_by_credential_id=requested_by_credential_id,
+                requested_at=now,
             )
 
     def admit(self, principal: MachinePrincipal, segment: SegmentUpload) -> DurableReceipt:

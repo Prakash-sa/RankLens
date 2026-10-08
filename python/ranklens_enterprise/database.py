@@ -152,6 +152,30 @@ class RetentionPolicyRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class RetentionPolicyBackfill(Base):
+    """Audited application of one policy revision to legacy attempts."""
+
+    __tablename__ = "retention_policy_backfills"
+    __table_args__ = (
+        Index(
+            "ix_retention_policy_backfill_history",
+            "tenant_id",
+            "cluster_id",
+            "requested_at",
+        ),
+    )
+
+    backfill_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    policy_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    eligible_attempts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    due_attempts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_attempts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    requested_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AdmissionReservation(Base):
     __tablename__ = "admission_reservations"
     __table_args__ = (
