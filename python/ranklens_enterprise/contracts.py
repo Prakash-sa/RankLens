@@ -252,6 +252,40 @@ class RetentionPolicyView(BaseModel):
     created_at: datetime
 
 
+class RetentionPolicyBackfillRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_version: int = Field(ge=1, le=2**63 - 1)
+    max_attempts: int = Field(default=1000, ge=1, le=1000)
+    apply: bool = False
+    expected_eligible_attempts: Optional[int] = Field(default=None, ge=0, le=1000)
+    expected_due_attempts: Optional[int] = Field(default=None, ge=0, le=1000)
+
+    @model_validator(mode="after")
+    def validate_apply_confirmation(self) -> "RetentionPolicyBackfillRequest":
+        expected = (self.expected_eligible_attempts, self.expected_due_attempts)
+        if self.apply and any(value is None for value in expected):
+            raise ValueError("apply requires both expected attempt counts from a preview")
+        if not self.apply and any(value is not None for value in expected):
+            raise ValueError("preview requests cannot include expected attempt counts")
+        return self
+
+
+class RetentionPolicyBackfillView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["preview", "applied"]
+    backfill_id: Optional[UUID] = None
+    tenant_id: str
+    cluster_id: str
+    policy_version: int
+    eligible_attempts: int
+    due_attempts: int
+    updated_attempts: int
+    requested_by_credential_id: Optional[str] = None
+    requested_at: Optional[datetime] = None
+
+
 class HealthStatus(BaseModel):
     status: Literal["ok"] = "ok"
     service: Literal["ranklens-enterprise-api"] = "ranklens-enterprise-api"

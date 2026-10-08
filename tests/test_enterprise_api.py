@@ -324,6 +324,102 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(second_attempt.json()["retention_policy_version"], 2)
         self.assertIsNotNone(second_attempt.json()["retention_expires_at"])
 
+    def test_retention_admin_previews_and_confirms_legacy_attempt_backfill(self) -> None:
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        read_headers = {"authorization": f"Bearer {self.read_token}"}
+        admin_headers = {"authorization": f"Bearer {self.retention_token}"}
+        for attempt_id in ("legacy-api-one", "legacy-api-two"):
+            body = self.request_body()
+            body.update(
+                {"attempt_id": attempt_id, "producer_id": f"node-{attempt_id}"}
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/v1/segments", json=body, headers=ingest_headers
+                ).status_code,
+                201,
+            )
+        policy = self.client.put(
+            "/v1/retention-policies/cluster-a",
+            json={"retention_seconds": 3600},
+            headers=admin_headers,
+        )
+        self.assertEqual(policy.status_code, 201)
+        path = "/v1/retention-policies/cluster-a/backfills"
+
+        forbidden = self.client.post(
+            path,
+            json={"policy_version": 1},
+            headers=read_headers,
+        )
+        missing_confirmation = self.client.post(
+            path,
+            json={"policy_version": 1, "apply": True},
+            headers=admin_headers,
+        )
+        preview = self.client.post(
+            path,
+            json={"policy_version": 1, "max_attempts": 10},
+            headers=admin_headers,
+        )
+        stale = self.client.post(
+            path,
+            json={
+                "policy_version": 1,
+                "max_attempts": 10,
+                "apply": True,
+                "expected_eligible_attempts": 1,
+                "expected_due_attempts": 0,
+            },
+            headers=admin_headers,
+        )
+        applied = self.client.post(
+            path,
+            json={
+                "policy_version": 1,
+                "max_attempts": 10,
+                "apply": True,
+                "expected_eligible_attempts": preview.json()["eligible_attempts"],
+                "expected_due_attempts": preview.json()["due_attempts"],
+            },
+            headers=admin_headers,
+        )
+        repeated_preview = self.client.post(
+            path,
+            json={"policy_version": 1, "max_attempts": 10},
+            headers=admin_headers,
+        )
+        wrong_cluster = self.client.post(
+            "/v1/retention-policies/cluster-b/backfills",
+            json={"policy_version": 1},
+            headers=admin_headers,
+        )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(missing_confirmation.status_code, 422)
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()["mode"], "preview")
+        self.assertEqual(preview.json()["eligible_attempts"], 2)
+        self.assertEqual(preview.json()["updated_attempts"], 0)
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.json()["mode"], "applied")
+        self.assertEqual(applied.json()["updated_attempts"], 2)
+        self.assertEqual(
+            applied.json()["requested_by_credential_id"], "test-retention"
+        )
+        self.assertIsNotNone(applied.json()["backfill_id"])
+        self.assertEqual(repeated_preview.json()["eligible_attempts"], 0)
+        self.assertEqual(wrong_cluster.status_code, 404)
+        for attempt_id in ("legacy-api-one", "legacy-api-two"):
+            detail = self.client.get(
+                f"/v1/attempts/{attempt_id}",
+                params={"cluster_id": "cluster-a"},
+                headers=read_headers,
+            )
+            self.assertEqual(detail.json()["retention_policy_version"], 1)
+            self.assertIsNotNone(detail.json()["retention_expires_at"])
+
     def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}
         first_body = self.request_body()

@@ -29,6 +29,8 @@ from .contracts import (
     RetentionHoldCreate,
     RetentionHoldView,
     RetentionPolicyUpdate,
+    RetentionPolicyBackfillRequest,
+    RetentionPolicyBackfillView,
     RetentionPolicyView,
     SchedulerObservationView,
     SegmentUpload,
@@ -349,6 +351,64 @@ def create_app(settings: Settings) -> FastAPI:
                 retention_policy_view(policy)
                 for policy in session.scalars(statement).all()
             ]
+
+    @app.post(
+        "/v1/retention-policies/{cluster_id}/backfills",
+        response_model=RetentionPolicyBackfillView,
+    )
+    def backfill_retention_policy(
+        request: RetentionPolicyBackfillRequest,
+        cluster_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> RetentionPolicyBackfillView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        try:
+            if request.apply:
+                assert request.expected_eligible_attempts is not None
+                assert request.expected_due_attempts is not None
+                decision = service.apply_retention_policy_backfill(
+                    principal.tenant_id,
+                    cluster_id,
+                    request.policy_version,
+                    request.max_attempts,
+                    request.expected_eligible_attempts,
+                    request.expected_due_attempts,
+                    principal.credential_id,
+                )
+                mode = "applied"
+            else:
+                decision = service.preview_retention_policy_backfill(
+                    principal.tenant_id,
+                    cluster_id,
+                    request.policy_version,
+                    request.max_attempts,
+                )
+                mode = "preview"
+        except ValueError as error:
+            message = str(error)
+            if message == "retention policy revision does not exist":
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "retention_policy_revision_not_found"},
+                ) from error
+            if message in {
+                "retention policy backfill preview is stale; preview again",
+                "eligible attempts exceed max_attempts; increase the explicit bound",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "retention_policy_backfill_conflict", "message": message},
+                ) from error
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "retention_policy_backfill_rejected", "message": message},
+            ) from error
+        return RetentionPolicyBackfillView(mode=mode, **asdict(decision))
 
     @app.post(
         "/v1/attempts/{attempt_id}/retention-holds",
