@@ -281,6 +281,91 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 ["retention-admin-a", "retention-admin-b", "retention-admin-c"],
             )
 
+    def test_scheduled_policy_activates_by_version_without_rewriting_attempts(self) -> None:
+        current = {"now": datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)}
+        service = IngestionService(
+            self.sessions,
+            self.objects,
+            clock=lambda: current["now"],
+        )
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="legacy-before-schedule").model_copy(
+                update={"producer_id": "node-legacy-before-schedule"}
+            ),
+        )
+        first = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 3600, "retention-admin-a"
+        )
+        scheduled_at = current["now"] + timedelta(hours=2)
+        second = service.create_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            7200,
+            "retention-admin-a",
+            scheduled_at,
+        )
+        with self.assertRaisesRegex(ValueError, "not yet effective"):
+            service.preview_retention_policy_backfill(
+                "tenant-a", "cluster-a", second.version, 10
+            )
+
+        current["now"] += timedelta(hours=1)
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="before-activation").model_copy(
+                update={"producer_id": "node-before-activation"}
+            ),
+        )
+        current["now"] = scheduled_at
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="after-activation").model_copy(
+                update={"producer_id": "node-after-activation"}
+            ),
+        )
+        third = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 10800, "retention-admin-b"
+        )
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="after-superseding-revision").model_copy(
+                update={"producer_id": "node-after-superseding-revision"}
+            ),
+        )
+
+        self.assertEqual(first.version, 1)
+        self.assertEqual(second.version, 2)
+        self.assertEqual(second.effective_at, scheduled_at)
+        self.assertEqual(third.version, 3)
+        with self.sessions() as session:
+            legacy = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "legacy-before-schedule"),
+            )
+            before = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "before-activation")
+            )
+            after = session.get(
+                AttemptRecord, ("tenant-a", "cluster-a", "after-activation")
+            )
+            superseding = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "after-superseding-revision"),
+            )
+            assert legacy is not None
+            assert before is not None
+            assert after is not None
+            assert superseding is not None
+            self.assertIsNone(legacy.retention_policy_version)
+            self.assertEqual(before.retention_policy_version, 1)
+            self.assertEqual(after.retention_policy_version, 2)
+            self.assertEqual(superseding.retention_policy_version, 3)
+            self.assertEqual(
+                after.retention_expires_at - after.first_admitted_at,
+                timedelta(seconds=7200),
+            )
+
     def test_reviewed_retention_backfill_is_bounded_audited_and_hold_aware(self) -> None:
         now = datetime.now(timezone.utc)
         for attempt_id in ("legacy-due", "legacy-held", "legacy-future", "legacy-deleting"):

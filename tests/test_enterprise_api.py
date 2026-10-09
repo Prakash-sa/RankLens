@@ -4,7 +4,7 @@ import base64
 import hashlib
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -419,6 +419,70 @@ class EnterpriseApiTests(unittest.TestCase):
             )
             self.assertEqual(detail.json()["retention_policy_version"], 1)
             self.assertIsNotNone(detail.json()["retention_expires_at"])
+
+    def test_retention_admin_schedules_future_policy_activation(self) -> None:
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        admin_headers = {"authorization": f"Bearer {self.retention_token}"}
+        path = "/v1/retention-policies/cluster-a"
+        first = self.client.put(
+            path,
+            json={"retention_seconds": 3600},
+            headers=admin_headers,
+        )
+        scheduled_at = datetime.now(timezone.utc) + timedelta(days=1)
+        scheduled = self.client.put(
+            path,
+            json={
+                "retention_seconds": 7200,
+                "effective_at": scheduled_at.isoformat(),
+            },
+            headers=admin_headers,
+        )
+        too_distant = self.client.put(
+            path,
+            json={
+                "retention_seconds": 10800,
+                "effective_at": (
+                    datetime.now(timezone.utc) + timedelta(days=367)
+                ).isoformat(),
+            },
+            headers=admin_headers,
+        )
+        body = self.request_body()
+        body.update(
+            {
+                "attempt_id": "attempt-before-scheduled-policy",
+                "producer_id": "node-before-scheduled-policy",
+            }
+        )
+        admission = self.client.post(
+            "/v1/segments", json=body, headers=ingest_headers
+        )
+        history = self.client.get(path, headers=admin_headers)
+        premature_backfill = self.client.post(
+            f"{path}/backfills",
+            json={"policy_version": 2},
+            headers=admin_headers,
+        )
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(first.json()["activation_status"], "active")
+        self.assertEqual(scheduled.status_code, 201)
+        self.assertEqual(scheduled.json()["version"], 2)
+        self.assertEqual(scheduled.json()["activation_status"], "scheduled")
+        self.assertEqual(too_distant.status_code, 422)
+        self.assertEqual(admission.status_code, 201)
+        self.assertEqual(
+            [item["activation_status"] for item in history.json()],
+            ["scheduled", "active"],
+        )
+        self.assertEqual(premature_backfill.status_code, 409)
+        detail = self.client.get(
+            "/v1/attempts/attempt-before-scheduled-policy",
+            params={"cluster_id": "cluster-a"},
+            headers={"authorization": f"Bearer {self.read_token}"},
+        )
+        self.assertEqual(detail.json()["retention_policy_version"], 1)
 
     def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}

@@ -232,6 +232,7 @@ class RetentionPolicyUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     retention_seconds: int = Field(ge=0, le=315360000)
+    effective_at: Optional[datetime] = None
 
     @model_validator(mode="after")
     def validate_retention_seconds(self) -> "RetentionPolicyUpdate":
@@ -250,6 +251,8 @@ class RetentionPolicyView(BaseModel):
     automatic_expiry_enabled: bool
     created_by_credential_id: str
     created_at: datetime
+    effective_at: datetime
+    activation_status: Literal["scheduled", "active", "superseded"]
 
 
 class RetentionPolicyBackfillRequest(BaseModel):

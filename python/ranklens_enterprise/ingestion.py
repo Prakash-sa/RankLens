@@ -9,8 +9,8 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional
 
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -66,6 +66,7 @@ class RetentionPolicyDecision:
     retention_seconds: int
     created_by_credential_id: str
     created_at: datetime
+    effective_at: datetime
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class IngestionService:
         *,
         max_expanded_segment_bytes: int = 8 * 1024 * 1024,
         default_retention_seconds: int = 0,
+        clock: Callable[[], datetime] = utc_now,
     ):
         if default_retention_seconds != 0 and not 3600 <= default_retention_seconds <= 315360000:
             raise ValueError(
@@ -100,6 +102,7 @@ class IngestionService:
         self._objects = objects
         self._max_expanded = max_expanded_segment_bytes
         self._default_retention_seconds = default_retention_seconds
+        self._clock = clock
 
     @staticmethod
     def _stream_identity(tenant_id: str, segment: SegmentUpload) -> str:
@@ -229,6 +232,7 @@ class IngestionService:
                 .where(
                     RetentionPolicyRevision.tenant_id == tenant_id,
                     RetentionPolicyRevision.cluster_id == segment.cluster_id,
+                    RetentionPolicyRevision.effective_at <= committed_at,
                 )
                 .order_by(RetentionPolicyRevision.version.desc())
                 .limit(1)
@@ -280,6 +284,7 @@ class IngestionService:
         cluster_id: str,
         retention_seconds: int,
         created_by_credential_id: str,
+        effective_at: Optional[datetime] = None,
     ) -> RetentionPolicyDecision:
         if retention_seconds != 0 and not 3600 <= retention_seconds <= 315360000:
             raise ValueError(
@@ -289,7 +294,15 @@ class IngestionService:
             raise ValueError("retention policy credential ID is invalid")
         if not cluster_id or len(cluster_id) > 128:
             raise ValueError("cluster ID is invalid")
-        now = utc_now()
+        now = self._clock()
+        if effective_at is None:
+            effective_at = now
+        elif effective_at.tzinfo is None or effective_at.utcoffset() is None:
+            raise ValueError("effective_at must include a UTC offset")
+        else:
+            effective_at = effective_at.astimezone(timezone.utc)
+        if effective_at > now + timedelta(days=366):
+            raise ValueError("effective_at cannot be more than 366 days in the future")
         with self._sessions.begin() as session:
             lock_stream(session, f"retention-policy:{tenant_id}:{cluster_id}")
             latest = session.scalar(
@@ -309,6 +322,7 @@ class IngestionService:
                 retention_seconds=retention_seconds,
                 created_by_credential_id=created_by_credential_id,
                 created_at=now,
+                effective_at=effective_at,
             )
             session.add(policy)
             session.flush()
@@ -319,6 +333,7 @@ class IngestionService:
                 retention_seconds=retention_seconds,
                 created_by_credential_id=created_by_credential_id,
                 created_at=now,
+                effective_at=effective_at,
             )
 
     @staticmethod
@@ -335,6 +350,7 @@ class IngestionService:
         tenant_id: str,
         cluster_id: str,
         policy_version: int,
+        now: datetime,
     ) -> RetentionPolicyRevision:
         policy = session.get(
             RetentionPolicyRevision,
@@ -342,6 +358,8 @@ class IngestionService:
         )
         if policy is None:
             raise ValueError("retention policy revision does not exist")
+        if not IngestionService._retention_deadline_is_due(policy.effective_at, now):
+            raise ValueError("retention policy revision is not yet effective")
         return policy
 
     @staticmethod
@@ -391,7 +409,7 @@ class IngestionService:
         if not 1 <= max_attempts <= 1000:
             raise ValueError("max_attempts must be within [1, 1000]")
         policy = self._retention_backfill_policy(
-            session, tenant_id, cluster_id, policy_version
+            session, tenant_id, cluster_id, policy_version, now
         )
         attempts = self._retention_backfill_candidates(
             session, tenant_id, cluster_id, max_attempts
@@ -413,7 +431,7 @@ class IngestionService:
         policy_version: int,
         max_attempts: int,
     ) -> RetentionPolicyBackfillDecision:
-        now = utc_now()
+        now = self._clock()
         with self._sessions() as session:
             _, attempts, due_attempts = self._retention_backfill_decision(
                 session,
@@ -446,7 +464,7 @@ class IngestionService:
             raise ValueError("retention policy credential ID is invalid")
         if expected_eligible_attempts < 0 or expected_due_attempts < 0:
             raise ValueError("expected attempt counts cannot be negative")
-        now = utc_now()
+        now = self._clock()
         with self._sessions.begin() as session:
             lock_stream(session, f"retention-policy-backfill:{tenant_id}:{cluster_id}")
             policy, attempts, due_attempts = self._retention_backfill_decision(
@@ -629,7 +647,7 @@ class IngestionService:
                 raise AdmissionConflict("sequence_overlap", "segment overlaps an admitted sequence range")
 
             receipt_id = str(uuid.uuid4())
-            committed_at = utc_now()
+            committed_at = self._clock()
             manifest = SegmentManifest(
                 receipt_id=receipt_id,
                 tenant_id=principal.tenant_id,

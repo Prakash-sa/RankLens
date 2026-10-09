@@ -47,6 +47,7 @@ from .database import (
     build_engine,
     build_session_factory,
     initialize_schema,
+    utc_now,
 )
 from .ingestion import AdmissionError, IngestionService
 from .scheduler import derive_allocation_timeline
@@ -267,7 +268,19 @@ def create_app(settings: Settings) -> FastAPI:
 
     def retention_policy_view(
         policy: RetentionPolicyRevision,
+        *,
+        active_version: Optional[int],
+        now,
     ) -> RetentionPolicyView:
+        effective_now = now
+        if policy.effective_at.tzinfo is None and now.tzinfo is not None:
+            effective_now = now.replace(tzinfo=None)
+        if policy.effective_at > effective_now:
+            activation_status = "scheduled"
+        elif policy.version == active_version:
+            activation_status = "active"
+        else:
+            activation_status = "superseded"
         return RetentionPolicyView(
             tenant_id=policy.tenant_id,
             cluster_id=policy.cluster_id,
@@ -276,6 +289,22 @@ def create_app(settings: Settings) -> FastAPI:
             automatic_expiry_enabled=policy.retention_seconds > 0,
             created_by_credential_id=policy.created_by_credential_id,
             created_at=policy.created_at,
+            effective_at=policy.effective_at,
+            activation_status=activation_status,
+        )
+
+    def active_retention_policy_version(
+        session, tenant_id: str, cluster_id: str, now
+    ) -> Optional[int]:
+        return session.scalar(
+            select(RetentionPolicyRevision.version)
+            .where(
+                RetentionPolicyRevision.tenant_id == tenant_id,
+                RetentionPolicyRevision.cluster_id == cluster_id,
+                RetentionPolicyRevision.effective_at <= now,
+            )
+            .order_by(RetentionPolicyRevision.version.desc())
+            .limit(1)
         )
 
     @app.put(
@@ -300,6 +329,7 @@ def create_app(settings: Settings) -> FastAPI:
                 cluster_id,
                 request.retention_seconds,
                 principal.credential_id,
+                request.effective_at,
             )
         except ValueError as error:
             raise HTTPException(
@@ -307,6 +337,7 @@ def create_app(settings: Settings) -> FastAPI:
                 detail={"code": "retention_policy_rejected", "message": str(error)},
             ) from error
         with sessions() as session:
+            now = utc_now()
             policy = session.scalar(
                 select(RetentionPolicyRevision)
                 .where(
@@ -320,7 +351,12 @@ def create_app(settings: Settings) -> FastAPI:
                 raise HTTPException(
                     status_code=503, detail={"code": "retention_policy_unavailable"}
                 )
-            return retention_policy_view(policy)
+            active_version = active_retention_policy_version(
+                session, principal.tenant_id, cluster_id, now
+            )
+            return retention_policy_view(
+                policy, active_version=active_version, now=now
+            )
 
     @app.get(
         "/v1/retention-policies/{cluster_id}",
@@ -347,8 +383,14 @@ def create_app(settings: Settings) -> FastAPI:
             .limit(limit)
         )
         with sessions() as session:
+            now = utc_now()
+            active_version = active_retention_policy_version(
+                session, principal.tenant_id, cluster_id, now
+            )
             return [
-                retention_policy_view(policy)
+                retention_policy_view(
+                    policy, active_version=active_version, now=now
+                )
                 for policy in session.scalars(statement).all()
             ]
 
@@ -399,6 +441,7 @@ def create_app(settings: Settings) -> FastAPI:
             if message in {
                 "retention policy backfill preview is stale; preview again",
                 "eligible attempts exceed max_attempts; increase the explicit bound",
+                "retention policy revision is not yet effective",
             }:
                 raise HTTPException(
                     status_code=409,

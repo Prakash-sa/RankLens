@@ -142,6 +142,13 @@ class RetentionPolicyRevision(Base):
             "cluster_id",
             "version",
         ),
+        Index(
+            "ix_retention_policy_effective",
+            "tenant_id",
+            "cluster_id",
+            "effective_at",
+            "version",
+        ),
     )
 
     tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -150,6 +157,7 @@ class RetentionPolicyRevision(Base):
     retention_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class RetentionPolicyBackfill(Base):
