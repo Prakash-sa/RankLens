@@ -285,6 +285,7 @@ def create_app(settings: Settings) -> FastAPI:
             tenant_id=policy.tenant_id,
             cluster_id=policy.cluster_id,
             version=policy.version,
+            logical_case_id=policy.logical_case_id,
             retention_seconds=policy.retention_seconds,
             automatic_expiry_enabled=policy.retention_seconds > 0,
             created_by_credential_id=policy.created_by_credential_id,
@@ -293,19 +294,22 @@ def create_app(settings: Settings) -> FastAPI:
             activation_status=activation_status,
         )
 
-    def active_retention_policy_version(
+    def active_retention_policy_versions(
         session, tenant_id: str, cluster_id: str, now
-    ) -> Optional[int]:
-        return session.scalar(
-            select(RetentionPolicyRevision.version)
+    ) -> dict[Optional[str], int]:
+        rows = session.execute(
+            select(
+                RetentionPolicyRevision.logical_case_id,
+                func.max(RetentionPolicyRevision.version),
+            )
             .where(
                 RetentionPolicyRevision.tenant_id == tenant_id,
                 RetentionPolicyRevision.cluster_id == cluster_id,
                 RetentionPolicyRevision.effective_at <= now,
             )
-            .order_by(RetentionPolicyRevision.version.desc())
-            .limit(1)
-        )
+            .group_by(RetentionPolicyRevision.logical_case_id)
+        ).all()
+        return {logical_case_id: version for logical_case_id, version in rows}
 
     @app.put(
         "/v1/retention-policies/{cluster_id}",
@@ -330,6 +334,7 @@ def create_app(settings: Settings) -> FastAPI:
                 request.retention_seconds,
                 principal.credential_id,
                 request.effective_at,
+                request.logical_case_id,
             )
         except ValueError as error:
             raise HTTPException(
@@ -351,11 +356,13 @@ def create_app(settings: Settings) -> FastAPI:
                 raise HTTPException(
                     status_code=503, detail={"code": "retention_policy_unavailable"}
                 )
-            active_version = active_retention_policy_version(
+            active_versions = active_retention_policy_versions(
                 session, principal.tenant_id, cluster_id, now
             )
             return retention_policy_view(
-                policy, active_version=active_version, now=now
+                policy,
+                active_version=active_versions.get(policy.logical_case_id),
+                now=now,
             )
 
     @app.get(
@@ -384,12 +391,14 @@ def create_app(settings: Settings) -> FastAPI:
         )
         with sessions() as session:
             now = utc_now()
-            active_version = active_retention_policy_version(
+            active_versions = active_retention_policy_versions(
                 session, principal.tenant_id, cluster_id, now
             )
             return [
                 retention_policy_view(
-                    policy, active_version=active_version, now=now
+                    policy,
+                    active_version=active_versions.get(policy.logical_case_id),
+                    now=now,
                 )
                 for policy in session.scalars(statement).all()
             ]

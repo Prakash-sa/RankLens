@@ -366,6 +366,113 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 timedelta(seconds=7200),
             )
 
+    def test_case_policy_overrides_cluster_default_and_bounds_legacy_backfill(self) -> None:
+        current = {"now": datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)}
+        service = IngestionService(
+            self.sessions,
+            self.objects,
+            clock=lambda: current["now"],
+        )
+        legacy_cases = {
+            "legacy-case-a": "case-a",
+            "legacy-case-b": "case-b",
+            "legacy-no-case": None,
+        }
+        for attempt_id, logical_case_id in legacy_cases.items():
+            service.admit(
+                self.principal,
+                self.segment(
+                    attempt_id=attempt_id,
+                    logical_case_id=logical_case_id,
+                ).model_copy(update={"producer_id": f"node-{attempt_id}"}),
+            )
+
+        cluster_policy = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 3600, "retention-admin-a"
+        )
+        case_policy = service.create_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            7200,
+            "retention-admin-a",
+            logical_case_id="case-a",
+        )
+        for attempt_id, logical_case_id in {
+            "new-case-a": "case-a",
+            "new-case-b": "case-b",
+            "new-no-case": None,
+        }.items():
+            service.admit(
+                self.principal,
+                self.segment(
+                    attempt_id=attempt_id,
+                    logical_case_id=logical_case_id,
+                ).model_copy(update={"producer_id": f"node-{attempt_id}"}),
+            )
+        newer_cluster_policy = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 10800, "retention-admin-b"
+        )
+        for attempt_id, logical_case_id in {
+            "latest-case-a": "case-a",
+            "latest-case-b": "case-b",
+        }.items():
+            service.admit(
+                self.principal,
+                self.segment(
+                    attempt_id=attempt_id,
+                    logical_case_id=logical_case_id,
+                ).model_copy(update={"producer_id": f"node-{attempt_id}"}),
+            )
+
+        preview = service.preview_retention_policy_backfill(
+            "tenant-a", "cluster-a", case_policy.version, 10
+        )
+        self.assertEqual(preview.logical_case_id, "case-a")
+        self.assertEqual(preview.eligible_attempts, 1)
+        applied = service.apply_retention_policy_backfill(
+            "tenant-a",
+            "cluster-a",
+            case_policy.version,
+            10,
+            expected_eligible_attempts=1,
+            expected_due_attempts=0,
+            requested_by_credential_id="retention-admin-a",
+        )
+        self.assertEqual(applied.updated_attempts, 1)
+
+        expected_versions = {
+            "legacy-case-a": case_policy.version,
+            "legacy-case-b": None,
+            "legacy-no-case": None,
+            "new-case-a": case_policy.version,
+            "new-case-b": cluster_policy.version,
+            "new-no-case": cluster_policy.version,
+            "latest-case-a": case_policy.version,
+            "latest-case-b": newer_cluster_policy.version,
+        }
+        with self.sessions() as session:
+            for attempt_id, expected_version in expected_versions.items():
+                attempt = session.get(
+                    AttemptRecord, ("tenant-a", "cluster-a", attempt_id)
+                )
+                assert attempt is not None
+                self.assertEqual(
+                    attempt.retention_policy_version,
+                    expected_version,
+                    attempt_id,
+                )
+            revisions = list(
+                session.scalars(
+                    select(RetentionPolicyRevision).order_by(
+                        RetentionPolicyRevision.version
+                    )
+                )
+            )
+            self.assertEqual(
+                [revision.logical_case_id for revision in revisions],
+                [None, "case-a", None],
+            )
+
     def test_reviewed_retention_backfill_is_bounded_audited_and_hold_aware(self) -> None:
         now = datetime.now(timezone.utc)
         for attempt_id in ("legacy-due", "legacy-held", "legacy-future", "legacy-deleting"):

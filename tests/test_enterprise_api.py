@@ -484,6 +484,68 @@ class EnterpriseApiTests(unittest.TestCase):
         )
         self.assertEqual(detail.json()["retention_policy_version"], 1)
 
+    def test_retention_admin_applies_case_policy_over_cluster_default(self) -> None:
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        read_headers = {"authorization": f"Bearer {self.read_token}"}
+        admin_headers = {"authorization": f"Bearer {self.retention_token}"}
+        path = "/v1/retention-policies/cluster-a"
+        cluster_policy = self.client.put(
+            path,
+            json={"retention_seconds": 3600},
+            headers=admin_headers,
+        )
+        case_policy = self.client.put(
+            path,
+            json={"retention_seconds": 7200, "logical_case_id": "case-a"},
+            headers=admin_headers,
+        )
+        for attempt_id, logical_case_id in {
+            "attempt-case-policy-a": "case-a",
+            "attempt-case-policy-b": "case-b",
+        }.items():
+            body = self.request_body()
+            body.update(
+                {
+                    "attempt_id": attempt_id,
+                    "producer_id": f"node-{attempt_id}",
+                    "logical_case_id": logical_case_id,
+                }
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/v1/segments", json=body, headers=ingest_headers
+                ).status_code,
+                201,
+            )
+        history = self.client.get(path, headers=admin_headers)
+
+        self.assertEqual(cluster_policy.status_code, 201)
+        self.assertIsNone(cluster_policy.json()["logical_case_id"])
+        self.assertEqual(cluster_policy.json()["activation_status"], "active")
+        self.assertEqual(case_policy.status_code, 201)
+        self.assertEqual(case_policy.json()["logical_case_id"], "case-a")
+        self.assertEqual(case_policy.json()["activation_status"], "active")
+        self.assertEqual(
+            [item["logical_case_id"] for item in history.json()],
+            ["case-a", None],
+        )
+        self.assertEqual(
+            [item["activation_status"] for item in history.json()],
+            ["active", "active"],
+        )
+        case_a = self.client.get(
+            "/v1/attempts/attempt-case-policy-a",
+            params={"cluster_id": "cluster-a"},
+            headers=read_headers,
+        )
+        case_b = self.client.get(
+            "/v1/attempts/attempt-case-policy-b",
+            params={"cluster_id": "cluster-a"},
+            headers=read_headers,
+        )
+        self.assertEqual(case_a.json()["retention_policy_version"], 2)
+        self.assertEqual(case_b.json()["retention_policy_version"], 1)
+
     def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}
         first_body = self.request_body()

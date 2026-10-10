@@ -233,6 +233,9 @@ class RetentionPolicyUpdate(BaseModel):
 
     retention_seconds: int = Field(ge=0, le=315360000)
     effective_at: Optional[datetime] = None
+    logical_case_id: Optional[Identifier] = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
 
     @model_validator(mode="after")
     def validate_retention_seconds(self) -> "RetentionPolicyUpdate":
@@ -247,6 +250,7 @@ class RetentionPolicyView(BaseModel):
     tenant_id: str
     cluster_id: str
     version: int
+    logical_case_id: Optional[str] = None
     retention_seconds: int
     automatic_expiry_enabled: bool
     created_by_credential_id: str
@@ -282,6 +286,7 @@ class RetentionPolicyBackfillView(BaseModel):
     tenant_id: str
     cluster_id: str
     policy_version: int
+    logical_case_id: Optional[str] = None
     eligible_attempts: int
     due_attempts: int
     updated_attempts: int

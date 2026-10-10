@@ -146,6 +146,7 @@ class RetentionPolicyRevision(Base):
             "ix_retention_policy_effective",
             "tenant_id",
             "cluster_id",
+            "logical_case_id",
             "effective_at",
             "version",
         ),
@@ -154,6 +155,7 @@ class RetentionPolicyRevision(Base):
     tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    logical_case_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     retention_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

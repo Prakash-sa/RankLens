@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .contracts import DurableReceipt, ReceiptView, SegmentUpload
@@ -63,6 +63,7 @@ class RetentionPolicyDecision:
     tenant_id: str
     cluster_id: str
     version: int
+    logical_case_id: Optional[str]
     retention_seconds: int
     created_by_credential_id: str
     created_at: datetime
@@ -74,6 +75,7 @@ class RetentionPolicyBackfillDecision:
     tenant_id: str
     cluster_id: str
     policy_version: int
+    logical_case_id: Optional[str]
     eligible_attempts: int
     due_attempts: int
     updated_attempts: int
@@ -84,6 +86,7 @@ class RetentionPolicyBackfillDecision:
 
 class IngestionService:
     _ACTOR_CREDENTIAL_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+    _SCOPE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
     def __init__(
         self,
@@ -233,8 +236,16 @@ class IngestionService:
                     RetentionPolicyRevision.tenant_id == tenant_id,
                     RetentionPolicyRevision.cluster_id == segment.cluster_id,
                     RetentionPolicyRevision.effective_at <= committed_at,
+                    or_(
+                        RetentionPolicyRevision.logical_case_id.is_(None),
+                        RetentionPolicyRevision.logical_case_id
+                        == segment.logical_case_id,
+                    ),
                 )
-                .order_by(RetentionPolicyRevision.version.desc())
+                .order_by(
+                    RetentionPolicyRevision.logical_case_id.is_not(None).desc(),
+                    RetentionPolicyRevision.version.desc(),
+                )
                 .limit(1)
             )
             retention_seconds = (
@@ -285,6 +296,7 @@ class IngestionService:
         retention_seconds: int,
         created_by_credential_id: str,
         effective_at: Optional[datetime] = None,
+        logical_case_id: Optional[str] = None,
     ) -> RetentionPolicyDecision:
         if retention_seconds != 0 and not 3600 <= retention_seconds <= 315360000:
             raise ValueError(
@@ -294,6 +306,11 @@ class IngestionService:
             raise ValueError("retention policy credential ID is invalid")
         if not cluster_id or len(cluster_id) > 128:
             raise ValueError("cluster ID is invalid")
+        if (
+            logical_case_id is not None
+            and self._SCOPE_ID.fullmatch(logical_case_id) is None
+        ):
+            raise ValueError("logical case ID is invalid")
         now = self._clock()
         if effective_at is None:
             effective_at = now
@@ -319,6 +336,7 @@ class IngestionService:
                 tenant_id=tenant_id,
                 cluster_id=cluster_id,
                 version=version,
+                logical_case_id=logical_case_id,
                 retention_seconds=retention_seconds,
                 created_by_credential_id=created_by_credential_id,
                 created_at=now,
@@ -330,6 +348,7 @@ class IngestionService:
                 tenant_id=tenant_id,
                 cluster_id=cluster_id,
                 version=version,
+                logical_case_id=logical_case_id,
                 retention_seconds=retention_seconds,
                 created_by_credential_id=created_by_credential_id,
                 created_at=now,
@@ -368,6 +387,7 @@ class IngestionService:
         tenant_id: str,
         cluster_id: str,
         max_attempts: int,
+        logical_case_id: Optional[str],
     ) -> list[AttemptRecord]:
         deletion_exists = (
             select(AttemptDeletion.attempt_id)
@@ -378,15 +398,18 @@ class IngestionService:
             )
             .exists()
         )
+        filters = [
+            AttemptRecord.tenant_id == tenant_id,
+            AttemptRecord.cluster_id == cluster_id,
+            AttemptRecord.retention_policy_version.is_(None),
+            ~deletion_exists,
+        ]
+        if logical_case_id is not None:
+            filters.append(AttemptRecord.logical_case_id == logical_case_id)
         attempts = list(
             session.scalars(
                 select(AttemptRecord)
-                .where(
-                    AttemptRecord.tenant_id == tenant_id,
-                    AttemptRecord.cluster_id == cluster_id,
-                    AttemptRecord.retention_policy_version.is_(None),
-                    ~deletion_exists,
-                )
+                .where(*filters)
                 .order_by(AttemptRecord.attempt_id)
                 .limit(max_attempts + 1)
             )
@@ -412,7 +435,7 @@ class IngestionService:
             session, tenant_id, cluster_id, policy_version, now
         )
         attempts = self._retention_backfill_candidates(
-            session, tenant_id, cluster_id, max_attempts
+            session, tenant_id, cluster_id, max_attempts, policy.logical_case_id
         )
         due_attempts = 0
         if policy.retention_seconds > 0:
@@ -433,7 +456,7 @@ class IngestionService:
     ) -> RetentionPolicyBackfillDecision:
         now = self._clock()
         with self._sessions() as session:
-            _, attempts, due_attempts = self._retention_backfill_decision(
+            policy, attempts, due_attempts = self._retention_backfill_decision(
                 session,
                 tenant_id,
                 cluster_id,
@@ -445,6 +468,7 @@ class IngestionService:
                 tenant_id=tenant_id,
                 cluster_id=cluster_id,
                 policy_version=policy_version,
+                logical_case_id=policy.logical_case_id,
                 eligible_attempts=len(attempts),
                 due_attempts=due_attempts,
                 updated_attempts=0,
@@ -508,6 +532,7 @@ class IngestionService:
                 tenant_id=tenant_id,
                 cluster_id=cluster_id,
                 policy_version=policy.version,
+                logical_case_id=policy.logical_case_id,
                 eligible_attempts=len(attempts),
                 due_attempts=due_attempts,
                 updated_attempts=len(attempts),
