@@ -546,6 +546,78 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(case_a.json()["retention_policy_version"], 2)
         self.assertEqual(case_b.json()["retention_policy_version"], 1)
 
+    def test_retention_admin_cancels_only_scheduled_policy_revisions(self) -> None:
+        read_headers = {"authorization": f"Bearer {self.read_token}"}
+        admin_headers = {"authorization": f"Bearer {self.retention_token}"}
+        path = "/v1/retention-policies/cluster-a"
+        active = self.client.put(
+            path,
+            json={"retention_seconds": 3600},
+            headers=admin_headers,
+        )
+        scheduled = self.client.put(
+            path,
+            json={
+                "retention_seconds": 7200,
+                "effective_at": (
+                    datetime.now(timezone.utc) + timedelta(days=1)
+                ).isoformat(),
+            },
+            headers=admin_headers,
+        )
+        cancellation_path = f"{path}/2/cancellation"
+        forbidden = self.client.post(
+            cancellation_path,
+            json={"reason": "operator correction"},
+            headers=read_headers,
+        )
+        cancelled = self.client.post(
+            cancellation_path,
+            json={"reason": "operator correction"},
+            headers=admin_headers,
+        )
+        replayed = self.client.post(
+            cancellation_path,
+            json={"reason": "operator correction"},
+            headers=admin_headers,
+        )
+        conflicting = self.client.post(
+            cancellation_path,
+            json={"reason": "different correction"},
+            headers=admin_headers,
+        )
+        active_cancellation = self.client.post(
+            f"{path}/1/cancellation",
+            json={"reason": "cannot cancel active policy"},
+            headers=admin_headers,
+        )
+        cancelled_backfill = self.client.post(
+            f"{path}/backfills",
+            json={"policy_version": 2},
+            headers=admin_headers,
+        )
+        history = self.client.get(path, headers=admin_headers)
+
+        self.assertEqual(active.status_code, 201)
+        self.assertEqual(scheduled.status_code, 201)
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["activation_status"], "cancelled")
+        self.assertEqual(cancelled.json()["cancellation_reason"], "operator correction")
+        self.assertEqual(
+            cancelled.json()["cancelled_by_credential_id"], "test-retention"
+        )
+        self.assertIsNotNone(cancelled.json()["cancelled_at"])
+        self.assertEqual(replayed.status_code, 200)
+        self.assertEqual(replayed.json()["cancelled_at"], cancelled.json()["cancelled_at"])
+        self.assertEqual(conflicting.status_code, 409)
+        self.assertEqual(active_cancellation.status_code, 409)
+        self.assertEqual(cancelled_backfill.status_code, 409)
+        self.assertEqual(
+            [item["activation_status"] for item in history.json()],
+            ["cancelled", "active"],
+        )
+
     def test_attempt_catalog_is_cluster_scoped_and_stably_paginated(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}
         first_body = self.request_body()

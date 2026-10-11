@@ -162,6 +162,27 @@ class RetentionPolicyRevision(Base):
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class RetentionPolicyCancellation(Base):
+    """Immutable audit record cancelling one not-yet-effective policy revision."""
+
+    __tablename__ = "retention_policy_cancellations"
+    __table_args__ = (
+        Index(
+            "ix_retention_policy_cancellation_history",
+            "tenant_id",
+            "cluster_id",
+            "cancelled_at",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cluster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    policy_version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    cancelled_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cancelled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class RetentionPolicyBackfill(Base):
     """Audited application of one policy revision to legacy attempts."""
 

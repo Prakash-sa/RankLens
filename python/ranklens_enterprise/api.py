@@ -29,6 +29,7 @@ from .contracts import (
     RetentionHoldCreate,
     RetentionHoldView,
     RetentionPolicyUpdate,
+    RetentionPolicyCancellationRequest,
     RetentionPolicyBackfillRequest,
     RetentionPolicyBackfillView,
     RetentionPolicyView,
@@ -41,6 +42,7 @@ from .database import (
     AttemptRecord,
     ReportHead,
     ReportRevision,
+    RetentionPolicyCancellation,
     RetentionPolicyRevision,
     SchedulerObservation,
     assert_schema_ready,
@@ -271,11 +273,14 @@ def create_app(settings: Settings) -> FastAPI:
         *,
         active_version: Optional[int],
         now,
+        cancellation: Optional[RetentionPolicyCancellation] = None,
     ) -> RetentionPolicyView:
         effective_now = now
         if policy.effective_at.tzinfo is None and now.tzinfo is not None:
             effective_now = now.replace(tzinfo=None)
-        if policy.effective_at > effective_now:
+        if cancellation is not None:
+            activation_status = "cancelled"
+        elif policy.effective_at > effective_now:
             activation_status = "scheduled"
         elif policy.version == active_version:
             activation_status = "active"
@@ -292,11 +297,34 @@ def create_app(settings: Settings) -> FastAPI:
             created_at=policy.created_at,
             effective_at=policy.effective_at,
             activation_status=activation_status,
+            cancellation_reason=(
+                cancellation.reason if cancellation is not None else None
+            ),
+            cancelled_by_credential_id=(
+                cancellation.cancelled_by_credential_id
+                if cancellation is not None
+                else None
+            ),
+            cancelled_at=(
+                cancellation.cancelled_at if cancellation is not None else None
+            ),
         )
 
     def active_retention_policy_versions(
         session, tenant_id: str, cluster_id: str, now
     ) -> dict[Optional[str], int]:
+        cancellation_exists = (
+            select(RetentionPolicyCancellation.policy_version)
+            .where(
+                RetentionPolicyCancellation.tenant_id
+                == RetentionPolicyRevision.tenant_id,
+                RetentionPolicyCancellation.cluster_id
+                == RetentionPolicyRevision.cluster_id,
+                RetentionPolicyCancellation.policy_version
+                == RetentionPolicyRevision.version,
+            )
+            .exists()
+        )
         rows = session.execute(
             select(
                 RetentionPolicyRevision.logical_case_id,
@@ -306,10 +334,30 @@ def create_app(settings: Settings) -> FastAPI:
                 RetentionPolicyRevision.tenant_id == tenant_id,
                 RetentionPolicyRevision.cluster_id == cluster_id,
                 RetentionPolicyRevision.effective_at <= now,
+                ~cancellation_exists,
             )
             .group_by(RetentionPolicyRevision.logical_case_id)
         ).all()
         return {logical_case_id: version for logical_case_id, version in rows}
+
+    def retention_policy_cancellations(
+        session,
+        tenant_id: str,
+        cluster_id: str,
+        policy_versions: List[int],
+    ) -> dict[int, RetentionPolicyCancellation]:
+        if not policy_versions:
+            return {}
+        return {
+            cancellation.policy_version: cancellation
+            for cancellation in session.scalars(
+                select(RetentionPolicyCancellation).where(
+                    RetentionPolicyCancellation.tenant_id == tenant_id,
+                    RetentionPolicyCancellation.cluster_id == cluster_id,
+                    RetentionPolicyCancellation.policy_version.in_(policy_versions),
+                )
+            )
+        }
 
     @app.put(
         "/v1/retention-policies/{cluster_id}",
@@ -391,17 +439,85 @@ def create_app(settings: Settings) -> FastAPI:
         )
         with sessions() as session:
             now = utc_now()
+            policies = list(session.scalars(statement).all())
             active_versions = active_retention_policy_versions(
                 session, principal.tenant_id, cluster_id, now
+            )
+            cancellations = retention_policy_cancellations(
+                session,
+                principal.tenant_id,
+                cluster_id,
+                [policy.version for policy in policies],
             )
             return [
                 retention_policy_view(
                     policy,
                     active_version=active_versions.get(policy.logical_case_id),
                     now=now,
+                    cancellation=cancellations.get(policy.version),
                 )
-                for policy in session.scalars(statement).all()
+                for policy in policies
             ]
+
+    @app.post(
+        "/v1/retention-policies/{cluster_id}/{policy_version}/cancellation",
+        response_model=RetentionPolicyView,
+    )
+    def cancel_retention_policy(
+        request: RetentionPolicyCancellationRequest,
+        cluster_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        policy_version: int = Path(ge=1, le=2**63 - 1),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_retention_admin
+        ),
+    ) -> RetentionPolicyView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        try:
+            service.cancel_retention_policy_revision(
+                principal.tenant_id,
+                cluster_id,
+                policy_version,
+                request.reason,
+                principal.credential_id,
+            )
+        except ValueError as error:
+            message = str(error)
+            if message == "retention policy revision does not exist":
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "retention_policy_revision_not_found"},
+                ) from error
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "retention_policy_cancellation_conflict", "message": message},
+            ) from error
+        with sessions() as session:
+            now = utc_now()
+            policy = session.get(
+                RetentionPolicyRevision,
+                (principal.tenant_id, cluster_id, policy_version),
+            )
+            cancellation = session.get(
+                RetentionPolicyCancellation,
+                (principal.tenant_id, cluster_id, policy_version),
+            )
+            if policy is None or cancellation is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "retention_policy_cancellation_unavailable"},
+                )
+            active_versions = active_retention_policy_versions(
+                session, principal.tenant_id, cluster_id, now
+            )
+            return retention_policy_view(
+                policy,
+                active_version=active_versions.get(policy.logical_case_id),
+                now=now,
+                cancellation=cancellation,
+            )
 
     @app.post(
         "/v1/retention-policies/{cluster_id}/backfills",
@@ -451,6 +567,7 @@ def create_app(settings: Settings) -> FastAPI:
                 "retention policy backfill preview is stale; preview again",
                 "eligible attempts exceed max_attempts; increase the explicit bound",
                 "retention policy revision is not yet effective",
+                "retention policy revision is cancelled",
             }:
                 raise HTTPException(
                     status_code=409,

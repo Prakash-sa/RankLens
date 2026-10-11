@@ -256,7 +256,16 @@ class RetentionPolicyView(BaseModel):
     created_by_credential_id: str
     created_at: datetime
     effective_at: datetime
-    activation_status: Literal["scheduled", "active", "superseded"]
+    activation_status: Literal["scheduled", "active", "superseded", "cancelled"]
+    cancellation_reason: Optional[str] = None
+    cancelled_by_credential_id: Optional[str] = None
+    cancelled_at: Optional[datetime] = None
+
+
+class RetentionPolicyCancellationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reason: str = Field(min_length=1, max_length=512)
 
 
 class RetentionPolicyBackfillRequest(BaseModel):

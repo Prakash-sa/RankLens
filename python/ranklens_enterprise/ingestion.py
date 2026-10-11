@@ -24,6 +24,7 @@ from .database import (
     AttemptRecord,
     OutboxRecord,
     RetentionPolicyBackfill,
+    RetentionPolicyCancellation,
     RetentionPolicyRevision,
     SegmentManifest,
     lock_stream,
@@ -82,6 +83,16 @@ class RetentionPolicyBackfillDecision:
     backfill_id: Optional[str] = None
     requested_by_credential_id: Optional[str] = None
     requested_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class RetentionPolicyCancellationDecision:
+    tenant_id: str
+    cluster_id: str
+    policy_version: int
+    reason: str
+    cancelled_by_credential_id: str
+    cancelled_at: datetime
 
 
 class IngestionService:
@@ -230,6 +241,18 @@ class IngestionService:
             "scheduler_source_identity": segment.scheduler_source_identity,
         }
         if record is None:
+            cancellation_exists = (
+                select(RetentionPolicyCancellation.policy_version)
+                .where(
+                    RetentionPolicyCancellation.tenant_id
+                    == RetentionPolicyRevision.tenant_id,
+                    RetentionPolicyCancellation.cluster_id
+                    == RetentionPolicyRevision.cluster_id,
+                    RetentionPolicyCancellation.policy_version
+                    == RetentionPolicyRevision.version,
+                )
+                .exists()
+            )
             policy = session.scalar(
                 select(RetentionPolicyRevision)
                 .where(
@@ -241,6 +264,7 @@ class IngestionService:
                         RetentionPolicyRevision.logical_case_id
                         == segment.logical_case_id,
                     ),
+                    ~cancellation_exists,
                 )
                 .order_by(
                     RetentionPolicyRevision.logical_case_id.is_not(None).desc(),
@@ -355,6 +379,68 @@ class IngestionService:
                 effective_at=effective_at,
             )
 
+    def cancel_retention_policy_revision(
+        self,
+        tenant_id: str,
+        cluster_id: str,
+        policy_version: int,
+        reason: str,
+        cancelled_by_credential_id: str,
+    ) -> RetentionPolicyCancellationDecision:
+        reason = reason.strip()
+        if not reason or len(reason) > 512:
+            raise ValueError(
+                "cancellation reason must contain between 1 and 512 characters"
+            )
+        if self._ACTOR_CREDENTIAL_ID.fullmatch(cancelled_by_credential_id) is None:
+            raise ValueError("cancelling credential ID is invalid")
+        now = self._clock()
+        identity = (tenant_id, cluster_id, policy_version)
+        with self._sessions.begin() as session:
+            lock_stream(session, f"retention-policy:{tenant_id}:{cluster_id}")
+            policy = session.get(RetentionPolicyRevision, identity)
+            if policy is None:
+                raise ValueError("retention policy revision does not exist")
+            existing = session.get(RetentionPolicyCancellation, identity)
+            if existing is not None:
+                if (
+                    existing.reason != reason
+                    or existing.cancelled_by_credential_id
+                    != cancelled_by_credential_id
+                ):
+                    raise ValueError(
+                        "retention policy revision already has a different cancellation"
+                    )
+                return RetentionPolicyCancellationDecision(
+                    tenant_id=existing.tenant_id,
+                    cluster_id=existing.cluster_id,
+                    policy_version=existing.policy_version,
+                    reason=existing.reason,
+                    cancelled_by_credential_id=existing.cancelled_by_credential_id,
+                    cancelled_at=existing.cancelled_at,
+                )
+            if self._retention_deadline_is_due(policy.effective_at, now):
+                raise ValueError(
+                    "retention policy revision cannot be cancelled after it is effective"
+                )
+            cancellation = RetentionPolicyCancellation(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                policy_version=policy_version,
+                reason=reason,
+                cancelled_by_credential_id=cancelled_by_credential_id,
+                cancelled_at=now,
+            )
+            session.add(cancellation)
+            return RetentionPolicyCancellationDecision(
+                tenant_id=tenant_id,
+                cluster_id=cluster_id,
+                policy_version=policy_version,
+                reason=reason,
+                cancelled_by_credential_id=cancelled_by_credential_id,
+                cancelled_at=now,
+            )
+
     @staticmethod
     def _retention_deadline_is_due(deadline: datetime, now: datetime) -> bool:
         if deadline.tzinfo is None and now.tzinfo is not None:
@@ -377,6 +463,11 @@ class IngestionService:
         )
         if policy is None:
             raise ValueError("retention policy revision does not exist")
+        if session.get(
+            RetentionPolicyCancellation,
+            (tenant_id, cluster_id, policy_version),
+        ) is not None:
+            raise ValueError("retention policy revision is cancelled")
         if not IngestionService._retention_deadline_is_due(policy.effective_at, now):
             raise ValueError("retention policy revision is not yet effective")
         return policy

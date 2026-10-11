@@ -24,6 +24,7 @@ from ranklens_enterprise.database import (
     ReportHead,
     ReportRevision,
     RetentionPolicyBackfill,
+    RetentionPolicyCancellation,
     RetentionPolicyRevision,
     SegmentManifest,
     build_engine,
@@ -472,6 +473,114 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 [revision.logical_case_id for revision in revisions],
                 [None, "case-a", None],
             )
+
+    def test_scheduled_policy_cancellation_is_audited_and_never_activates(self) -> None:
+        current = {"now": datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)}
+        service = IngestionService(
+            self.sessions,
+            self.objects,
+            clock=lambda: current["now"],
+        )
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="legacy-cancellation").model_copy(
+                update={"producer_id": "node-legacy-cancellation"}
+            ),
+        )
+        active = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 3600, "retention-admin-a"
+        )
+        scheduled_at = current["now"] + timedelta(hours=2)
+        cancelled_policy = service.create_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            7200,
+            "retention-admin-a",
+            scheduled_at,
+        )
+        scheduled_case = service.create_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            10800,
+            "retention-admin-a",
+            scheduled_at,
+            "case-a",
+        )
+        cancellation = service.cancel_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            cancelled_policy.version,
+            "scheduled duration was incorrect",
+            "retention-admin-b",
+        )
+        replay = service.cancel_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            cancelled_policy.version,
+            "scheduled duration was incorrect",
+            "retention-admin-b",
+        )
+        self.assertEqual(replay.policy_version, cancellation.policy_version)
+        self.assertEqual(replay.reason, cancellation.reason)
+        self.assertEqual(
+            replay.cancelled_by_credential_id,
+            cancellation.cancelled_by_credential_id,
+        )
+        with self.assertRaisesRegex(ValueError, "different cancellation"):
+            service.cancel_retention_policy_revision(
+                "tenant-a",
+                "cluster-a",
+                cancelled_policy.version,
+                "different reason",
+                "retention-admin-b",
+            )
+        with self.assertRaisesRegex(ValueError, "after it is effective"):
+            service.cancel_retention_policy_revision(
+                "tenant-a",
+                "cluster-a",
+                active.version,
+                "invalid active cancellation",
+                "retention-admin-b",
+            )
+        with self.assertRaisesRegex(ValueError, "is cancelled"):
+            service.preview_retention_policy_backfill(
+                "tenant-a", "cluster-a", cancelled_policy.version, 10
+            )
+
+        current["now"] += timedelta(hours=3)
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="after-cancelled-activation").model_copy(
+                update={"producer_id": "node-after-cancelled-activation"}
+            ),
+        )
+        service.admit(
+            self.principal,
+            self.segment(
+                attempt_id="case-after-cancelled-activation",
+                logical_case_id="case-a",
+            ).model_copy(update={"producer_id": "node-case-after-cancelled-activation"}),
+        )
+        with self.sessions() as session:
+            audit = session.get(
+                RetentionPolicyCancellation,
+                ("tenant-a", "cluster-a", cancelled_policy.version),
+            )
+            plain = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "after-cancelled-activation"),
+            )
+            case = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "case-after-cancelled-activation"),
+            )
+            assert audit is not None
+            assert plain is not None
+            assert case is not None
+            self.assertEqual(audit.reason, "scheduled duration was incorrect")
+            self.assertEqual(audit.cancelled_by_credential_id, "retention-admin-b")
+            self.assertEqual(plain.retention_policy_version, active.version)
+            self.assertEqual(case.retention_policy_version, scheduled_case.version)
 
     def test_reviewed_retention_backfill_is_bounded_audited_and_hold_aware(self) -> None:
         now = datetime.now(timezone.utc)
