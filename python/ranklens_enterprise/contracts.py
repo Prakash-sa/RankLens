@@ -80,6 +80,22 @@ class ReceiptView(DurableReceipt):
     last_sequence: int
 
 
+class MachineCredentialRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class MachineCredentialRevocationView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    credential_id: str
+    reason: str
+    revoked_by_credential_id: str
+    revoked_at: datetime
+
+
 class SchedulerObservationView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

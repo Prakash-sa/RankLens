@@ -6,6 +6,7 @@ import argparse
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import timezone
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
@@ -23,6 +24,8 @@ from .contracts import (
     AttemptView,
     DurableReceipt,
     HealthStatus,
+    MachineCredentialRevocationRequest,
+    MachineCredentialRevocationView,
     ReceiptView,
     RankAggregateView,
     ReportRevisionView,
@@ -40,6 +43,7 @@ from .database import (
     AttemptGeneration,
     AttemptHold,
     AttemptRecord,
+    MachineCredentialRevocation,
     ReportHead,
     ReportRevision,
     RetentionPolicyCancellation,
@@ -67,7 +71,7 @@ def create_app(settings: Settings) -> FastAPI:
         max_expanded_segment_bytes=settings.max_expanded_segment_bytes,
         default_retention_seconds=settings.default_retention_seconds,
     )
-    authenticator = MachineAuthenticator(settings)
+    authenticator = MachineAuthenticator(settings, sessions)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -142,6 +146,78 @@ def create_app(settings: Settings) -> FastAPI:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         return HealthStatus()
+
+    def machine_credential_revocation_view(
+        revocation: MachineCredentialRevocation,
+    ) -> MachineCredentialRevocationView:
+        revoked_at = revocation.revoked_at
+        if revoked_at.tzinfo is None:
+            revoked_at = revoked_at.replace(tzinfo=timezone.utc)
+        return MachineCredentialRevocationView(
+            tenant_id=revocation.tenant_id,
+            credential_id=revocation.credential_id,
+            reason=revocation.reason,
+            revoked_by_credential_id=revocation.revoked_by_credential_id,
+            revoked_at=revoked_at,
+        )
+
+    @app.post(
+        "/v1/machine-credentials/{credential_id}/revocation",
+        response_model=MachineCredentialRevocationView,
+        status_code=201,
+    )
+    def revoke_machine_credential(
+        request: MachineCredentialRevocationRequest,
+        credential_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_security_admin
+        ),
+    ) -> MachineCredentialRevocationView:
+        try:
+            revocation = authenticator.revoke_credential(
+                principal, credential_id, request.reason
+            )
+        except LookupError as error:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "machine_credential_not_found"},
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "machine_credential_revocation_conflict",
+                    "message": str(error),
+                },
+            ) from error
+        return machine_credential_revocation_view(revocation)
+
+    @app.get(
+        "/v1/machine-credential-revocations",
+        response_model=List[MachineCredentialRevocationView],
+    )
+    def list_machine_credential_revocations(
+        limit: int = Query(default=50, ge=1, le=500),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_security_admin
+        ),
+    ) -> List[MachineCredentialRevocationView]:
+        with sessions() as session:
+            revocations = session.scalars(
+                select(MachineCredentialRevocation)
+                .where(MachineCredentialRevocation.tenant_id == principal.tenant_id)
+                .order_by(
+                    MachineCredentialRevocation.revoked_at.desc(),
+                    MachineCredentialRevocation.credential_id,
+                )
+                .limit(limit)
+            ).all()
+            return [
+                machine_credential_revocation_view(revocation)
+                for revocation in revocations
+            ]
 
     @app.post("/v1/segments", response_model=DurableReceipt, status_code=201)
     def admit_segment(

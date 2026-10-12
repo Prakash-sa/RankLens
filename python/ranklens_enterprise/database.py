@@ -18,6 +18,26 @@ class Base(DeclarativeBase):
     pass
 
 
+class MachineCredentialRevocation(Base):
+    """Permanent tenant-scoped revocation of one configured machine identity."""
+
+    __tablename__ = "machine_credential_revocations"
+    __table_args__ = (
+        Index(
+            "ix_machine_credential_revocation_history",
+            "tenant_id",
+            "revoked_at",
+            "credential_id",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    credential_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    revoked_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AttemptGeneration(Base):
     __tablename__ = "attempt_generations"
 

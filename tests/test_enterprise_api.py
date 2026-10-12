@@ -36,6 +36,8 @@ class EnterpriseApiTests(unittest.TestCase):
         self.ingest_token = "ingest-only-token-with-at-least-24-characters"
         self.read_token = "read-only-token-with-at-least-24-characters"
         self.retention_token = "retention-admin-token-with-at-least-24-characters"
+        self.security_token = "security-admin-token-with-at-least-24-characters"
+        self.other_tenant_token = "other-tenant-token-with-at-least-24-characters"
         settings = Settings(
             database_url=self.database_url,
             object_root=self.object_root,
@@ -46,6 +48,15 @@ class EnterpriseApiTests(unittest.TestCase):
                 self.credential(
                     self.retention_token, "test-retention", {"retention:admin"}
                 ),
+                self.credential(
+                    self.security_token, "test-security", {"credentials:revoke"}
+                ),
+                self.credential(
+                    self.other_tenant_token,
+                    "other-tenant-agent",
+                    {"segments:write"},
+                    tenant_id="tenant-b",
+                ),
             ),
             bootstrap_schema=True,
         )
@@ -53,11 +64,17 @@ class EnterpriseApiTests(unittest.TestCase):
         self.client = self.client_context.__enter__()
 
     @staticmethod
-    def credential(token: str, credential_id: str, permissions: set[str]) -> MachineCredential:
+    def credential(
+        token: str,
+        credential_id: str,
+        permissions: set[str],
+        *,
+        tenant_id: str = "tenant-a",
+    ) -> MachineCredential:
         return MachineCredential(
             token_sha256=hashlib.sha256(token.encode("utf-8")).hexdigest(),
             principal=MachinePrincipal(
-                "tenant-a",
+                tenant_id,
                 frozenset({"cluster-a"}),
                 credential_id,
                 frozenset(permissions),
@@ -158,6 +175,71 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(read_ingest.json()["detail"]["code"], "machine_auth_forbidden")
         self.assertEqual(readable.status_code, 200)
         self.assertEqual(len(readable.json()["items"]), 1)
+
+    def test_security_admin_revokes_a_tenant_credential_without_restart(self) -> None:
+        security_headers = {"authorization": f"Bearer {self.security_token}"}
+        retention_headers = {"authorization": f"Bearer {self.retention_token}"}
+        ingest_headers = {"authorization": f"Bearer {self.ingest_token}"}
+        path = "/v1/machine-credentials/test-ingest/revocation"
+
+        admitted = self.client.post(
+            "/v1/segments", json=self.request_body(), headers=ingest_headers
+        )
+        forbidden = self.client.post(
+            path,
+            json={"reason": "credential exposed"},
+            headers=retention_headers,
+        )
+        cross_tenant = self.client.post(
+            "/v1/machine-credentials/other-tenant-agent/revocation",
+            json={"reason": "credential exposed"},
+            headers=security_headers,
+        )
+        self_revoke = self.client.post(
+            "/v1/machine-credentials/test-security/revocation",
+            json={"reason": "rotate administrator"},
+            headers=security_headers,
+        )
+        revoked = self.client.post(
+            path,
+            json={"reason": "credential exposed"},
+            headers=security_headers,
+        )
+        replayed = self.client.post(
+            path,
+            json={"reason": "credential exposed"},
+            headers=security_headers,
+        )
+        conflicting = self.client.post(
+            path,
+            json={"reason": "different incident"},
+            headers=security_headers,
+        )
+        rejected = self.client.post(
+            "/v1/segments", json=self.request_body(), headers=ingest_headers
+        )
+        history = self.client.get(
+            "/v1/machine-credential-revocations", headers=security_headers
+        )
+
+        self.assertEqual(admitted.status_code, 201)
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(cross_tenant.status_code, 404)
+        self.assertEqual(self_revoke.status_code, 409)
+        self.assertEqual(revoked.status_code, 201)
+        self.assertEqual(revoked.json()["tenant_id"], "tenant-a")
+        self.assertEqual(revoked.json()["credential_id"], "test-ingest")
+        self.assertEqual(revoked.json()["reason"], "credential exposed")
+        self.assertEqual(
+            revoked.json()["revoked_by_credential_id"], "test-security"
+        )
+        self.assertEqual(replayed.status_code, 201)
+        self.assertEqual(replayed.json()["revoked_at"], revoked.json()["revoked_at"])
+        self.assertEqual(conflicting.status_code, 409)
+        self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(rejected.json()["detail"]["code"], "machine_auth_invalid")
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(history.json(), [revoked.json()])
 
     def test_segment_endpoint_requires_json_and_a_bounded_body(self) -> None:
         headers = {"authorization": f"Bearer {self.token}"}

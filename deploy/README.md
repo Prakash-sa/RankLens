@@ -16,9 +16,12 @@ docker compose -f deploy/compose.yaml up --build
 ```
 
 Use a separate credential with `telemetry:read` for read-only API clients, and grant
-`retention:admin` only to identities allowed to view, place, and release retention holds. Validity windows use
-offset-aware ISO-8601 timestamps; overlapping old and new credentials support a controlled rotation.
-Removing a credential from the configuration revokes it after the API is restarted.
+`retention:admin` only to identities allowed to manage retention. Reserve `credentials:revoke` for
+a separate security-administrator identity. That administrator can permanently revoke another
+credential through the API without a restart; the tenant-scoped reason, actor, and time are retained
+for audit, and a revoked credential ID must not be reused. Validity windows use offset-aware ISO-8601
+timestamps, and overlapping old and new credentials support a controlled rotation. Removing a
+credential from configuration still requires an API restart to take effect.
 
 Retention administrators can also create append-only cluster policy revisions. A policy applies to
 new attempts only, so later edits never silently rewrite an existing attempt's fixed expiry. Use a

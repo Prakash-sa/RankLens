@@ -9,6 +9,12 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from ranklens_enterprise.auth import MachineAuthenticator
+from ranklens_enterprise.database import (
+    MachineCredentialRevocation,
+    build_engine,
+    build_session_factory,
+    initialize_schema,
+)
 from ranklens_enterprise.settings import MachineCredential, MachinePrincipal, Settings
 
 
@@ -17,8 +23,12 @@ class MachineAuthenticatorTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.token = "rotated-machine-token-with-enough-entropy"
         self.now = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        self.engine = build_engine("sqlite:///:memory:")
+        initialize_schema(self.engine)
+        self.sessions = build_session_factory(self.engine)
 
     def tearDown(self) -> None:
+        self.engine.dispose()
         self.temporary.cleanup()
 
     def authenticator(
@@ -43,7 +53,7 @@ class MachineAuthenticatorTests(unittest.TestCase):
             object_root=Path(self.temporary.name),
             machine_credentials=(credential,),
         )
-        return MachineAuthenticator(settings, clock=lambda: self.now)
+        return MachineAuthenticator(settings, self.sessions, clock=lambda: self.now)
 
     def test_accepts_active_digest_and_rejects_unmatched_token(self) -> None:
         authenticator = self.authenticator(
@@ -67,6 +77,25 @@ class MachineAuthenticatorTests(unittest.TestCase):
                 authenticator.authenticate_ingest(f"Bearer {self.token}")
             self.assertEqual(rejected.exception.status_code, 401)
             self.assertEqual(rejected.exception.detail["code"], "machine_auth_invalid")
+
+    def test_rejects_a_durably_revoked_credential(self) -> None:
+        authenticator = self.authenticator()
+        with self.sessions.begin() as session:
+            session.add(
+                MachineCredentialRevocation(
+                    tenant_id="tenant-a",
+                    credential_id="agent-rotating",
+                    reason="credential exposed",
+                    revoked_by_credential_id="security-admin",
+                    revoked_at=self.now,
+                )
+            )
+
+        with self.assertRaises(HTTPException) as rejected:
+            authenticator.authenticate_ingest(f"Bearer {self.token}")
+
+        self.assertEqual(rejected.exception.status_code, 401)
+        self.assertEqual(rejected.exception.detail["code"], "machine_auth_invalid")
 
 
 if __name__ == "__main__":

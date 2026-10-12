@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from fastapi import Header, HTTPException, status
+from sqlalchemy.orm import Session, sessionmaker
 
+from .database import MachineCredentialRevocation, lock_stream
 from .settings import MachinePrincipal, Settings
 
 
@@ -16,11 +18,29 @@ class MachineAuthenticator:
     def __init__(
         self,
         settings: Settings,
+        sessions: sessionmaker[Session],
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self._credentials = settings.machine_credentials
+        self._sessions = sessions
         self._clock = clock
+        self._credentials_by_id = {
+            credential.principal.credential_id: credential
+            for credential in self._credentials
+        }
+        if len(self._credentials_by_id) != len(self._credentials):
+            raise RuntimeError("machine credential IDs must be unique")
+
+    def _is_revoked(self, principal: MachinePrincipal) -> bool:
+        with self._sessions() as session:
+            return (
+                session.get(
+                    MachineCredentialRevocation,
+                    (principal.tenant_id, principal.credential_id),
+                )
+                is not None
+            )
 
     def _authenticate(self, authorization: str, permission: str) -> MachinePrincipal:
         scheme, separator, supplied = authorization.partition(" ")
@@ -43,6 +63,8 @@ class MachineAuthenticator:
                 (matched.not_before is not None and now < matched.not_before)
                 or (matched.expires_at is not None and now >= matched.expires_at)
             ):
+                matched = None
+            elif self._is_revoked(matched.principal):
                 matched = None
             elif permission not in matched.principal.permissions:
                 raise HTTPException(
@@ -70,3 +92,51 @@ class MachineAuthenticator:
         self, authorization: str = Header(default="")
     ) -> MachinePrincipal:
         return self._authenticate(authorization, "retention:admin")
+
+    def authenticate_security_admin(
+        self, authorization: str = Header(default="")
+    ) -> MachinePrincipal:
+        return self._authenticate(authorization, "credentials:revoke")
+
+    def revoke_credential(
+        self,
+        principal: MachinePrincipal,
+        credential_id: str,
+        reason: str,
+    ) -> MachineCredentialRevocation:
+        reason = reason.strip()
+        if not reason or len(reason) > 512:
+            raise ValueError("revocation reason must contain between 1 and 512 characters")
+        if credential_id == principal.credential_id:
+            raise ValueError("a security credential cannot revoke itself")
+        target = self._credentials_by_id.get(credential_id)
+        if target is None or target.principal.tenant_id != principal.tenant_id:
+            raise LookupError("machine credential does not exist")
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RuntimeError("machine authentication clock must be timezone-aware")
+        identity = (principal.tenant_id, credential_id)
+        with self._sessions.begin() as session:
+            lock_stream(
+                session,
+                f"machine-credential-revocation:{principal.tenant_id}:{credential_id}",
+            )
+            existing = session.get(MachineCredentialRevocation, identity)
+            if existing is not None:
+                if (
+                    existing.reason != reason
+                    or existing.revoked_by_credential_id != principal.credential_id
+                ):
+                    raise ValueError(
+                        "machine credential already has a different revocation"
+                    )
+                return existing
+            revocation = MachineCredentialRevocation(
+                tenant_id=principal.tenant_id,
+                credential_id=credential_id,
+                reason=reason,
+                revoked_by_credential_id=principal.credential_id,
+                revoked_at=now,
+            )
+            session.add(revocation)
+            return revocation
