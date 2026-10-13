@@ -24,6 +24,7 @@ from ranklens_enterprise.database import (
     ReportHead,
     ReportRevision,
     RetentionPolicyBackfill,
+    RetentionPolicyBackfillItem,
     RetentionPolicyCancellation,
     RetentionPolicyRevision,
     SegmentManifest,
@@ -437,6 +438,7 @@ class EnterpriseIngestionTests(unittest.TestCase):
             10,
             expected_eligible_attempts=1,
             expected_due_attempts=0,
+            expected_candidate_digest=preview.candidate_digest,
             requested_by_credential_id="retention-admin-a",
         )
         self.assertEqual(applied.updated_attempts, 1)
@@ -636,6 +638,7 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 10,
                 expected_eligible_attempts=4,
                 expected_due_attempts=2,
+                expected_candidate_digest=preview.candidate_digest,
                 requested_by_credential_id="retention-admin-a",
             )
         with self.sessions() as session:
@@ -659,6 +662,7 @@ class EnterpriseIngestionTests(unittest.TestCase):
             10,
             expected_eligible_attempts=preview.eligible_attempts,
             expected_due_attempts=preview.due_attempts,
+            expected_candidate_digest=preview.candidate_digest,
             requested_by_credential_id="retention-admin-a",
         )
         self.assertEqual(applied.updated_attempts, 3)
@@ -709,6 +713,150 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 ).state,
                 "held",
             )
+
+    def test_reviewed_retention_migration_detects_candidate_drift_and_audits_items(
+        self,
+    ) -> None:
+        now = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+        service = IngestionService(
+            self.sessions,
+            self.objects,
+            clock=lambda: now,
+        )
+        source = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 14400, "retention-admin-a"
+        )
+        for attempt_id in ("migration-old-one", "migration-old-two"):
+            service.admit(
+                self.principal,
+                self.segment(attempt_id=attempt_id).model_copy(
+                    update={"producer_id": f"node-{attempt_id}"}
+                ),
+            )
+        target = service.create_retention_policy_revision(
+            "tenant-a", "cluster-a", 28800, "retention-admin-b"
+        )
+        service.admit(
+            self.principal,
+            self.segment(attempt_id="migration-new").model_copy(
+                update={"producer_id": "node-migration-new"}
+            ),
+        )
+        case_target = service.create_retention_policy_revision(
+            "tenant-a",
+            "cluster-a",
+            43200,
+            "retention-admin-b",
+            logical_case_id="case-a",
+        )
+        reason = "extend evidence for active investigation"
+        preview = service.preview_retention_policy_backfill(
+            "tenant-a",
+            "cluster-a",
+            target.version,
+            10,
+            source.version,
+            reason,
+        )
+        self.assertEqual(preview.eligible_attempts, 2)
+        self.assertEqual(preview.due_attempts, 0)
+        self.assertEqual(len(preview.candidate_digest), 64)
+        with self.assertRaisesRegex(ValueError, "same scope"):
+            service.preview_retention_policy_backfill(
+                "tenant-a",
+                "cluster-a",
+                case_target.version,
+                10,
+                source.version,
+                reason,
+            )
+
+        with self.sessions.begin() as session:
+            removed = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "migration-old-one"),
+            )
+            added = session.get(
+                AttemptRecord,
+                ("tenant-a", "cluster-a", "migration-new"),
+            )
+            assert removed is not None
+            assert added is not None
+            removed.retention_policy_version = target.version
+            removed.retention_expires_at = removed.first_admitted_at + timedelta(
+                seconds=target.retention_seconds
+            )
+            added.retention_policy_version = source.version
+            added.retention_expires_at = added.first_admitted_at + timedelta(
+                seconds=source.retention_seconds
+            )
+
+        with self.assertRaisesRegex(ValueError, "preview is stale"):
+            service.apply_retention_policy_backfill(
+                "tenant-a",
+                "cluster-a",
+                target.version,
+                10,
+                expected_eligible_attempts=preview.eligible_attempts,
+                expected_due_attempts=preview.due_attempts,
+                expected_candidate_digest=preview.candidate_digest,
+                requested_by_credential_id="retention-admin-b",
+                source_policy_version=source.version,
+                reason=reason,
+            )
+
+        refreshed = service.preview_retention_policy_backfill(
+            "tenant-a",
+            "cluster-a",
+            target.version,
+            10,
+            source.version,
+            reason,
+        )
+        applied = service.apply_retention_policy_backfill(
+            "tenant-a",
+            "cluster-a",
+            target.version,
+            10,
+            expected_eligible_attempts=refreshed.eligible_attempts,
+            expected_due_attempts=refreshed.due_attempts,
+            expected_candidate_digest=refreshed.candidate_digest,
+            requested_by_credential_id="retention-admin-b",
+            source_policy_version=source.version,
+            reason=reason,
+        )
+
+        with self.sessions() as session:
+            audit = session.get(RetentionPolicyBackfill, applied.backfill_id)
+            items = list(
+                session.scalars(
+                    select(RetentionPolicyBackfillItem)
+                    .where(
+                        RetentionPolicyBackfillItem.backfill_id
+                        == applied.backfill_id
+                    )
+                    .order_by(RetentionPolicyBackfillItem.attempt_id)
+                )
+            )
+            assert audit is not None
+            self.assertEqual(audit.source_policy_version, source.version)
+            self.assertEqual(audit.policy_version, target.version)
+            self.assertEqual(audit.reason, reason)
+            self.assertEqual(audit.candidate_digest, refreshed.candidate_digest)
+            self.assertEqual(
+                [item.attempt_id for item in items],
+                ["migration-new", "migration-old-two"],
+            )
+            self.assertTrue(
+                all(item.previous_policy_version == source.version for item in items)
+            )
+            self.assertTrue(
+                all(item.new_policy_version == target.version for item in items)
+            )
+            self.assertTrue(
+                all(item.previous_expires_at is not None for item in items)
+            )
+            self.assertTrue(all(item.new_expires_at is not None for item in items))
 
     def test_admission_rejects_conflicting_attempt_binding(self) -> None:
         self.service.admit(

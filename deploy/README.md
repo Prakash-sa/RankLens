@@ -23,9 +23,12 @@ for audit, and a revoked credential ID must not be reused. Validity windows use 
 timestamps, and overlapping old and new credentials support a controlled rotation. Removing a
 credential from configuration still requires an API restart to take effect.
 
-Retention administrators can also create append-only cluster policy revisions. A policy applies to
-new attempts only, so later edits never silently rewrite an existing attempt's fixed expiry. Use a
-retention value of zero to disable automatic expiry for new attempts in that cluster.
+Retention administrators can also create append-only cluster policy revisions. A new revision
+applies to new attempts only, so later edits never silently rewrite an existing attempt's fixed
+expiry. An administrator can migrate attempts from one named revision to another only through the
+bounded preview/apply workflow, which confirms the exact candidate digest and records each
+attempt's before/after assignment with an audit reason. Use a retention value of zero to disable
+automatic expiry for new attempts in that cluster.
 
 The API binds only to loopback on port 8080. Put a site-approved TLS/mTLS reverse proxy in front of
 it before an agent connects from another host. Do not put the password, token, or credential JSON in this repository

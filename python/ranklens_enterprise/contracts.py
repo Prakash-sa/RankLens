@@ -285,19 +285,34 @@ class RetentionPolicyCancellationRequest(BaseModel):
 
 
 class RetentionPolicyBackfillRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     policy_version: int = Field(ge=1, le=2**63 - 1)
+    source_policy_version: Optional[int] = Field(default=None, ge=1, le=2**63 - 1)
+    reason: Optional[str] = Field(default=None, min_length=1, max_length=512)
     max_attempts: int = Field(default=1000, ge=1, le=1000)
     apply: bool = False
     expected_eligible_attempts: Optional[int] = Field(default=None, ge=0, le=1000)
     expected_due_attempts: Optional[int] = Field(default=None, ge=0, le=1000)
+    expected_candidate_digest: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def validate_apply_confirmation(self) -> "RetentionPolicyBackfillRequest":
-        expected = (self.expected_eligible_attempts, self.expected_due_attempts)
+        if self.source_policy_version == self.policy_version:
+            raise ValueError("source and target policy revisions must differ")
+        if (self.source_policy_version is None) != (self.reason is None):
+            raise ValueError(
+                "versioned migration requires both source_policy_version and reason"
+            )
+        expected = (
+            self.expected_eligible_attempts,
+            self.expected_due_attempts,
+            self.expected_candidate_digest,
+        )
         if self.apply and any(value is None for value in expected):
-            raise ValueError("apply requires both expected attempt counts from a preview")
+            raise ValueError("apply requires counts and candidate digest from a preview")
         if not self.apply and any(value is not None for value in expected):
             raise ValueError("preview requests cannot include expected attempt counts")
         return self
@@ -311,7 +326,10 @@ class RetentionPolicyBackfillView(BaseModel):
     tenant_id: str
     cluster_id: str
     policy_version: int
+    source_policy_version: Optional[int] = None
+    reason: Optional[str] = None
     logical_case_id: Optional[str] = None
+    candidate_digest: str
     eligible_attempts: int
     due_attempts: int
     updated_attempts: int

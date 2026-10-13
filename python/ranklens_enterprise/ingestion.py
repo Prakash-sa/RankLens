@@ -24,6 +24,7 @@ from .database import (
     AttemptRecord,
     OutboxRecord,
     RetentionPolicyBackfill,
+    RetentionPolicyBackfillItem,
     RetentionPolicyCancellation,
     RetentionPolicyRevision,
     SegmentManifest,
@@ -77,9 +78,12 @@ class RetentionPolicyBackfillDecision:
     cluster_id: str
     policy_version: int
     logical_case_id: Optional[str]
+    candidate_digest: str
     eligible_attempts: int
     due_attempts: int
     updated_attempts: int
+    source_policy_version: Optional[int] = None
+    reason: Optional[str] = None
     backfill_id: Optional[str] = None
     requested_by_credential_id: Optional[str] = None
     requested_at: Optional[datetime] = None
@@ -479,6 +483,7 @@ class IngestionService:
         cluster_id: str,
         max_attempts: int,
         logical_case_id: Optional[str],
+        source_policy_version: Optional[int],
     ) -> list[AttemptRecord]:
         deletion_exists = (
             select(AttemptDeletion.attempt_id)
@@ -492,9 +497,14 @@ class IngestionService:
         filters = [
             AttemptRecord.tenant_id == tenant_id,
             AttemptRecord.cluster_id == cluster_id,
-            AttemptRecord.retention_policy_version.is_(None),
             ~deletion_exists,
         ]
+        if source_policy_version is None:
+            filters.append(AttemptRecord.retention_policy_version.is_(None))
+        else:
+            filters.append(
+                AttemptRecord.retention_policy_version == source_policy_version
+            )
         if logical_case_id is not None:
             filters.append(AttemptRecord.logical_case_id == logical_case_id)
         attempts = list(
@@ -511,6 +521,31 @@ class IngestionService:
             )
         return attempts
 
+    @staticmethod
+    def _retention_backfill_candidate_digest(
+        attempts: list[AttemptRecord],
+    ) -> str:
+        def timestamp(value: Optional[datetime]) -> Optional[str]:
+            if value is None:
+                return None
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat()
+
+        candidates = [
+            {
+                "attempt_id": attempt.attempt_id,
+                "first_admitted_at": timestamp(attempt.first_admitted_at),
+                "retention_policy_version": attempt.retention_policy_version,
+                "retention_expires_at": timestamp(attempt.retention_expires_at),
+            }
+            for attempt in attempts
+        ]
+        encoded = json.dumps(
+            candidates, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def _retention_backfill_decision(
         self,
         session: Session,
@@ -519,14 +554,40 @@ class IngestionService:
         policy_version: int,
         max_attempts: int,
         now: datetime,
-    ) -> tuple[RetentionPolicyRevision, list[AttemptRecord], int]:
+        source_policy_version: Optional[int],
+        reason: Optional[str],
+    ) -> tuple[RetentionPolicyRevision, list[AttemptRecord], int, str]:
         if not 1 <= max_attempts <= 1000:
             raise ValueError("max_attempts must be within [1, 1000]")
         policy = self._retention_backfill_policy(
             session, tenant_id, cluster_id, policy_version, now
         )
+        if source_policy_version == policy_version:
+            raise ValueError("source and target policy revisions must differ")
+        if source_policy_version is not None:
+            if reason is None or not reason.strip() or len(reason.strip()) > 512:
+                raise ValueError(
+                    "versioned migration requires a reason between 1 and 512 characters"
+                )
+            source_policy = session.get(
+                RetentionPolicyRevision,
+                (tenant_id, cluster_id, source_policy_version),
+            )
+            if source_policy is None:
+                raise ValueError("source retention policy revision does not exist")
+            if source_policy.logical_case_id != policy.logical_case_id:
+                raise ValueError(
+                    "source and target policy revisions must have the same scope"
+                )
+        elif reason is not None:
+            raise ValueError("legacy backfill cannot include a migration reason")
         attempts = self._retention_backfill_candidates(
-            session, tenant_id, cluster_id, max_attempts, policy.logical_case_id
+            session,
+            tenant_id,
+            cluster_id,
+            max_attempts,
+            policy.logical_case_id,
+            source_policy_version,
         )
         due_attempts = 0
         if policy.retention_seconds > 0:
@@ -536,7 +597,12 @@ class IngestionService:
                 )
                 if self._retention_deadline_is_due(deadline, now):
                     due_attempts += 1
-        return policy, attempts, due_attempts
+        return (
+            policy,
+            attempts,
+            due_attempts,
+            self._retention_backfill_candidate_digest(attempts),
+        )
 
     def preview_retention_policy_backfill(
         self,
@@ -544,25 +610,34 @@ class IngestionService:
         cluster_id: str,
         policy_version: int,
         max_attempts: int,
+        source_policy_version: Optional[int] = None,
+        reason: Optional[str] = None,
     ) -> RetentionPolicyBackfillDecision:
         now = self._clock()
         with self._sessions() as session:
-            policy, attempts, due_attempts = self._retention_backfill_decision(
-                session,
-                tenant_id,
-                cluster_id,
-                policy_version,
-                max_attempts,
-                now,
+            policy, attempts, due_attempts, candidate_digest = (
+                self._retention_backfill_decision(
+                    session,
+                    tenant_id,
+                    cluster_id,
+                    policy_version,
+                    max_attempts,
+                    now,
+                    source_policy_version,
+                    reason,
+                )
             )
             return RetentionPolicyBackfillDecision(
                 tenant_id=tenant_id,
                 cluster_id=cluster_id,
                 policy_version=policy_version,
                 logical_case_id=policy.logical_case_id,
+                candidate_digest=candidate_digest,
                 eligible_attempts=len(attempts),
                 due_attempts=due_attempts,
                 updated_attempts=0,
+                source_policy_version=source_policy_version,
+                reason=reason.strip() if reason is not None else None,
             )
 
     def apply_retention_policy_backfill(
@@ -573,45 +648,88 @@ class IngestionService:
         max_attempts: int,
         expected_eligible_attempts: int,
         expected_due_attempts: int,
+        expected_candidate_digest: str,
         requested_by_credential_id: str,
+        source_policy_version: Optional[int] = None,
+        reason: Optional[str] = None,
     ) -> RetentionPolicyBackfillDecision:
         if self._ACTOR_CREDENTIAL_ID.fullmatch(requested_by_credential_id) is None:
             raise ValueError("retention policy credential ID is invalid")
         if expected_eligible_attempts < 0 or expected_due_attempts < 0:
             raise ValueError("expected attempt counts cannot be negative")
+        if re.fullmatch(r"[0-9a-f]{64}", expected_candidate_digest) is None:
+            raise ValueError("expected candidate digest must be a lowercase SHA-256")
         now = self._clock()
         with self._sessions.begin() as session:
             lock_stream(session, f"retention-policy-backfill:{tenant_id}:{cluster_id}")
-            policy, attempts, due_attempts = self._retention_backfill_decision(
-                session,
-                tenant_id,
-                cluster_id,
-                policy_version,
-                max_attempts,
-                now,
+            policy, attempts, due_attempts, candidate_digest = (
+                self._retention_backfill_decision(
+                    session,
+                    tenant_id,
+                    cluster_id,
+                    policy_version,
+                    max_attempts,
+                    now,
+                    source_policy_version,
+                    reason,
+                )
+            )
+            for attempt in attempts:
+                lock_stream(
+                    session,
+                    f"attempt:{tenant_id}:{cluster_id}:{attempt.attempt_id}",
+                )
+            policy, attempts, due_attempts, candidate_digest = (
+                self._retention_backfill_decision(
+                    session,
+                    tenant_id,
+                    cluster_id,
+                    policy_version,
+                    max_attempts,
+                    now,
+                    source_policy_version,
+                    reason,
+                )
             )
             if (
                 len(attempts) != expected_eligible_attempts
                 or due_attempts != expected_due_attempts
+                or candidate_digest != expected_candidate_digest
             ):
                 raise ValueError(
                     "retention policy backfill preview is stale; preview again"
                 )
+            backfill_id = str(uuid.uuid4())
             for attempt in attempts:
-                attempt.retention_policy_version = policy.version
-                attempt.retention_expires_at = (
+                new_expires_at = (
                     attempt.first_admitted_at
                     + timedelta(seconds=policy.retention_seconds)
                     if policy.retention_seconds > 0
                     else None
                 )
-            backfill_id = str(uuid.uuid4())
+                session.add(
+                    RetentionPolicyBackfillItem(
+                        backfill_id=backfill_id,
+                        attempt_id=attempt.attempt_id,
+                        tenant_id=tenant_id,
+                        cluster_id=cluster_id,
+                        previous_policy_version=attempt.retention_policy_version,
+                        previous_expires_at=attempt.retention_expires_at,
+                        new_policy_version=policy.version,
+                        new_expires_at=new_expires_at,
+                    )
+                )
+                attempt.retention_policy_version = policy.version
+                attempt.retention_expires_at = new_expires_at
             session.add(
                 RetentionPolicyBackfill(
                     backfill_id=backfill_id,
                     tenant_id=tenant_id,
                     cluster_id=cluster_id,
                     policy_version=policy.version,
+                    source_policy_version=source_policy_version,
+                    reason=reason.strip() if reason is not None else None,
+                    candidate_digest=candidate_digest,
                     eligible_attempts=len(attempts),
                     due_attempts=due_attempts,
                     updated_attempts=len(attempts),
@@ -624,9 +742,12 @@ class IngestionService:
                 cluster_id=cluster_id,
                 policy_version=policy.version,
                 logical_case_id=policy.logical_case_id,
+                candidate_digest=candidate_digest,
                 eligible_attempts=len(attempts),
                 due_attempts=due_attempts,
                 updated_attempts=len(attempts),
+                source_policy_version=source_policy_version,
+                reason=reason.strip() if reason is not None else None,
                 backfill_id=backfill_id,
                 requested_by_credential_id=requested_by_credential_id,
                 requested_at=now,

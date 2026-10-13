@@ -204,7 +204,7 @@ class RetentionPolicyCancellation(Base):
 
 
 class RetentionPolicyBackfill(Base):
-    """Audited application of one policy revision to legacy attempts."""
+    """Audited application of one policy revision to a reviewed attempt set."""
 
     __tablename__ = "retention_policy_backfills"
     __table_args__ = (
@@ -220,11 +220,45 @@ class RetentionPolicyBackfill(Base):
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
     cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
     policy_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_policy_version: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    reason: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    candidate_digest: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     eligible_attempts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     due_attempts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_attempts: Mapped[int] = mapped_column(BigInteger, nullable=False)
     requested_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RetentionPolicyBackfillItem(Base):
+    """Immutable before/after evidence for one reviewed retention migration."""
+
+    __tablename__ = "retention_policy_backfill_items"
+    __table_args__ = (
+        Index(
+            "ix_retention_policy_backfill_item_scope",
+            "tenant_id",
+            "cluster_id",
+            "attempt_id",
+        ),
+    )
+
+    backfill_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    attempt_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    previous_policy_version: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    previous_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    new_policy_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    new_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class AdmissionReservation(Base):

@@ -452,6 +452,7 @@ class EnterpriseApiTests(unittest.TestCase):
                 "apply": True,
                 "expected_eligible_attempts": 1,
                 "expected_due_attempts": 0,
+                "expected_candidate_digest": preview.json()["candidate_digest"],
             },
             headers=admin_headers,
         )
@@ -463,6 +464,7 @@ class EnterpriseApiTests(unittest.TestCase):
                 "apply": True,
                 "expected_eligible_attempts": preview.json()["eligible_attempts"],
                 "expected_due_attempts": preview.json()["due_attempts"],
+                "expected_candidate_digest": preview.json()["candidate_digest"],
             },
             headers=admin_headers,
         )
@@ -474,6 +476,44 @@ class EnterpriseApiTests(unittest.TestCase):
         wrong_cluster = self.client.post(
             "/v1/retention-policies/cluster-b/backfills",
             json={"policy_version": 1},
+            headers=admin_headers,
+        )
+        replacement = self.client.put(
+            "/v1/retention-policies/cluster-a",
+            json={"retention_seconds": 7200},
+            headers=admin_headers,
+        )
+        migration_without_reason = self.client.post(
+            path,
+            json={"policy_version": 2, "source_policy_version": 1},
+            headers=admin_headers,
+        )
+        migration_preview = self.client.post(
+            path,
+            json={
+                "policy_version": 2,
+                "source_policy_version": 1,
+                "reason": "extend investigation window",
+                "max_attempts": 10,
+            },
+            headers=admin_headers,
+        )
+        migration_applied = self.client.post(
+            path,
+            json={
+                "policy_version": 2,
+                "source_policy_version": 1,
+                "reason": "extend investigation window",
+                "max_attempts": 10,
+                "apply": True,
+                "expected_eligible_attempts": migration_preview.json()[
+                    "eligible_attempts"
+                ],
+                "expected_due_attempts": migration_preview.json()["due_attempts"],
+                "expected_candidate_digest": migration_preview.json()[
+                    "candidate_digest"
+                ],
+            },
             headers=admin_headers,
         )
 
@@ -493,13 +533,24 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertIsNotNone(applied.json()["backfill_id"])
         self.assertEqual(repeated_preview.json()["eligible_attempts"], 0)
         self.assertEqual(wrong_cluster.status_code, 404)
+        self.assertEqual(replacement.status_code, 201)
+        self.assertEqual(migration_without_reason.status_code, 422)
+        self.assertEqual(migration_preview.status_code, 200)
+        self.assertEqual(migration_preview.json()["source_policy_version"], 1)
+        self.assertEqual(migration_preview.json()["eligible_attempts"], 2)
+        self.assertEqual(migration_applied.status_code, 200)
+        self.assertEqual(migration_applied.json()["policy_version"], 2)
+        self.assertEqual(
+            migration_applied.json()["reason"], "extend investigation window"
+        )
+        self.assertEqual(migration_applied.json()["updated_attempts"], 2)
         for attempt_id in ("legacy-api-one", "legacy-api-two"):
             detail = self.client.get(
                 f"/v1/attempts/{attempt_id}",
                 params={"cluster_id": "cluster-a"},
                 headers=read_headers,
             )
-            self.assertEqual(detail.json()["retention_policy_version"], 1)
+            self.assertEqual(detail.json()["retention_policy_version"], 2)
             self.assertIsNotNone(detail.json()["retention_expires_at"])
 
     def test_retention_admin_schedules_future_policy_activation(self) -> None:

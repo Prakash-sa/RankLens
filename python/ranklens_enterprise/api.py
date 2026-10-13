@@ -614,6 +614,7 @@ def create_app(settings: Settings) -> FastAPI:
             if request.apply:
                 assert request.expected_eligible_attempts is not None
                 assert request.expected_due_attempts is not None
+                assert request.expected_candidate_digest is not None
                 decision = service.apply_retention_policy_backfill(
                     principal.tenant_id,
                     cluster_id,
@@ -621,7 +622,10 @@ def create_app(settings: Settings) -> FastAPI:
                     request.max_attempts,
                     request.expected_eligible_attempts,
                     request.expected_due_attempts,
+                    request.expected_candidate_digest,
                     principal.credential_id,
+                    request.source_policy_version,
+                    request.reason,
                 )
                 mode = "applied"
             else:
@@ -630,6 +634,8 @@ def create_app(settings: Settings) -> FastAPI:
                     cluster_id,
                     request.policy_version,
                     request.max_attempts,
+                    request.source_policy_version,
+                    request.reason,
                 )
                 mode = "preview"
         except ValueError as error:
@@ -638,6 +644,11 @@ def create_app(settings: Settings) -> FastAPI:
                 raise HTTPException(
                     status_code=404,
                     detail={"code": "retention_policy_revision_not_found"},
+                ) from error
+            if message == "source retention policy revision does not exist":
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "source_retention_policy_revision_not_found"},
                 ) from error
             if message in {
                 "retention policy backfill preview is stale; preview again",
