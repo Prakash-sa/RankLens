@@ -24,6 +24,8 @@ from .contracts import (
     AttemptView,
     DurableReceipt,
     HealthStatus,
+    IntegrityIncidentResolutionRequest,
+    IntegrityIncidentView,
     MachineCredentialRevocationRequest,
     MachineCredentialRevocationView,
     ReceiptView,
@@ -44,6 +46,7 @@ from .database import (
     AttemptHold,
     AttemptRecord,
     MachineCredentialRevocation,
+    IntegrityIncident,
     ReportHead,
     ReportRevision,
     RetentionPolicyCancellation,
@@ -56,6 +59,7 @@ from .database import (
     utc_now,
 )
 from .ingestion import AdmissionError, IngestionService
+from .integrity import IntegrityIncidentService
 from .scheduler import derive_allocation_timeline
 from .settings import MachinePrincipal, Settings
 from .storage import LocalObjectStore, ObjectIntegrityError
@@ -72,6 +76,7 @@ def create_app(settings: Settings) -> FastAPI:
         default_retention_seconds=settings.default_retention_seconds,
     )
     authenticator = MachineAuthenticator(settings, sessions)
+    integrity_service = IntegrityIncidentService(sessions, objects)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -160,6 +165,74 @@ def create_app(settings: Settings) -> FastAPI:
             revoked_by_credential_id=revocation.revoked_by_credential_id,
             revoked_at=revoked_at,
         )
+
+    def integrity_incident_view(incident: IntegrityIncident) -> IntegrityIncidentView:
+        return IntegrityIncidentView.model_validate(
+            {
+                column.name: getattr(incident, column.name)
+                for column in IntegrityIncident.__table__.columns
+            }
+        )
+
+    @app.get("/v1/integrity-incidents", response_model=List[IntegrityIncidentView])
+    def integrity_incidents(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        state: str = Query(default="open", pattern=r"^(open|resolved)$"),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_integrity_admin
+        ),
+    ) -> List[IntegrityIncidentView]:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        with sessions() as session:
+            incidents = session.scalars(
+                select(IntegrityIncident)
+                .where(
+                    IntegrityIncident.tenant_id == principal.tenant_id,
+                    IntegrityIncident.cluster_id == cluster_id,
+                    IntegrityIncident.state == state,
+                )
+                .order_by(
+                    IntegrityIncident.last_detected_at.desc(),
+                    IntegrityIncident.incident_id,
+                )
+                .limit(limit)
+            )
+            return [integrity_incident_view(incident) for incident in incidents]
+
+    @app.post(
+        "/v1/integrity-incidents/{incident_id}/resolution",
+        response_model=IntegrityIncidentView,
+    )
+    def resolve_integrity_incident(
+        request: IntegrityIncidentResolutionRequest,
+        incident_id: uuid.UUID,
+        cluster_id: str = Query(min_length=1, max_length=128),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_integrity_admin
+        ),
+    ) -> IntegrityIncidentView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        try:
+            incident = integrity_service.resolve(
+                principal.tenant_id,
+                cluster_id,
+                str(incident_id),
+                actor=principal.credential_id,
+                reason=request.reason,
+            )
+        except LookupError as error:
+            raise HTTPException(
+                status_code=404, detail={"code": "integrity_incident_not_found"}
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "integrity_incident_resolution_conflict", "message": str(error)},
+            ) from error
+        return integrity_incident_view(incident)
 
     @app.post(
         "/v1/machine-credentials/{credential_id}/revocation",

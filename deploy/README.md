@@ -16,7 +16,8 @@ docker compose -f deploy/compose.yaml up --build
 ```
 
 Use a separate credential with `telemetry:read` for read-only API clients, and grant
-`retention:admin` only to identities allowed to manage retention. Reserve `credentials:revoke` for
+`retention:admin` only to identities allowed to manage retention. Grant `integrity:admin` only to
+operators responsible for reviewing and closing protected-artifact incidents. Reserve `credentials:revoke` for
 a separate security-administrator identity. That administrator can permanently revoke another
 credential through the API without a restart; the tenant-scoped reason, actor, and time are retained
 for audit, and a revoked credential ID must not be reused. Validity windows use offset-aware ISO-8601

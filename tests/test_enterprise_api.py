@@ -13,6 +13,8 @@ from ranklens_enterprise.api import create_app
 from ranklens_enterprise.database import (
     AttemptGeneration,
     AttemptRecord,
+    IntegrityIncident,
+    ObjectGcCandidate,
     ReportHead,
     ReportRevision,
     SchedulerObservation,
@@ -37,7 +39,9 @@ class EnterpriseApiTests(unittest.TestCase):
         self.read_token = "read-only-token-with-at-least-24-characters"
         self.retention_token = "retention-admin-token-with-at-least-24-characters"
         self.security_token = "security-admin-token-with-at-least-24-characters"
+        self.integrity_token = "integrity-admin-token-with-at-least-24-characters"
         self.other_tenant_token = "other-tenant-token-with-at-least-24-characters"
+        self.other_integrity_token = "other-integrity-token-with-at-least-24-characters"
         settings = Settings(
             database_url=self.database_url,
             object_root=self.object_root,
@@ -52,9 +56,18 @@ class EnterpriseApiTests(unittest.TestCase):
                     self.security_token, "test-security", {"credentials:revoke"}
                 ),
                 self.credential(
+                    self.integrity_token, "test-integrity", {"integrity:admin"}
+                ),
+                self.credential(
                     self.other_tenant_token,
                     "other-tenant-agent",
                     {"segments:write"},
+                    tenant_id="tenant-b",
+                ),
+                self.credential(
+                    self.other_integrity_token,
+                    "other-integrity",
+                    {"integrity:admin"},
                     tenant_id="tenant-b",
                 ),
             ),
@@ -84,6 +97,62 @@ class EnterpriseApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
         self.temporary.cleanup()
+
+    def test_integrity_incidents_are_isolated_and_resolved_by_dedicated_admin(self) -> None:
+        now = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions.begin() as session:
+            session.add(ObjectGcCandidate(
+                candidate_id="00000000-0000-0000-0000-000000000091",
+                object_key="v2/operator-review.segment", payload_sha256="a" * 64,
+                state="failed", not_before=now, attempts=1,
+                last_error="referenced object missing", created_at=now, completed_at=now,
+            ))
+            session.add(IntegrityIncident(
+                incident_id="00000000-0000-0000-0000-000000000092",
+                candidate_id="00000000-0000-0000-0000-000000000091",
+                tenant_id="tenant-a", cluster_id="cluster-a", attempt_id="attempt-1",
+                object_key="v2/operator-review.segment", payload_sha256="a" * 64,
+                category="missing", state="open", details="referenced object missing",
+                occurrences=1, first_detected_at=now, last_detected_at=now,
+                resolved_at=None, resolved_by_credential_id=None, resolution=None,
+            ))
+        engine.dispose()
+
+        forbidden = self.client.get(
+            "/v1/integrity-incidents?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.read_token}"},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        listed = self.client.get(
+            "/v1/integrity-incidents?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+        )
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.json()), 1)
+        self.assertEqual(listed.json()[0]["state"], "open")
+        isolated = self.client.get(
+            "/v1/integrity-incidents?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.other_integrity_token}"},
+        )
+        self.assertEqual(isolated.status_code, 200)
+        self.assertEqual(isolated.json(), [])
+        resolved = self.client.post(
+            "/v1/integrity-incidents/00000000-0000-0000-0000-000000000092/resolution?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+            json={"reason": "catalog reference removed after incident review"},
+        )
+        self.assertEqual(resolved.status_code, 200)
+        self.assertEqual(resolved.json()["state"], "resolved")
+        self.assertEqual(resolved.json()["resolved_by_credential_id"], "test-integrity")
+        self.assertEqual(
+            self.client.get(
+                "/v1/integrity-incidents?cluster_id=cluster-a",
+                headers={"Authorization": f"Bearer {self.integrity_token}"},
+            ).json(),
+            [],
+        )
 
     @staticmethod
     def request_body() -> dict:

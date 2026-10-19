@@ -343,6 +343,33 @@ class HealthStatus(BaseModel):
     envelope_major: Literal[2] = 2
 
 
+class IntegrityIncidentResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class IntegrityIncidentView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: UUID
+    candidate_id: UUID
+    tenant_id: str
+    cluster_id: str
+    attempt_id: Optional[str] = None
+    object_key: str
+    payload_sha256: str
+    category: Literal["missing", "corrupt"]
+    state: Literal["open", "resolved"]
+    details: str
+    occurrences: int
+    first_detected_at: datetime
+    last_detected_at: datetime
+    resolved_at: Optional[datetime] = None
+    resolved_by_credential_id: Optional[str] = None
+    resolution: Optional[str] = None
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str

@@ -98,6 +98,11 @@ class MachineAuthenticator:
     ) -> MachinePrincipal:
         return self._authenticate(authorization, "credentials:revoke")
 
+    def authenticate_integrity_admin(
+        self, authorization: str = Header(default="")
+    ) -> MachinePrincipal:
+        return self._authenticate(authorization, "integrity:admin")
+
     def revoke_credential(
         self,
         principal: MachinePrincipal,

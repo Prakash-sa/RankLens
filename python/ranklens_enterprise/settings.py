@@ -12,7 +12,10 @@ from typing import FrozenSet, Optional, Tuple
 
 
 MACHINE_PERMISSIONS = frozenset(
-    {"segments:write", "telemetry:read", "retention:admin", "credentials:revoke"}
+    {
+        "segments:write", "telemetry:read", "retention:admin",
+        "credentials:revoke", "integrity:admin",
+    }
 )
 _CREDENTIAL_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
