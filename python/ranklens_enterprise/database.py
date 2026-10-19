@@ -310,6 +310,56 @@ class ObjectGcCandidate(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class IntegrityIncident(Base):
+    """Durable, tenant-scoped evidence of a protected artifact failure."""
+
+    __tablename__ = "integrity_incidents"
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id", "tenant_id", "cluster_id", "category",
+            name="uq_integrity_incident_identity",
+        ),
+        Index(
+            "ix_integrity_incident_queue",
+            "tenant_id", "cluster_id", "state", "last_detected_at",
+        ),
+    )
+
+    incident_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    candidate_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    object_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    details: Mapped[str] = mapped_column(String(512), nullable=False)
+    occurrences: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    first_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_credential_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    resolution: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+
+class IntegrityIncidentResolution(Base):
+    """Append-only evidence for an operator-verified incident resolution."""
+
+    __tablename__ = "integrity_incident_resolutions"
+    __table_args__ = (
+        Index("ix_integrity_incident_resolution_history", "incident_id", "resolved_at"),
+    )
+
+    resolution_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    incident_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    resolved_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SegmentManifest(Base):
     __tablename__ = "segment_manifests"
     __table_args__ = (

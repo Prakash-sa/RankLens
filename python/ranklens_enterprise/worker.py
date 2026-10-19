@@ -31,6 +31,7 @@ from .database import (
     utc_now,
 )
 from .ingestion import DeletionHeldError, IngestionService
+from .integrity import object_reference_scopes, record_integrity_incidents
 from .parquet import ParquetSegment, build_normalized_parquet
 from .storage import ImmutableObjectStore, ObjectIntegrityError
 
@@ -546,32 +547,7 @@ class ObjectGcWorker:
 
 
 def _object_has_reference(session: Session, object_key: str) -> bool:
-    manifest_reference = session.scalar(
-        select(SegmentManifest.receipt_id)
-        .where(SegmentManifest.object_key == object_key)
-        .limit(1)
-    )
-    if manifest_reference is not None:
-        return True
-    reservation_reference = session.scalar(
-        select(AdmissionReservation.reservation_id)
-        .where(
-            AdmissionReservation.object_key == object_key,
-            AdmissionReservation.state.in_(("reserved", "committed")),
-        )
-        .limit(1)
-    )
-    if reservation_reference is not None:
-        return True
-    report_reference = session.scalar(
-        select(ReportRevision.revision_id)
-        .where(
-            (ReportRevision.report_object_key == object_key)
-            | (ReportRevision.parquet_object_key == object_key)
-        )
-        .limit(1)
-    )
-    return report_reference is not None
+    return bool(object_reference_scopes(session, object_key))
 
 
 class ObjectGcAuditWorker:
@@ -636,6 +612,11 @@ class ObjectGcAuditWorker:
                 except ObjectIntegrityError as exc:
                     candidate.state = "failed"
                     candidate.last_error = f"audit integrity failure: {exc}"[:512]
+                    if referenced:
+                        record_integrity_incidents(
+                            session, candidate, category="corrupt",
+                            details=candidate.last_error, detected_at=now,
+                        )
                     candidate.completed_at = now
                     candidate.not_before = now + timedelta(
                         seconds=self._audit_interval_seconds
@@ -651,6 +632,10 @@ class ObjectGcAuditWorker:
                     elif referenced:
                         candidate.state = "failed"
                         candidate.last_error = "audit found a referenced object missing"
+                        record_integrity_incidents(
+                            session, candidate, category="missing",
+                            details=candidate.last_error, detected_at=now,
+                        )
                         candidate.completed_at = now
                         candidate.not_before = now + timedelta(
                             seconds=self._audit_interval_seconds

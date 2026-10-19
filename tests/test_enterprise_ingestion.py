@@ -19,6 +19,8 @@ from ranklens_enterprise.database import (
     AttemptHold,
     AttemptRecord,
     NormalizedSegment,
+    IntegrityIncident,
+    IntegrityIncidentResolution,
     ObjectGcCandidate,
     OutboxRecord,
     ReportHead,
@@ -38,6 +40,7 @@ from ranklens_enterprise.ingestion import (
     DeletionHeldError,
     IngestionService,
 )
+from ranklens_enterprise.integrity import IntegrityIncidentService
 from ranklens_enterprise.settings import MachinePrincipal
 from ranklens_enterprise.storage import LocalObjectStore
 from ranklens_enterprise.storage import ObjectIntegrityError
@@ -1146,6 +1149,9 @@ class EnterpriseIngestionTests(unittest.TestCase):
         missing = next(
             candidate for candidate in candidates if candidate.object_key.endswith(".json")
         )
+        missing_payload = self.objects.read_verified(
+            missing.object_key, missing.payload_sha256
+        )
         self.assertTrue(
             self.objects.delete_verified(missing.object_key, missing.payload_sha256)
         )
@@ -1160,6 +1166,68 @@ class EnterpriseIngestionTests(unittest.TestCase):
             assert candidate is not None
             self.assertEqual(candidate.state, "failed")
             self.assertIn("referenced object missing", candidate.last_error or "")
+            incident = session.scalar(select(IntegrityIncident))
+            assert incident is not None
+            self.assertEqual(incident.state, "open")
+            self.assertEqual(incident.tenant_id, "tenant-a")
+            self.assertEqual(incident.cluster_id, "cluster-a")
+            self.assertEqual(incident.attempt_id, "attempt-1")
+            self.assertEqual(incident.category, "missing")
+            self.assertEqual(incident.occurrences, 1)
+
+        resolution = IntegrityIncidentService(
+            self.sessions, self.objects, clock=lambda: now + timedelta(seconds=1)
+        )
+        with self.assertRaisesRegex(ValueError, "not restored"):
+            resolution.resolve(
+                "tenant-a", "cluster-a", incident.incident_id,
+                actor="operator-one", reason="restored from verified replica",
+            )
+        self.objects.put_verified(
+            missing.object_key, missing_payload, missing.payload_sha256
+        )
+        resolved = resolution.resolve(
+            "tenant-a", "cluster-a", incident.incident_id,
+            actor="operator-one", reason="restored from verified replica",
+        )
+        self.assertEqual(resolved.state, "resolved")
+        replay = resolution.resolve(
+            "tenant-a", "cluster-a", incident.incident_id,
+            actor="operator-one", reason="restored from verified replica",
+        )
+        self.assertEqual(replay.incident_id, incident.incident_id)
+        with self.assertRaisesRegex(ValueError, "already resolved"):
+            resolution.resolve(
+                "tenant-a", "cluster-a", incident.incident_id,
+                actor="operator-two", reason="different review",
+            )
+        with self.sessions() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntegrityIncidentResolution)),
+                1,
+            )
+
+        self.assertTrue(
+            self.objects.delete_verified(missing.object_key, missing.payload_sha256)
+        )
+        recurrence_time = now + timedelta(seconds=601)
+        recurrence_audit = ObjectGcAuditWorker(
+            self.sessions,
+            self.objects,
+            audit_interval_seconds=600,
+            clock=lambda: recurrence_time,
+        )
+        self.assertEqual(recurrence_audit.run_once(), {"failed": 1, "protected": 1})
+        with self.sessions() as session:
+            reopened = session.get(IntegrityIncident, incident.incident_id)
+            assert reopened is not None
+            self.assertEqual(reopened.state, "open")
+            self.assertEqual(reopened.occurrences, 2)
+            self.assertIsNone(reopened.resolution)
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntegrityIncidentResolution)),
+                1,
+            )
 
     def test_object_gc_audit_releases_repaired_unreferenced_quarantine(self) -> None:
         now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
