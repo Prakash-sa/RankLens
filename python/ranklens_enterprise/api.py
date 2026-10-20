@@ -26,6 +26,8 @@ from .contracts import (
     HealthStatus,
     IntegrityIncidentResolutionRequest,
     IntegrityIncidentView,
+    IntegrityNotificationRedriveRequest,
+    IntegrityNotificationView,
     MachineCredentialRevocationRequest,
     MachineCredentialRevocationView,
     ReceiptView,
@@ -47,6 +49,7 @@ from .database import (
     AttemptRecord,
     MachineCredentialRevocation,
     IntegrityIncident,
+    IntegrityNotification,
     ReportHead,
     ReportRevision,
     RetentionPolicyCancellation,
@@ -60,6 +63,7 @@ from .database import (
 )
 from .ingestion import AdmissionError, IngestionService
 from .integrity import IntegrityIncidentService
+from .notifications import IntegrityNotificationService
 from .scheduler import derive_allocation_timeline
 from .settings import MachinePrincipal, Settings
 from .storage import LocalObjectStore, ObjectIntegrityError
@@ -77,6 +81,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     authenticator = MachineAuthenticator(settings, sessions)
     integrity_service = IntegrityIncidentService(sessions, objects)
+    integrity_notification_service = IntegrityNotificationService(sessions)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -174,6 +179,24 @@ def create_app(settings: Settings) -> FastAPI:
             }
         )
 
+    def integrity_notification_view(
+        notification: IntegrityNotification,
+    ) -> IntegrityNotificationView:
+        return IntegrityNotificationView.model_validate({
+            "notification_id": notification.notification_id,
+            "incident_id": notification.incident_id,
+            "tenant_id": notification.tenant_id,
+            "cluster_id": notification.cluster_id,
+            "occurrence": notification.occurrence,
+            "event_type": notification.event_type,
+            "state": notification.state,
+            "attempts": notification.attempts,
+            "next_attempt_at": notification.next_attempt_at,
+            "last_error": notification.last_error,
+            "created_at": notification.created_at,
+            "delivered_at": notification.delivered_at,
+        })
+
     @app.get("/v1/integrity-incidents", response_model=List[IntegrityIncidentView])
     def integrity_incidents(
         cluster_id: str = Query(min_length=1, max_length=128),
@@ -233,6 +256,78 @@ def create_app(settings: Settings) -> FastAPI:
                 detail={"code": "integrity_incident_resolution_conflict", "message": str(error)},
             ) from error
         return integrity_incident_view(incident)
+
+    @app.get(
+        "/v1/integrity-notifications",
+        response_model=List[IntegrityNotificationView],
+    )
+    def integrity_notifications(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        state: str = Query(
+            default="failed", pattern=r"^(pending|processing|delivered|failed)$"
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_integrity_admin
+        ),
+    ) -> List[IntegrityNotificationView]:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        with sessions() as session:
+            notifications = session.scalars(
+                select(IntegrityNotification)
+                .where(
+                    IntegrityNotification.tenant_id == principal.tenant_id,
+                    IntegrityNotification.cluster_id == cluster_id,
+                    IntegrityNotification.state == state,
+                )
+                .order_by(
+                    IntegrityNotification.created_at.desc(),
+                    IntegrityNotification.notification_id,
+                )
+                .limit(limit)
+            )
+            return [
+                integrity_notification_view(notification)
+                for notification in notifications
+            ]
+
+    @app.post(
+        "/v1/integrity-notifications/{notification_id}/redrive",
+        response_model=IntegrityNotificationView,
+    )
+    def redrive_integrity_notification(
+        request: IntegrityNotificationRedriveRequest,
+        notification_id: uuid.UUID,
+        cluster_id: str = Query(min_length=1, max_length=128),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_integrity_admin
+        ),
+    ) -> IntegrityNotificationView:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        try:
+            notification = integrity_notification_service.redrive(
+                principal.tenant_id,
+                cluster_id,
+                str(notification_id),
+                actor=principal.credential_id,
+                reason=request.reason,
+            )
+        except LookupError as error:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "integrity_notification_not_found"},
+            ) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "integrity_notification_redrive_conflict",
+                    "message": str(error),
+                },
+            ) from error
+        return integrity_notification_view(notification)
 
     @app.post(
         "/v1/machine-credentials/{credential_id}/revocation",

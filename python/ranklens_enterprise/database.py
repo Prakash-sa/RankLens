@@ -391,6 +391,23 @@ class IntegrityNotification(Base):
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class IntegrityNotificationRedrive(Base):
+    """Append-only operator audit for retrying a quarantined notification."""
+
+    __tablename__ = "integrity_notification_redrives"
+    __table_args__ = (
+        Index("ix_integrity_notification_redrive_history", "notification_id", "requested_at"),
+    )
+
+    redrive_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    notification_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    requested_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SegmentManifest(Base):
     __tablename__ = "segment_manifests"
     __table_args__ = (

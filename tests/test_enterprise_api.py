@@ -14,6 +14,8 @@ from ranklens_enterprise.database import (
     AttemptGeneration,
     AttemptRecord,
     IntegrityIncident,
+    IntegrityNotification,
+    IntegrityNotificationRedrive,
     ObjectGcCandidate,
     ReportHead,
     ReportRevision,
@@ -118,6 +120,16 @@ class EnterpriseApiTests(unittest.TestCase):
                 occurrences=1, first_detected_at=now, last_detected_at=now,
                 resolved_at=None, resolved_by_credential_id=None, resolution=None,
             ))
+            session.add(IntegrityNotification(
+                notification_id="00000000-0000-0000-0000-000000000093",
+                incident_id="00000000-0000-0000-0000-000000000092",
+                tenant_id="tenant-a", cluster_id="cluster-a", occurrence=1,
+                event_type="integrity.incident.detected", payload_json="{}",
+                state="failed", attempts=8, next_attempt_at=now,
+                lease_owner=None, lease_generation=8, lease_expires_at=None,
+                last_error="paging provider unavailable", created_at=now,
+                delivered_at=None,
+            ))
         engine.dispose()
 
         forbidden = self.client.get(
@@ -153,6 +165,55 @@ class EnterpriseApiTests(unittest.TestCase):
             ).json(),
             [],
         )
+        notification_forbidden = self.client.get(
+            "/v1/integrity-notifications?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.read_token}"},
+        )
+        self.assertEqual(notification_forbidden.status_code, 403)
+        notifications = self.client.get(
+            "/v1/integrity-notifications?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+        )
+        self.assertEqual(notifications.status_code, 200)
+        self.assertEqual(len(notifications.json()), 1)
+        self.assertEqual(notifications.json()[0]["attempts"], 8)
+        isolated_notifications = self.client.get(
+            "/v1/integrity-notifications?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.other_integrity_token}"},
+        )
+        self.assertEqual(isolated_notifications.status_code, 200)
+        self.assertEqual(isolated_notifications.json(), [])
+        redrive_url = (
+            "/v1/integrity-notifications/00000000-0000-0000-0000-000000000093/"
+            "redrive?cluster_id=cluster-a"
+        )
+        redriven = self.client.post(
+            redrive_url,
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+            json={"reason": "provider route restored"},
+        )
+        self.assertEqual(redriven.status_code, 200)
+        self.assertEqual(redriven.json()["state"], "pending")
+        self.assertEqual(redriven.json()["attempts"], 0)
+        replay = self.client.post(
+            redrive_url,
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+            json={"reason": "provider route restored"},
+        )
+        self.assertEqual(replay.status_code, 200)
+        conflict = self.client.post(
+            redrive_url,
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+            json={"reason": "different operator decision"},
+        )
+        self.assertEqual(conflict.status_code, 409)
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions() as session:
+            self.assertEqual(
+                session.query(IntegrityNotificationRedrive).count(), 1
+            )
+        engine.dispose()
 
     @staticmethod
     def request_body() -> dict:

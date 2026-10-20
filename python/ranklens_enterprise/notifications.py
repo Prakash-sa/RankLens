@@ -15,7 +15,12 @@ from typing import Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .database import IntegrityNotification, lock_stream, utc_now
+from .database import (
+    IntegrityNotification,
+    IntegrityNotificationRedrive,
+    lock_stream,
+    utc_now,
+)
 
 
 @dataclass(frozen=True)
@@ -200,3 +205,67 @@ class IntegrityNotificationWorker:
             return False
         self.execute(lease)
         return True
+
+
+class IntegrityNotificationService:
+    """Operator-controlled, audited redrive of terminal delivery failures."""
+
+    def __init__(self, sessions: sessionmaker[Session], *, clock=utc_now):
+        self._sessions = sessions
+        self._clock = clock
+
+    def redrive(
+        self,
+        tenant_id: str,
+        cluster_id: str,
+        notification_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> IntegrityNotification:
+        reason = reason.strip()
+        if not reason or len(reason) > 512:
+            raise ValueError("redrive reason must contain 1 to 512 characters")
+        now = self._clock()
+        with self._sessions.begin() as session:
+            lock_stream(session, f"integrity-notification:{notification_id}")
+            notification = session.get(IntegrityNotification, notification_id)
+            if (
+                notification is None
+                or notification.tenant_id != tenant_id
+                or notification.cluster_id != cluster_id
+            ):
+                raise LookupError("integrity notification not found")
+            latest = session.scalar(
+                select(IntegrityNotificationRedrive)
+                .where(IntegrityNotificationRedrive.notification_id == notification_id)
+                .order_by(
+                    IntegrityNotificationRedrive.requested_at.desc(),
+                    IntegrityNotificationRedrive.redrive_id.desc(),
+                )
+                .limit(1)
+            )
+            if notification.state != "failed":
+                if (
+                    notification.state in {"pending", "processing"}
+                    and latest is not None
+                    and latest.requested_by_credential_id == actor
+                    and latest.reason == reason
+                ):
+                    return notification
+                raise ValueError("only a failed integrity notification can be redriven")
+            notification.state = "pending"
+            notification.attempts = 0
+            notification.next_attempt_at = now
+            notification.lease_owner = None
+            notification.lease_expires_at = None
+            notification.lease_generation += 1
+            notification.last_error = None
+            notification.delivered_at = None
+            session.add(IntegrityNotificationRedrive(
+                redrive_id=str(uuid.uuid4()), notification_id=notification_id,
+                tenant_id=tenant_id, cluster_id=cluster_id,
+                requested_by_credential_id=actor, reason=reason,
+                requested_at=now,
+            ))
+            return notification

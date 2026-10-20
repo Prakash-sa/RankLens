@@ -38,7 +38,9 @@ detection and resolution are first committed to a durable outbox, so a paging ou
 the object audit. The worker retries with bounded exponential backoff and signs the exact JSON body
 as `HMAC-SHA256(secret, timestamp + "." + body)` in `X-RankLens-Signature`; receivers should also
 validate `X-RankLens-Timestamp` and deduplicate `X-RankLens-Event-ID`. Store the secret in the
-deployment secret manager, not in Compose or source control.
+deployment secret manager, not in Compose or source control. Integrity administrators can list
+delivery state through the API and redrive a quarantined notification after correcting the route;
+each redrive requires a reason and retains an immutable actor/time audit record.
 
 The API binds only to loopback on port 8080. Put a site-approved TLS/mTLS reverse proxy in front of
 it before an agent connects from another host. Do not put the password, token, or credential JSON in this repository

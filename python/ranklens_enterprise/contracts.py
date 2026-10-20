@@ -370,6 +370,29 @@ class IntegrityIncidentView(BaseModel):
     resolution: Optional[str] = None
 
 
+class IntegrityNotificationRedriveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class IntegrityNotificationView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    notification_id: UUID
+    incident_id: UUID
+    tenant_id: str
+    cluster_id: str
+    occurrence: int
+    event_type: Literal["integrity.incident.detected", "integrity.incident.resolved"]
+    state: Literal["pending", "processing", "delivered", "failed"]
+    attempts: int
+    next_attempt_at: datetime
+    last_error: Optional[str] = None
+    created_at: datetime
+    delivered_at: Optional[datetime] = None
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
