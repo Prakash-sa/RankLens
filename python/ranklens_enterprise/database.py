@@ -360,6 +360,37 @@ class IntegrityIncidentResolution(Base):
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class IntegrityNotification(Base):
+    """Durable delivery state for an immutable integrity-incident event."""
+
+    __tablename__ = "integrity_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "incident_id", "occurrence", "event_type",
+            name="uq_integrity_notification_event",
+        ),
+        Index("ix_integrity_notification_due", "state", "next_attempt_at", "notification_id"),
+        Index("ix_integrity_notification_scope", "tenant_id", "cluster_id", "created_at"),
+    )
+
+    notification_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    incident_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurrence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SegmentManifest(Base):
     __tablename__ = "segment_manifests"
     __table_args__ = (

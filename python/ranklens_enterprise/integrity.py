@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -13,6 +14,7 @@ from .database import (
     AdmissionReservation,
     IntegrityIncident,
     IntegrityIncidentResolution,
+    IntegrityNotification,
     ObjectGcCandidate,
     ReportRevision,
     SegmentManifest,
@@ -27,6 +29,38 @@ class ObjectReferenceScope:
     tenant_id: str
     cluster_id: str
     attempt_id: str
+
+
+def _enqueue_notification(
+    session: Session,
+    incident: IntegrityIncident,
+    *,
+    event_type: str,
+    created_at: datetime,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "event_type": event_type,
+        "incident_id": incident.incident_id,
+        "tenant_id": incident.tenant_id,
+        "cluster_id": incident.cluster_id,
+        "attempt_id": incident.attempt_id,
+        "category": incident.category,
+        "state": incident.state,
+        "occurrence": incident.occurrences,
+        "object_key": incident.object_key,
+        "payload_sha256": incident.payload_sha256,
+        "observed_at": incident.last_detected_at.isoformat(),
+    }
+    session.add(IntegrityNotification(
+        notification_id=str(uuid.uuid4()), incident_id=incident.incident_id,
+        tenant_id=incident.tenant_id, cluster_id=incident.cluster_id,
+        occurrence=incident.occurrences, event_type=event_type,
+        payload_json=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        state="pending", attempts=0, next_attempt_at=created_at,
+        lease_owner=None, lease_generation=0, lease_expires_at=None,
+        last_error=None, created_at=created_at, delivered_at=None,
+    ))
 
 
 def object_reference_scopes(session: Session, object_key: str) -> set[ObjectReferenceScope]:
@@ -78,14 +112,15 @@ def record_integrity_incidents(
         )
         attempt_id = next(iter(attempts)) if len(attempts) == 1 else None
         if incident is None:
-            session.add(IntegrityIncident(
+            incident = IntegrityIncident(
                 incident_id=str(uuid.uuid4()), candidate_id=candidate.candidate_id,
                 tenant_id=tenant_id, cluster_id=cluster_id, attempt_id=attempt_id,
                 object_key=candidate.object_key, payload_sha256=candidate.payload_sha256,
                 category=category, state="open", details=details[:512], occurrences=1,
                 first_detected_at=detected_at, last_detected_at=detected_at,
                 resolved_at=None, resolved_by_credential_id=None, resolution=None,
-            ))
+            )
+            session.add(incident)
         else:
             incident.state = "open"
             incident.attempt_id = attempt_id
@@ -95,6 +130,10 @@ def record_integrity_incidents(
             incident.resolved_at = None
             incident.resolved_by_credential_id = None
             incident.resolution = None
+        _enqueue_notification(
+            session, incident, event_type="integrity.incident.detected",
+            created_at=detected_at,
+        )
     return len(grouped)
 
 
@@ -138,4 +177,8 @@ class IntegrityIncidentService:
                 tenant_id=tenant_id, cluster_id=cluster_id,
                 resolved_by_credential_id=actor, reason=reason, resolved_at=now,
             ))
+            _enqueue_notification(
+                session, incident, event_type="integrity.incident.resolved",
+                created_at=now,
+            )
             return incident

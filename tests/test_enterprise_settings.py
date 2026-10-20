@@ -120,6 +120,31 @@ class EnterpriseSettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "after not_before"):
                 Settings.from_environment()
 
+    def test_parses_fail_closed_integrity_webhook_settings(self) -> None:
+        environment = self.environment()
+        environment.update({
+            "RANKLENS_INTEGRITY_WEBHOOK_URL": "https://alerts.example.test/ranklens",
+            "RANKLENS_INTEGRITY_WEBHOOK_SECRET": "s" * 32,
+            "RANKLENS_INTEGRITY_WEBHOOK_TIMEOUT_SECONDS": "7",
+        })
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.integrity_webhook_url, environment["RANKLENS_INTEGRITY_WEBHOOK_URL"])
+        self.assertEqual(settings.integrity_webhook_timeout_seconds, 7)
+        self.assertNotIn("s" * 32, repr(settings))
+
+    def test_rejects_partial_or_insecure_integrity_webhook_settings(self) -> None:
+        environment = self.environment()
+        environment["RANKLENS_INTEGRITY_WEBHOOK_URL"] = "https://alerts.example.test/ranklens"
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "configured together"):
+                Settings.from_environment()
+        environment["RANKLENS_INTEGRITY_WEBHOOK_SECRET"] = "s" * 32
+        environment["RANKLENS_INTEGRITY_WEBHOOK_URL"] = "http://alerts.example.test/ranklens"
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "HTTPS URL"):
+                Settings.from_environment()
+
 
 if __name__ == "__main__":
     unittest.main()

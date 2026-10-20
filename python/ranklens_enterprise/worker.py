@@ -32,6 +32,7 @@ from .database import (
 )
 from .ingestion import DeletionHeldError, IngestionService
 from .integrity import object_reference_scopes, record_integrity_incidents
+from .notifications import IntegrityNotificationWorker, SignedWebhookSender
 from .parquet import ParquetSegment, build_normalized_parquet
 from .storage import ImmutableObjectStore, ObjectIntegrityError
 
@@ -1355,6 +1356,17 @@ def main() -> int:
         audit_interval_seconds=settings.object_gc_audit_interval_seconds,
         batch_size=settings.object_gc_audit_batch_size,
     )
+    notification_worker = None
+    if settings.integrity_webhook_url is not None:
+        assert settings.integrity_webhook_secret is not None
+        notification_worker = IntegrityNotificationWorker(
+            sessions,
+            SignedWebhookSender(
+                settings.integrity_webhook_url,
+                settings.integrity_webhook_secret,
+                timeout_seconds=settings.integrity_webhook_timeout_seconds,
+            ),
+        )
     next_reservation_sweep = 0.0
     next_retention_sweep = 0.0
     next_object_gc_sweep = 0.0
@@ -1372,6 +1384,8 @@ def main() -> int:
             worked = deletion_worker.run_once()
             worked = worker.run_once() or worked
             worked = report_worker.run_once() or worked
+            if notification_worker is not None:
+                worked = notification_worker.run_once() or worked
             monotonic_now = time.monotonic()
             if monotonic_now >= next_reservation_sweep:
                 worked = reservation_sweeper.run_once() > 0 or worked

@@ -21,6 +21,7 @@ from ranklens_enterprise.database import (
     NormalizedSegment,
     IntegrityIncident,
     IntegrityIncidentResolution,
+    IntegrityNotification,
     ObjectGcCandidate,
     OutboxRecord,
     ReportHead,
@@ -1174,6 +1175,9 @@ class EnterpriseIngestionTests(unittest.TestCase):
             self.assertEqual(incident.attempt_id, "attempt-1")
             self.assertEqual(incident.category, "missing")
             self.assertEqual(incident.occurrences, 1)
+            notifications = list(session.scalars(select(IntegrityNotification)))
+            self.assertEqual(len(notifications), 1)
+            self.assertEqual(notifications[0].event_type, "integrity.incident.detected")
 
         resolution = IntegrityIncidentService(
             self.sessions, self.objects, clock=lambda: now + timedelta(seconds=1)
@@ -1206,6 +1210,10 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 session.scalar(select(func.count()).select_from(IntegrityIncidentResolution)),
                 1,
             )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntegrityNotification)),
+                2,
+            )
 
         self.assertTrue(
             self.objects.delete_verified(missing.object_key, missing.payload_sha256)
@@ -1228,6 +1236,14 @@ class EnterpriseIngestionTests(unittest.TestCase):
                 session.scalar(select(func.count()).select_from(IntegrityIncidentResolution)),
                 1,
             )
+            events = list(
+                session.scalars(
+                    select(IntegrityNotification).order_by(IntegrityNotification.created_at)
+                )
+            )
+            self.assertEqual(len(events), 3)
+            self.assertEqual(events[-1].event_type, "integrity.incident.detected")
+            self.assertEqual(events[-1].occurrence, 2)
 
     def test_object_gc_audit_releases_repaired_unreferenced_quarantine(self) -> None:
         now = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)

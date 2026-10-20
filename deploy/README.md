@@ -31,6 +31,15 @@ bounded preview/apply workflow, which confirms the exact candidate digest and re
 attempt's before/after assignment with an audit reason. Use a retention value of zero to disable
 automatic expiry for new attempts in that cluster.
 
+To route protected-artifact incidents to an operator system, configure
+`RANKLENS_INTEGRITY_WEBHOOK_URL` with an HTTPS endpoint and
+`RANKLENS_INTEGRITY_WEBHOOK_SECRET` with a secret of at least 32 characters on the worker. Incident
+detection and resolution are first committed to a durable outbox, so a paging outage never blocks
+the object audit. The worker retries with bounded exponential backoff and signs the exact JSON body
+as `HMAC-SHA256(secret, timestamp + "." + body)` in `X-RankLens-Signature`; receivers should also
+validate `X-RankLens-Timestamp` and deduplicate `X-RankLens-Event-ID`. Store the secret in the
+deployment secret manager, not in Compose or source control.
+
 The API binds only to loopback on port 8080. Put a site-approved TLS/mTLS reverse proxy in front of
 it before an agent connects from another host. Do not put the password, token, or credential JSON in this repository
 or the Compose file. Production deployments must pin image digests, use a KMS/secrets manager,

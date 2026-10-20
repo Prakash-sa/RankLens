@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import FrozenSet, Optional, Tuple
+from urllib.parse import urlparse
 
 
 MACHINE_PERMISSIONS = frozenset(
@@ -53,6 +54,9 @@ class Settings:
     default_retention_seconds: int = 0
     retention_sweep_seconds: int = 300
     retention_sweep_batch_size: int = 100
+    integrity_webhook_url: Optional[str] = None
+    integrity_webhook_secret: Optional[str] = field(default=None, repr=False)
+    integrity_webhook_timeout_seconds: int = 10
     bootstrap_schema: bool = False
 
     @classmethod
@@ -152,6 +156,9 @@ class Settings:
             retention_sweep_batch = int(
                 os.environ.get("RANKLENS_RETENTION_SWEEP_BATCH_SIZE", "100")
             )
+            integrity_webhook_timeout = int(
+                os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_TIMEOUT_SECONDS", "10")
+            )
         except ValueError as exc:
             raise RuntimeError("lifecycle timing settings must be integers") from exc
         if reservation_ttl < 60 or reservation_ttl > 86400:
@@ -186,6 +193,32 @@ class Settings:
             raise RuntimeError(
                 "RANKLENS_RETENTION_SWEEP_BATCH_SIZE must be within [1, 10000]"
             )
+        integrity_webhook_url = os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_URL") or None
+        integrity_webhook_secret = os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_SECRET") or None
+        if (integrity_webhook_url is None) != (integrity_webhook_secret is None):
+            raise RuntimeError(
+                "RANKLENS_INTEGRITY_WEBHOOK_URL and RANKLENS_INTEGRITY_WEBHOOK_SECRET must be configured together"
+            )
+        if integrity_webhook_url is not None:
+            parsed_webhook = urlparse(integrity_webhook_url)
+            if (
+                parsed_webhook.scheme != "https"
+                or not parsed_webhook.hostname
+                or parsed_webhook.username is not None
+                or parsed_webhook.password is not None
+                or parsed_webhook.fragment
+            ):
+                raise RuntimeError(
+                    "RANKLENS_INTEGRITY_WEBHOOK_URL must be an HTTPS URL without user info or a fragment"
+                )
+            if not 32 <= len(integrity_webhook_secret or "") <= 1024:
+                raise RuntimeError(
+                    "RANKLENS_INTEGRITY_WEBHOOK_SECRET must contain between 32 and 1024 characters"
+                )
+        if integrity_webhook_timeout < 1 or integrity_webhook_timeout > 60:
+            raise RuntimeError(
+                "RANKLENS_INTEGRITY_WEBHOOK_TIMEOUT_SECONDS must be within [1, 60]"
+            )
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
@@ -200,6 +233,9 @@ class Settings:
             default_retention_seconds=default_retention,
             retention_sweep_seconds=retention_sweep,
             retention_sweep_batch_size=retention_sweep_batch,
+            integrity_webhook_url=integrity_webhook_url,
+            integrity_webhook_secret=integrity_webhook_secret,
+            integrity_webhook_timeout_seconds=integrity_webhook_timeout,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},
         )
