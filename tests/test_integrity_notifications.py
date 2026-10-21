@@ -127,7 +127,8 @@ class IntegrityNotificationTests(unittest.TestCase):
         secret = "s" * 32
         sender = SignedWebhookSender(
             "https://alerts.example.test/ranklens", secret,
-            timeout_seconds=7, clock=lambda: 1_790_000_000.9,
+            key_id="key-2026-10", timeout_seconds=7,
+            clock=lambda: 1_790_000_000.9,
         )
         with patch("urllib.request.urlopen", side_effect=urlopen):
             sender("event-1", "integrity.incident.detected", payload)
@@ -138,6 +139,7 @@ class IntegrityNotificationTests(unittest.TestCase):
         assert isinstance(headers, dict)
         self.assertEqual(captured["body"], payload.encode())
         self.assertEqual(headers["x-ranklens-event-id"], "event-1")
+        self.assertEqual(headers["x-ranklens-key-id"], "key-2026-10")
         self.assertEqual(headers["x-ranklens-signature"], f"sha256={expected}")
         self.assertEqual(captured["timeout"], 7)
 

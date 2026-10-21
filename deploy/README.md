@@ -42,6 +42,14 @@ deployment secret manager, not in Compose or source control. Integrity administr
 delivery state through the API and redrive a quarantined notification after correcting the route;
 each redrive requires a reason and retains an immutable actor/time audit record.
 
+For signing-key rotation, configure a bounded JSON key set in
+`RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON` and select one key with
+`RANKLENS_INTEGRITY_WEBHOOK_ACTIVE_KEY_ID`. The sender includes that safe identifier in
+`X-RankLens-Key-ID` without exposing key material. Add the new key to the receiver first, deploy the
+overlapping key set, switch the active ID, and remove the old key only after the receiver's replay
+window closes. The single-secret variable remains supported as a legacy `legacy` key ID; do not
+configure both forms together.
+
 The API binds only to loopback on port 8080. Put a site-approved TLS/mTLS reverse proxy in front of
 it before an agent connects from another host. Do not put the password, token, or credential JSON in this repository
 or the Compose file. Production deployments must pin image digests, use a KMS/secrets manager,

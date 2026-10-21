@@ -131,7 +131,27 @@ class EnterpriseSettingsTests(unittest.TestCase):
             settings = Settings.from_environment()
         self.assertEqual(settings.integrity_webhook_url, environment["RANKLENS_INTEGRITY_WEBHOOK_URL"])
         self.assertEqual(settings.integrity_webhook_timeout_seconds, 7)
+        self.assertEqual(settings.integrity_webhook_key_id, "legacy")
         self.assertNotIn("s" * 32, repr(settings))
+
+    def test_selects_active_webhook_key_from_bounded_rotation_set(self) -> None:
+        environment = self.environment()
+        old_secret = "o" * 32
+        new_secret = "n" * 32
+        environment.update({
+            "RANKLENS_INTEGRITY_WEBHOOK_URL": "https://alerts.example.test/ranklens",
+            "RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON": json.dumps({
+                "key-old": old_secret,
+                "key-new": new_secret,
+            }),
+            "RANKLENS_INTEGRITY_WEBHOOK_ACTIVE_KEY_ID": "key-new",
+        })
+        with patch.dict("os.environ", environment, clear=True):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.integrity_webhook_key_id, "key-new")
+        self.assertEqual(settings.integrity_webhook_secret, new_secret)
+        self.assertNotIn(old_secret, repr(settings))
+        self.assertNotIn(new_secret, repr(settings))
 
     def test_rejects_partial_or_insecure_integrity_webhook_settings(self) -> None:
         environment = self.environment()
@@ -143,6 +163,16 @@ class EnterpriseSettingsTests(unittest.TestCase):
         environment["RANKLENS_INTEGRITY_WEBHOOK_URL"] = "http://alerts.example.test/ranklens"
         with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, "HTTPS URL"):
+                Settings.from_environment()
+
+        environment = self.environment()
+        environment.update({
+            "RANKLENS_INTEGRITY_WEBHOOK_URL": "https://alerts.example.test/ranklens",
+            "RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON": json.dumps({"key-old": "o" * 32}),
+            "RANKLENS_INTEGRITY_WEBHOOK_ACTIVE_KEY_ID": "key-missing",
+        })
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "must select"):
                 Settings.from_environment()
 
 

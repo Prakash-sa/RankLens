@@ -56,6 +56,7 @@ class Settings:
     retention_sweep_batch_size: int = 100
     integrity_webhook_url: Optional[str] = None
     integrity_webhook_secret: Optional[str] = field(default=None, repr=False)
+    integrity_webhook_key_id: Optional[str] = None
     integrity_webhook_timeout_seconds: int = 10
     bootstrap_schema: bool = False
 
@@ -194,7 +195,48 @@ class Settings:
                 "RANKLENS_RETENTION_SWEEP_BATCH_SIZE must be within [1, 10000]"
             )
         integrity_webhook_url = os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_URL") or None
-        integrity_webhook_secret = os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_SECRET") or None
+        legacy_webhook_secret = os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_SECRET") or None
+        raw_webhook_keys = os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON") or None
+        integrity_webhook_key_id = (
+            os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_ACTIVE_KEY_ID") or None
+        )
+        if legacy_webhook_secret is not None and raw_webhook_keys is not None:
+            raise RuntimeError(
+                "legacy webhook secret and webhook signing key set cannot both be configured"
+            )
+        integrity_webhook_secret = legacy_webhook_secret
+        if raw_webhook_keys is not None:
+            try:
+                webhook_keys = json.loads(raw_webhook_keys)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON must be valid JSON"
+                ) from exc
+            if (
+                not isinstance(webhook_keys, dict)
+                or not 1 <= len(webhook_keys) <= 5
+                or any(
+                    not isinstance(key_id, str)
+                    or _CREDENTIAL_ID.fullmatch(key_id) is None
+                    or not isinstance(secret, str)
+                    or not 32 <= len(secret) <= 1024
+                    for key_id, secret in webhook_keys.items()
+                )
+            ):
+                raise RuntimeError(
+                    "webhook signing keys must contain 1 to 5 safe key IDs with 32 to 1024 character secrets"
+                )
+            if integrity_webhook_key_id not in webhook_keys:
+                raise RuntimeError(
+                    "RANKLENS_INTEGRITY_WEBHOOK_ACTIVE_KEY_ID must select a configured webhook signing key"
+                )
+            integrity_webhook_secret = webhook_keys[integrity_webhook_key_id]
+        elif integrity_webhook_key_id is not None:
+            raise RuntimeError(
+                "RANKLENS_INTEGRITY_WEBHOOK_ACTIVE_KEY_ID requires RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON"
+            )
+        elif legacy_webhook_secret is not None:
+            integrity_webhook_key_id = "legacy"
         if (integrity_webhook_url is None) != (integrity_webhook_secret is None):
             raise RuntimeError(
                 "RANKLENS_INTEGRITY_WEBHOOK_URL and RANKLENS_INTEGRITY_WEBHOOK_SECRET must be configured together"
@@ -235,6 +277,7 @@ class Settings:
             retention_sweep_batch_size=retention_sweep_batch,
             integrity_webhook_url=integrity_webhook_url,
             integrity_webhook_secret=integrity_webhook_secret,
+            integrity_webhook_key_id=integrity_webhook_key_id,
             integrity_webhook_timeout_seconds=integrity_webhook_timeout,
             bootstrap_schema=os.environ.get("RANKLENS_BOOTSTRAP_SCHEMA", "0").lower()
             in {"1", "true", "yes"},

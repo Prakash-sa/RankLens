@@ -1359,11 +1359,13 @@ def main() -> int:
     notification_worker = None
     if settings.integrity_webhook_url is not None:
         assert settings.integrity_webhook_secret is not None
+        assert settings.integrity_webhook_key_id is not None
         notification_worker = IntegrityNotificationWorker(
             sessions,
             SignedWebhookSender(
                 settings.integrity_webhook_url,
                 settings.integrity_webhook_secret,
+                key_id=settings.integrity_webhook_key_id,
                 timeout_seconds=settings.integrity_webhook_timeout_seconds,
             ),
         )

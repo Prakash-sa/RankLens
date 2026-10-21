@@ -38,11 +38,13 @@ class SignedWebhookSender:
         url: str,
         secret: str,
         *,
+        key_id: str = "legacy",
         timeout_seconds: float = 10.0,
         clock: Callable[[], float] = time.time,
     ):
         self._url = url
         self._secret = secret.encode("utf-8")
+        self._key_id = key_id
         self._timeout_seconds = timeout_seconds
         self._clock = clock
 
@@ -61,6 +63,7 @@ class SignedWebhookSender:
                 "User-Agent": "RankLens-integrity-webhook/1",
                 "X-RankLens-Event-ID": notification_id,
                 "X-RankLens-Event-Type": event_type,
+                "X-RankLens-Key-ID": self._key_id,
                 "X-RankLens-Timestamp": timestamp,
                 "X-RankLens-Signature": f"sha256={digest}",
             },
