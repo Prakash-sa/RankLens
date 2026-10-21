@@ -177,12 +177,31 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(notifications.status_code, 200)
         self.assertEqual(len(notifications.json()), 1)
         self.assertEqual(notifications.json()[0]["attempts"], 8)
+        failed_summary = self.client.get(
+            "/v1/integrity-notifications/summary?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+        )
+        self.assertEqual(failed_summary.status_code, 200)
+        self.assertEqual(failed_summary.json()["status"], "failed")
+        self.assertEqual(failed_summary.json()["failed_count"], 1)
+        self.assertEqual(failed_summary.json()["pending_count"], 1)
+        self.assertEqual(failed_summary.json()["max_attempts"], 8)
+        self.assertGreaterEqual(
+            failed_summary.json()["oldest_outstanding_age_seconds"], 0
+        )
         isolated_notifications = self.client.get(
             "/v1/integrity-notifications?cluster_id=cluster-a",
             headers={"Authorization": f"Bearer {self.other_integrity_token}"},
         )
         self.assertEqual(isolated_notifications.status_code, 200)
         self.assertEqual(isolated_notifications.json(), [])
+        isolated_summary = self.client.get(
+            "/v1/integrity-notifications/summary?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.other_integrity_token}"},
+        )
+        self.assertEqual(isolated_summary.status_code, 200)
+        self.assertEqual(isolated_summary.json()["status"], "idle")
+        self.assertEqual(isolated_summary.json()["total_count"], 0)
         redrive_url = (
             "/v1/integrity-notifications/00000000-0000-0000-0000-000000000093/"
             "redrive?cluster_id=cluster-a"
@@ -195,6 +214,13 @@ class EnterpriseApiTests(unittest.TestCase):
         self.assertEqual(redriven.status_code, 200)
         self.assertEqual(redriven.json()["state"], "pending")
         self.assertEqual(redriven.json()["attempts"], 0)
+        degraded_summary = self.client.get(
+            "/v1/integrity-notifications/summary?cluster_id=cluster-a",
+            headers={"Authorization": f"Bearer {self.integrity_token}"},
+        )
+        self.assertEqual(degraded_summary.status_code, 200)
+        self.assertEqual(degraded_summary.json()["status"], "degraded")
+        self.assertEqual(degraded_summary.json()["pending_count"], 2)
         replay = self.client.post(
             redrive_url,
             headers={"Authorization": f"Bearer {self.integrity_token}"},

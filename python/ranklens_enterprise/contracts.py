@@ -393,6 +393,24 @@ class IntegrityNotificationView(BaseModel):
     delivered_at: Optional[datetime] = None
 
 
+class IntegrityNotificationSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    cluster_id: str
+    status: Literal["idle", "healthy", "degraded", "failed"]
+    total_count: int
+    pending_count: int
+    processing_count: int
+    delivered_count: int
+    failed_count: int
+    max_attempts: int
+    oldest_outstanding_at: Optional[datetime] = None
+    oldest_outstanding_age_seconds: Optional[int] = None
+    last_delivered_at: Optional[datetime] = None
+    observed_at: datetime
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str

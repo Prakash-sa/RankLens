@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy import text
 
 from ranklens import __version__
@@ -27,6 +27,7 @@ from .contracts import (
     IntegrityIncidentResolutionRequest,
     IntegrityIncidentView,
     IntegrityNotificationRedriveRequest,
+    IntegrityNotificationSummary,
     IntegrityNotificationView,
     MachineCredentialRevocationRequest,
     MachineCredentialRevocationView,
@@ -291,6 +292,84 @@ def create_app(settings: Settings) -> FastAPI:
                 integrity_notification_view(notification)
                 for notification in notifications
             ]
+
+    @app.get(
+        "/v1/integrity-notifications/summary",
+        response_model=IntegrityNotificationSummary,
+    )
+    def integrity_notification_summary(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_integrity_admin
+        ),
+    ) -> IntegrityNotificationSummary:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        with sessions() as session:
+            row = session.execute(
+                select(
+                    func.count(IntegrityNotification.notification_id),
+                    func.sum(case((IntegrityNotification.state == "pending", 1), else_=0)),
+                    func.sum(case((IntegrityNotification.state == "processing", 1), else_=0)),
+                    func.sum(case((IntegrityNotification.state == "delivered", 1), else_=0)),
+                    func.sum(case((IntegrityNotification.state == "failed", 1), else_=0)),
+                    func.max(IntegrityNotification.attempts),
+                    func.min(case(
+                        (
+                            IntegrityNotification.state.in_(("pending", "processing", "failed")),
+                            IntegrityNotification.created_at,
+                        ),
+                        else_=None,
+                    )),
+                    func.max(case(
+                        (
+                            IntegrityNotification.state == "delivered",
+                            IntegrityNotification.delivered_at,
+                        ),
+                        else_=None,
+                    )),
+                ).where(
+                    IntegrityNotification.tenant_id == principal.tenant_id,
+                    IntegrityNotification.cluster_id == cluster_id,
+                )
+            ).one()
+        total, pending, processing, delivered, failed, max_attempts, oldest, last = row
+        total = int(total or 0)
+        pending = int(pending or 0)
+        processing = int(processing or 0)
+        delivered = int(delivered or 0)
+        failed = int(failed or 0)
+        now = utc_now()
+        if oldest is not None and oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        if last is not None and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if total == 0:
+            status = "idle"
+        elif failed:
+            status = "failed"
+        elif pending or processing:
+            status = "degraded"
+        else:
+            status = "healthy"
+        return IntegrityNotificationSummary(
+            tenant_id=principal.tenant_id,
+            cluster_id=cluster_id,
+            status=status,
+            total_count=total,
+            pending_count=pending,
+            processing_count=processing,
+            delivered_count=delivered,
+            failed_count=failed,
+            max_attempts=int(max_attempts or 0),
+            oldest_outstanding_at=oldest,
+            oldest_outstanding_age_seconds=(
+                max(0, int((now - oldest).total_seconds()))
+                if oldest is not None else None
+            ),
+            last_delivered_at=last,
+            observed_at=now,
+        )
 
     @app.post(
         "/v1/integrity-notifications/{notification_id}/redrive",

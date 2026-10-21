@@ -41,6 +41,8 @@ validate `X-RankLens-Timestamp` and deduplicate `X-RankLens-Event-ID`. Store the
 deployment secret manager, not in Compose or source control. Integrity administrators can list
 delivery state through the API and redrive a quarantined notification after correcting the route;
 each redrive requires a reason and retains an immutable actor/time audit record.
+The scoped notification summary reports backlog age, state counts, maximum attempts, and the last
+successful delivery time so operators can attach their own paging objective without scanning rows.
 
 For signing-key rotation, configure a bounded JSON key set in
 `RANKLENS_INTEGRITY_WEBHOOK_KEYS_JSON` and select one key with
