@@ -179,6 +179,7 @@ class EnterpriseRecoveryTests(unittest.TestCase):
 
     def test_operator_cli_uses_protected_secret_and_non_overwriting_bundle(self) -> None:
         self.completed_tombstone_bundle()
+        self.service.admit(self.principal, self.segment())
         secret_path = self.root / "tombstone.key"
         secret_path.write_text(self.secret, encoding="utf-8")
         secret_path.chmod(0o600)
@@ -195,6 +196,18 @@ class EnterpriseRecoveryTests(unittest.TestCase):
             "--secret-file", str(secret_path),
             "export", "--output", str(bundle_path),
         ]), 2)
+        self.assertEqual(recovery_main([
+            "--database-url", self.restore_url,
+            "--secret-file", str(secret_path),
+            "apply", "--input", str(bundle_path), "--actor", "restore-operator",
+        ]), 0)
+        with self.restore_sessions() as session:
+            generation = session.get(
+                AttemptGeneration, ("tenant-a", "cluster-a", "attempt-restore")
+            )
+            assert generation is not None
+            self.assertEqual(generation.generation, 1)
+            self.assertIsNotNone(generation.deleted_at)
 
         insecure_secret = self.root / "insecure.key"
         insecure_secret.write_text(self.secret, encoding="utf-8")
@@ -204,6 +217,23 @@ class EnterpriseRecoveryTests(unittest.TestCase):
             "--secret-file", str(insecure_secret),
             "apply", "--input", str(bundle_path), "--actor", "restore-operator",
         ]), 2)
+
+    def test_newer_live_generation_blocks_restore_reconciliation(self) -> None:
+        bundle = self.completed_tombstone_bundle()
+        with self.restore_sessions.begin() as session:
+            session.add(AttemptGeneration(
+                tenant_id="tenant-a", cluster_id="cluster-a",
+                attempt_id="attempt-restore", generation=2, deleted_at=None,
+            ))
+        with self.assertRaisesRegex(ValueError, "newer live"):
+            apply_completed_tombstones(
+                self.restore_sessions, bundle, self.secret,
+                actor="restore-operator",
+            )
+        with self.restore_sessions() as session:
+            self.assertEqual(
+                len(list(session.scalars(select(RestoreTombstoneImport)))), 0
+            )
 
 
 if __name__ == "__main__":

@@ -171,6 +171,10 @@ def apply_completed_tombstones(
             lock_stream(session, f"attempt:{tenant_id}:{cluster_id}:{attempt_id}")
             generation = session.get(AttemptGeneration, identity)
             if generation is not None and generation.generation > generation_value:
+                if generation.deleted_at is None:
+                    raise ValueError(
+                        "tombstone conflicts with a newer live attempt generation"
+                    )
                 stale += 1
                 continue
             if generation is None:

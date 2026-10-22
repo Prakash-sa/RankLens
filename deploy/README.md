@@ -100,6 +100,8 @@ ranklens-enterprise-recovery \
   apply --input tombstones-0001.json --actor restore-operator
 ```
 
-Repeat export with the returned cursor until it is null. Applying a valid bundle immediately fences
+Repeat export with the returned cursor until it is null and retain evidence that every page was
+consumed; an incomplete page set is not acceptable restore evidence. Applying a valid bundle immediately fences
 restored attempts and queues physical cleanup through the normal deletion worker; exact bundle
-replay is safe. A missing page, invalid signature, or failed cleanup blocks restore acceptance.
+replay is safe. An incomplete export, invalid signature, generation conflict, or failed cleanup
+blocks restore acceptance.
