@@ -106,6 +106,23 @@ class AttemptDeletion(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class RestoreTombstoneImport(Base):
+    """Immutable audit of one authenticated deletion-tombstone restore page."""
+
+    __tablename__ = "restore_tombstone_imports"
+    __table_args__ = (
+        Index("ix_restore_tombstone_import_history", "imported_at", "bundle_sha256"),
+    )
+
+    bundle_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    entry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    applied_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    stale_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    imported_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AttemptRecord(Base):
     """Durable telemetry identity with independently reconciled scheduler state."""
 

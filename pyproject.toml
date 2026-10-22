@@ -26,6 +26,7 @@ ranklens = "ranklens.cli:main"
 ranklens-enterprise-api = "ranklens_enterprise.api:main"
 ranklens-enterprise-scheduler = "ranklens_enterprise.scheduler_service:main"
 ranklens-enterprise-worker = "ranklens_enterprise.worker:main"
+ranklens-enterprise-recovery = "ranklens_enterprise.recovery_cli:main"
 
 [project.optional-dependencies]
 enterprise = [

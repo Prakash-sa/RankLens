@@ -79,3 +79,27 @@ segments, and refuses new segments once the configured pending-spool byte budget
 current transport is identity-compressed NDJSON over HTTPS; Protobuf/Zstandard, node-local
 IPC/shared memory, service-manager packaging, mTLS enrollment, multi-segment large-file draining,
 reserved emergency summary capacity, and adaptive sampling remain open implementation work.
+
+## Restore deletion reconciliation
+
+Keep completed deletion tombstones in an independently protected backup path. Before allowing API
+or worker traffic against a restored catalog, export the newest tombstone pages from the surviving
+catalog and apply every page to the restored database. The command accepts its HMAC key only from a
+regular mode-0600 file, writes new bundles without overwriting an existing file, and audits each
+applied bundle by digest and operator identity:
+
+```bash
+ranklens-enterprise-recovery \
+  --database-url "$RANKLENS_DATABASE_URL" \
+  --secret-file /run/secrets/ranklens-tombstone-key \
+  export --output tombstones-0001.json
+
+ranklens-enterprise-recovery \
+  --database-url "$RESTORED_RANKLENS_DATABASE_URL" \
+  --secret-file /run/secrets/ranklens-tombstone-key \
+  apply --input tombstones-0001.json --actor restore-operator
+```
+
+Repeat export with the returned cursor until it is null. Applying a valid bundle immediately fences
+restored attempts and queues physical cleanup through the normal deletion worker; exact bundle
+replay is safe. A missing page, invalid signature, or failed cleanup blocks restore acceptance.
