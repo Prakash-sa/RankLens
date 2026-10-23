@@ -10,7 +10,7 @@ from datetime import timezone
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import case, func, select
 from sqlalchemy import text
 
@@ -23,6 +23,7 @@ from .contracts import (
     AttemptPage,
     AttemptView,
     DurableReceipt,
+    EvidenceDownloadAuditView,
     HealthStatus,
     IntegrityIncidentResolutionRequest,
     IntegrityIncidentView,
@@ -48,6 +49,7 @@ from .database import (
     AttemptGeneration,
     AttemptHold,
     AttemptRecord,
+    EvidenceDownloadAudit,
     MachineCredentialRevocation,
     IntegrityIncident,
     IntegrityNotification,
@@ -61,13 +63,14 @@ from .database import (
     build_session_factory,
     initialize_schema,
     utc_now,
+    lock_stream,
 )
 from .ingestion import AdmissionError, IngestionService
 from .integrity import IntegrityIncidentService
 from .notifications import IntegrityNotificationService
 from .scheduler import derive_allocation_timeline
 from .settings import MachinePrincipal, Settings
-from .storage import LocalObjectStore, ObjectIntegrityError
+from .storage import LocalObjectStore, ObjectIntegrityError, ObjectSizeLimitError
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -1145,37 +1148,48 @@ def create_app(settings: Settings) -> FastAPI:
                 intervals=[asdict(interval) for interval in timeline.intervals],
             )
 
-    def resolve_report_revision(
+    def resolve_report_revision_in_session(
+        session,
         tenant_id: str,
         cluster_id: str,
         attempt_id: str,
         revision_number: Optional[int],
     ) -> tuple[ReportRevision, ReportHead]:
         identity = (tenant_id, cluster_id, attempt_id)
+        generation = session.get(AttemptGeneration, identity)
+        head = session.get(ReportHead, identity)
+        if (
+            generation is None
+            or generation.deleted_at is not None
+            or head is None
+            or head.deletion_generation != generation.generation
+        ):
+            raise HTTPException(status_code=404, detail={"code": "report_not_found"})
+        statement = select(ReportRevision).where(
+            ReportRevision.tenant_id == tenant_id,
+            ReportRevision.cluster_id == cluster_id,
+            ReportRevision.attempt_id == attempt_id,
+            ReportRevision.deletion_generation == generation.generation,
+        )
+        if revision_number is None:
+            statement = statement.where(ReportRevision.revision_id == head.revision_id)
+        else:
+            statement = statement.where(ReportRevision.revision_number == revision_number)
+        revision = session.scalar(statement)
+        if revision is None:
+            raise HTTPException(status_code=404, detail={"code": "report_not_found"})
+        return revision, head
+
+    def resolve_report_revision(
+        tenant_id: str,
+        cluster_id: str,
+        attempt_id: str,
+        revision_number: Optional[int],
+    ) -> tuple[ReportRevision, ReportHead]:
         with sessions() as session:
-            generation = session.get(AttemptGeneration, identity)
-            head = session.get(ReportHead, identity)
-            if (
-                generation is None
-                or generation.deleted_at is not None
-                or head is None
-                or head.deletion_generation != generation.generation
-            ):
-                raise HTTPException(status_code=404, detail={"code": "report_not_found"})
-            statement = select(ReportRevision).where(
-                ReportRevision.tenant_id == tenant_id,
-                ReportRevision.cluster_id == cluster_id,
-                ReportRevision.attempt_id == attempt_id,
-                ReportRevision.deletion_generation == generation.generation,
+            return resolve_report_revision_in_session(
+                session, tenant_id, cluster_id, attempt_id, revision_number
             )
-            if revision_number is None:
-                statement = statement.where(ReportRevision.revision_id == head.revision_id)
-            else:
-                statement = statement.where(ReportRevision.revision_number == revision_number)
-            revision = session.scalar(statement)
-            if revision is None:
-                raise HTTPException(status_code=404, detail={"code": "report_not_found"})
-            return revision, head
 
     @app.get("/v1/reports/{attempt_id}", response_model=ReportRevisionView)
     def report_revision(
@@ -1213,6 +1227,142 @@ def create_app(settings: Settings) -> FastAPI:
             builder_version=revision.builder_version,
             created_at=revision.created_at,
             current=revision.revision_id == head.revision_id,
+            download_available="evidence:download" in principal.permissions,
+        )
+
+    @app.get(
+        "/v1/evidence-downloads",
+        response_model=List[EvidenceDownloadAuditView],
+    )
+    def evidence_download_history(
+        cluster_id: str = Query(min_length=1, max_length=128),
+        attempt_id: Optional[str] = Query(
+            default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_evidence_download
+        ),
+    ) -> List[EvidenceDownloadAuditView]:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        statement = select(EvidenceDownloadAudit).where(
+            EvidenceDownloadAudit.tenant_id == principal.tenant_id,
+            EvidenceDownloadAudit.cluster_id == cluster_id,
+        )
+        if attempt_id is not None:
+            statement = statement.where(
+                EvidenceDownloadAudit.attempt_id == attempt_id
+            )
+        statement = statement.order_by(
+            EvidenceDownloadAudit.downloaded_at.desc(),
+            EvidenceDownloadAudit.download_id,
+        ).limit(limit)
+        with sessions() as session:
+            rows = session.scalars(statement).all()
+            return [
+                EvidenceDownloadAuditView(
+                    download_id=row.download_id,
+                    tenant_id=row.tenant_id,
+                    cluster_id=row.cluster_id,
+                    attempt_id=row.attempt_id,
+                    revision_id=row.revision_id,
+                    revision_number=row.revision_number,
+                    artifact_kind=row.artifact_kind,
+                    payload_sha256=row.payload_sha256,
+                    payload_bytes=row.payload_bytes,
+                    downloaded_by_credential_id=row.downloaded_by_credential_id,
+                    downloaded_at=row.downloaded_at,
+                )
+                for row in rows
+            ]
+
+    @app.get("/v1/reports/{attempt_id}/artifact")
+    def report_artifact(
+        attempt_id: str = Path(
+            min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+        ),
+        cluster_id: str = Query(min_length=1, max_length=128),
+        artifact_kind: str = Query(default="report", pattern=r"^(report|parquet)$"),
+        revision_number: Optional[int] = Query(default=None, ge=1, le=2**63 - 1),
+        principal: MachinePrincipal = Depends(
+            authenticator.authenticate_evidence_download
+        ),
+    ) -> Response:
+        if cluster_id not in principal.clusters:
+            raise HTTPException(status_code=404, detail={"code": "cluster_not_found"})
+        identity = (principal.tenant_id, cluster_id, attempt_id)
+        download_id = str(uuid.uuid4())
+        with sessions.begin() as session:
+            lock_stream(session, f"attempt:{':'.join(identity)}")
+            revision, _ = resolve_report_revision_in_session(
+                session,
+                principal.tenant_id,
+                cluster_id,
+                attempt_id,
+                revision_number,
+            )
+            if artifact_kind == "parquet":
+                object_key = revision.parquet_object_key
+                digest = revision.parquet_sha256
+                media_type = "application/vnd.apache.parquet"
+                extension = "parquet"
+            else:
+                object_key = revision.report_object_key
+                digest = revision.report_sha256
+                media_type = "application/json"
+                extension = "json"
+            if not object_key or not digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "report_artifact_not_available"},
+                )
+            try:
+                payload = objects.read_verified_bounded(
+                    object_key,
+                    digest,
+                    settings.max_evidence_download_bytes,
+                )
+            except ObjectSizeLimitError as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"code": "report_artifact_too_large"},
+                ) from exc
+            except ObjectIntegrityError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "report_artifact_unavailable"},
+                ) from exc
+            session.add(
+                EvidenceDownloadAudit(
+                    download_id=download_id,
+                    tenant_id=principal.tenant_id,
+                    cluster_id=cluster_id,
+                    attempt_id=attempt_id,
+                    revision_id=revision.revision_id,
+                    revision_number=revision.revision_number,
+                    artifact_kind=artifact_kind,
+                    payload_sha256=digest,
+                    payload_bytes=len(payload),
+                    downloaded_by_credential_id=principal.credential_id,
+                    downloaded_at=utc_now(),
+                )
+            )
+        safe_attempt = attempt_id.replace(":", "-")
+        return Response(
+            content=payload,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": (
+                    f'attachment; filename="ranklens-{safe_attempt}-r'
+                    f'{revision.revision_number}.{extension}"'
+                ),
+                "ETag": f'"{digest}"',
+                "X-Content-SHA256": digest,
+                "X-Content-Type-Options": "nosniff",
+                "X-RankLens-Download-ID": download_id,
+            },
         )
 
     @app.get(

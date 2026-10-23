@@ -536,6 +536,33 @@ class ReportHead(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class EvidenceDownloadAudit(Base):
+    """Immutable authorization evidence for a delivered report artifact."""
+
+    __tablename__ = "evidence_download_audits"
+    __table_args__ = (
+        Index(
+            "ix_evidence_download_audit_scope",
+            "tenant_id",
+            "cluster_id",
+            "attempt_id",
+            "downloaded_at",
+        ),
+    )
+
+    download_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cluster_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    revision_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    artifact_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    downloaded_by_credential_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    downloaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SchedulerObservation(Base):
     __tablename__ = "scheduler_observations"
     __table_args__ = (

@@ -24,6 +24,13 @@ for audit, and a revoked credential ID must not be reused. Validity windows use 
 timestamps, and overlapping old and new credentials support a controlled rotation. Removing a
 credential from configuration still requires an API restart to take effect.
 
+Report JSON and Parquet evidence downloads require the separate `evidence:download` permission.
+Each successful delivery is checksum-verified, limited by
+`RANKLENS_MAX_EVIDENCE_DOWNLOAD_BYTES` (64 MiB by default), and recorded with its tenant, cluster,
+attempt, revision, digest, size, credential, and time. Download history is available only within the
+same authenticated tenant and cluster. Use a dedicated export identity and keep the default limit
+unless the deployment has an approved memory and egress budget.
+
 Retention administrators can also create append-only cluster policy revisions. A new revision
 applies to new attempts only, so later edits never silently rewrite an existing attempt's fixed
 expiry. An administrator can migrate attempts from one named revision to another only through the

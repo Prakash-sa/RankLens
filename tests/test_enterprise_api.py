@@ -13,6 +13,7 @@ from ranklens_enterprise.api import create_app
 from ranklens_enterprise.database import (
     AttemptGeneration,
     AttemptRecord,
+    EvidenceDownloadAudit,
     IntegrityIncident,
     IntegrityNotification,
     IntegrityNotificationRedrive,
@@ -42,8 +43,10 @@ class EnterpriseApiTests(unittest.TestCase):
         self.retention_token = "retention-admin-token-with-at-least-24-characters"
         self.security_token = "security-admin-token-with-at-least-24-characters"
         self.integrity_token = "integrity-admin-token-with-at-least-24-characters"
+        self.evidence_token = "evidence-download-token-with-at-least-24-characters"
         self.other_tenant_token = "other-tenant-token-with-at-least-24-characters"
         self.other_integrity_token = "other-integrity-token-with-at-least-24-characters"
+        self.other_evidence_token = "other-evidence-token-with-at-least-24-characters"
         settings = Settings(
             database_url=self.database_url,
             object_root=self.object_root,
@@ -61,6 +64,11 @@ class EnterpriseApiTests(unittest.TestCase):
                     self.integrity_token, "test-integrity", {"integrity:admin"}
                 ),
                 self.credential(
+                    self.evidence_token,
+                    "test-evidence",
+                    {"telemetry:read", "evidence:download"},
+                ),
+                self.credential(
                     self.other_tenant_token,
                     "other-tenant-agent",
                     {"segments:write"},
@@ -70,6 +78,12 @@ class EnterpriseApiTests(unittest.TestCase):
                     self.other_integrity_token,
                     "other-integrity",
                     {"integrity:admin"},
+                    tenant_id="tenant-b",
+                ),
+                self.credential(
+                    self.other_evidence_token,
+                    "other-evidence",
+                    {"evidence:download"},
                     tenant_id="tenant-b",
                 ),
             ),
@@ -1153,6 +1167,152 @@ class EnterpriseApiTests(unittest.TestCase):
             "/v1/reports/attempt-report",
             params={"cluster_id": "cluster-a"},
             headers=headers,
+        )
+        self.assertEqual(deleted.status_code, 404)
+
+    def test_report_artifacts_require_dedicated_scope_and_are_audited(self) -> None:
+        report_payload = b'{"coverage_status":"complete","attempt_id":"attempt-download"}\n'
+        parquet_payload = b"PAR1-bounded-test-artifact"
+        report_digest = hashlib.sha256(report_payload).hexdigest()
+        parquet_digest = hashlib.sha256(parquet_payload).hexdigest()
+        report_key = "reports/test/download.json"
+        parquet_key = "reports/test/download.parquet"
+        store = LocalObjectStore(self.object_root)
+        store.put_verified(report_key, report_payload, report_digest)
+        store.put_verified(parquet_key, parquet_payload, parquet_digest)
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions.begin() as session:
+            session.add(AttemptGeneration(
+                tenant_id="tenant-a", cluster_id="cluster-a",
+                attempt_id="attempt-download", generation=0, deleted_at=None,
+            ))
+            session.add(ReportRevision(
+                revision_id="revision-download", tenant_id="tenant-a",
+                cluster_id="cluster-a", attempt_id="attempt-download",
+                deletion_generation=0, revision_number=1,
+                input_fingerprint="6" * 64, segment_count=1, record_count=1,
+                report_object_key=report_key, report_sha256=report_digest,
+                parquet_object_key=parquet_key, parquet_sha256=parquet_digest,
+                parquet_schema_version="normalized-record-v2", parquet_row_count=1,
+                builder_version="attempt-manifest-v1", created_at=now,
+            ))
+            session.add(ReportHead(
+                tenant_id="tenant-a", cluster_id="cluster-a",
+                attempt_id="attempt-download", deletion_generation=0,
+                revision_number=1, revision_id="revision-download",
+                input_fingerprint="6" * 64, updated_at=now,
+            ))
+        engine.dispose()
+
+        read_headers = {"Authorization": f"Bearer {self.read_token}"}
+        evidence_headers = {"Authorization": f"Bearer {self.evidence_token}"}
+        forbidden = self.client.get(
+            "/v1/reports/attempt-download/artifact",
+            params={"cluster_id": "cluster-a"},
+            headers=read_headers,
+        )
+        isolated = self.client.get(
+            "/v1/reports/attempt-download/artifact",
+            params={"cluster_id": "cluster-a"},
+            headers={"Authorization": f"Bearer {self.other_evidence_token}"},
+        )
+        metadata = self.client.get(
+            "/v1/reports/attempt-download",
+            params={"cluster_id": "cluster-a"},
+            headers=evidence_headers,
+        )
+        report = self.client.get(
+            "/v1/reports/attempt-download/artifact",
+            params={"cluster_id": "cluster-a"},
+            headers=evidence_headers,
+        )
+        parquet = self.client.get(
+            "/v1/reports/attempt-download/artifact",
+            params={"cluster_id": "cluster-a", "artifact_kind": "parquet"},
+            headers=evidence_headers,
+        )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(isolated.status_code, 404)
+        self.assertEqual(metadata.status_code, 200)
+        self.assertTrue(metadata.json()["download_available"])
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.content, report_payload)
+        self.assertEqual(report.headers["content-type"], "application/json")
+        self.assertEqual(report.headers["cache-control"], "no-store")
+        self.assertEqual(report.headers["x-content-sha256"], report_digest)
+        self.assertIn("ranklens-attempt-download-r1.json", report.headers["content-disposition"])
+        self.assertEqual(parquet.status_code, 200)
+        self.assertEqual(parquet.content, parquet_payload)
+        self.assertEqual(parquet.headers["content-type"], "application/vnd.apache.parquet")
+        audit_forbidden = self.client.get(
+            "/v1/evidence-downloads",
+            params={"cluster_id": "cluster-a"},
+            headers=read_headers,
+        )
+        audit_history = self.client.get(
+            "/v1/evidence-downloads",
+            params={"cluster_id": "cluster-a", "attempt_id": "attempt-download"},
+            headers=evidence_headers,
+        )
+        isolated_history = self.client.get(
+            "/v1/evidence-downloads",
+            params={"cluster_id": "cluster-a"},
+            headers={"Authorization": f"Bearer {self.other_evidence_token}"},
+        )
+        self.assertEqual(audit_forbidden.status_code, 403)
+        self.assertEqual(audit_history.status_code, 200)
+        self.assertEqual(len(audit_history.json()), 2)
+        self.assertEqual(
+            {item["artifact_kind"] for item in audit_history.json()},
+            {"report", "parquet"},
+        )
+        self.assertEqual(isolated_history.status_code, 200)
+        self.assertEqual(isolated_history.json(), [])
+
+        engine = build_engine(self.database_url)
+        sessions = build_session_factory(engine)
+        with sessions() as session:
+            report_audit = session.get(
+                EvidenceDownloadAudit, report.headers["x-ranklens-download-id"]
+            )
+            parquet_audit = session.get(
+                EvidenceDownloadAudit, parquet.headers["x-ranklens-download-id"]
+            )
+            assert report_audit is not None
+            assert parquet_audit is not None
+            self.assertEqual(report_audit.downloaded_by_credential_id, "test-evidence")
+            self.assertEqual(report_audit.payload_bytes, len(report_payload))
+            self.assertEqual(parquet_audit.artifact_kind, "parquet")
+        (self.object_root / report_key).write_bytes(b"tampered")
+        corrupt = self.client.get(
+            "/v1/reports/attempt-download/artifact",
+            params={"cluster_id": "cluster-a"},
+            headers=evidence_headers,
+        )
+        self.assertEqual(corrupt.status_code, 503)
+        self.assertEqual(
+            len(self.client.get(
+                "/v1/evidence-downloads",
+                params={"cluster_id": "cluster-a", "attempt_id": "attempt-download"},
+                headers=evidence_headers,
+            ).json()),
+            2,
+        )
+        with sessions.begin() as session:
+            generation = session.get(
+                AttemptGeneration, ("tenant-a", "cluster-a", "attempt-download")
+            )
+            assert generation is not None
+            generation.generation = 1
+            generation.deleted_at = now
+        engine.dispose()
+        deleted = self.client.get(
+            "/v1/reports/attempt-download/artifact",
+            params={"cluster_id": "cluster-a", "artifact_kind": "parquet"},
+            headers=evidence_headers,
         )
         self.assertEqual(deleted.status_code, 404)
 

@@ -46,6 +46,7 @@ class EnterpriseSettingsTests(unittest.TestCase):
                 "RANKLENS_DEFAULT_RETENTION_SECONDS": "2592000",
                 "RANKLENS_RETENTION_SWEEP_SECONDS": "120",
                 "RANKLENS_RETENTION_SWEEP_BATCH_SIZE": "50",
+                "RANKLENS_MAX_EVIDENCE_DOWNLOAD_BYTES": str(32 * 1024 * 1024),
             }
         )
         with patch.dict("os.environ", environment, clear=True):
@@ -61,6 +62,7 @@ class EnterpriseSettingsTests(unittest.TestCase):
         self.assertEqual(settings.default_retention_seconds, 2592000)
         self.assertEqual(settings.retention_sweep_seconds, 120)
         self.assertEqual(settings.retention_sweep_batch_size, 50)
+        self.assertEqual(settings.max_evidence_download_bytes, 32 * 1024 * 1024)
         self.assertEqual(len(settings.machine_credentials), 1)
         credential = settings.machine_credentials[0]
         self.assertEqual(credential.principal.credential_id, "agent-primary")
@@ -91,6 +93,13 @@ class EnterpriseSettingsTests(unittest.TestCase):
         environment["RANKLENS_DEFAULT_RETENTION_SECONDS"] = "300"
         with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, "DEFAULT_RETENTION_SECONDS"):
+                Settings.from_environment()
+
+    def test_rejects_unbounded_evidence_download_budget(self) -> None:
+        environment = self.environment()
+        environment["RANKLENS_MAX_EVIDENCE_DOWNLOAD_BYTES"] = str(2 * 1024 * 1024 * 1024)
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "MAX_EVIDENCE_DOWNLOAD_BYTES"):
                 Settings.from_environment()
 
     def test_rejects_plaintext_or_overprivileged_machine_credentials(self) -> None:

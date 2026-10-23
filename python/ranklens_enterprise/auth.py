@@ -103,6 +103,11 @@ class MachineAuthenticator:
     ) -> MachinePrincipal:
         return self._authenticate(authorization, "integrity:admin")
 
+    def authenticate_evidence_download(
+        self, authorization: str = Header(default="")
+    ) -> MachinePrincipal:
+        return self._authenticate(authorization, "evidence:download")
+
     def revoke_credential(
         self,
         principal: MachinePrincipal,

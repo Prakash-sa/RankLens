@@ -166,7 +166,23 @@ class ReportRevisionView(BaseModel):
     builder_version: str
     created_at: datetime
     current: bool
-    download_available: Literal[False] = False
+    download_available: bool = False
+
+
+class EvidenceDownloadAuditView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    download_id: str
+    tenant_id: str
+    cluster_id: str
+    attempt_id: str
+    revision_id: str
+    revision_number: int
+    artifact_kind: Literal["report", "parquet"]
+    payload_sha256: str
+    payload_bytes: int
+    downloaded_by_credential_id: str
+    downloaded_at: datetime
 
 
 class RankAggregateView(BaseModel):

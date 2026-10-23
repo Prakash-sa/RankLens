@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 MACHINE_PERMISSIONS = frozenset(
     {
         "segments:write", "telemetry:read", "retention:admin",
-        "credentials:revoke", "integrity:admin",
+        "credentials:revoke", "integrity:admin", "evidence:download",
     }
 )
 _CREDENTIAL_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -44,6 +44,7 @@ class Settings:
     object_root: Path
     machine_credentials: Tuple[MachineCredential, ...]
     max_expanded_segment_bytes: int = 8 * 1024 * 1024
+    max_evidence_download_bytes: int = 64 * 1024 * 1024
     reservation_ttl_seconds: int = 900
     reservation_sweep_seconds: int = 30
     object_gc_grace_seconds: int = 3600
@@ -160,6 +161,11 @@ class Settings:
             integrity_webhook_timeout = int(
                 os.environ.get("RANKLENS_INTEGRITY_WEBHOOK_TIMEOUT_SECONDS", "10")
             )
+            max_evidence_download = int(
+                os.environ.get(
+                    "RANKLENS_MAX_EVIDENCE_DOWNLOAD_BYTES", str(64 * 1024 * 1024)
+                )
+            )
         except ValueError as exc:
             raise RuntimeError("lifecycle timing settings must be integers") from exc
         if reservation_ttl < 60 or reservation_ttl > 86400:
@@ -261,10 +267,15 @@ class Settings:
             raise RuntimeError(
                 "RANKLENS_INTEGRITY_WEBHOOK_TIMEOUT_SECONDS must be within [1, 60]"
             )
+        if not 1024 * 1024 <= max_evidence_download <= 1024 * 1024 * 1024:
+            raise RuntimeError(
+                "RANKLENS_MAX_EVIDENCE_DOWNLOAD_BYTES must be within [1048576, 1073741824]"
+            )
         return cls(
             database_url=database_url,
             object_root=Path(object_root),
             machine_credentials=tuple(credentials),
+            max_evidence_download_bytes=max_evidence_download,
             reservation_ttl_seconds=reservation_ttl,
             reservation_sweep_seconds=reservation_sweep,
             object_gc_grace_seconds=object_gc_grace,
